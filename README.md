@@ -127,7 +127,7 @@ CI 会在 push / PR 时执行 `pnpm install --frozen-lockfile && pnpm build`。
 2. 保持 `pnpm build` 通过；
 3. 说明改动动机与验证方式（涉及 UI 的改动建议附截图）。
 
-详见 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。
+详见 [CONTRIBUTING.md](CONTRIBUTING.md) 与 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。
 
 ## 许可证
 

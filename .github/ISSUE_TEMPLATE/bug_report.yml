@@ -1,0 +1,53 @@
+name: Bug 报告
+description: 报告可以复现的缺陷
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。安全漏洞请**不要**在公开 Issue 中报告，请按 [SECURITY.md](https://github.com/limfox2000/novels-studio/blob/main/SECURITY.md) 私下提交。
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 问题描述
+      description: 发生了什么？期望的结果是什么？
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开 …
+        2. 点击 …
+        3. 看到 …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / 提交
+      description: 运行的提交哈希或版本号
+      placeholder: e.g. e7d8dc9
+  - type: dropdown
+    id: run-mode
+    attributes:
+      label: 运行方式
+      options:
+        - pnpm dev + python server.py
+        - pnpm build 后由 server.py 提供
+        - 已部署的线上环境
+        - 其他
+  - type: input
+    id: environment
+    attributes:
+      label: 环境
+      description: 浏览器、Node、Python 版本与操作系统
+      placeholder: Chrome 141 / Node 22.14 / Python 3.11 / Windows 11
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志或截图
+      description: 浏览器控制台、server.py 终端输出或界面截图
+      render: shell

@@ -39,6 +39,10 @@ pnpm dev             # 5173，/api 自动代理到 8768
 - 状态逻辑放在 stores/engines/services，组件尽量只负责展示与交互。
 - 保持中文界面文案与现有术语一致（作品、画布、节点、卷、章节、编辑室等）。
 
+## 行为准则
+
+参与本项目即表示同意遵守 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。技术分歧请就事论事，人身攻击与骚扰不受欢迎。
+
 ## 许可证
 
 提交贡献即表示同意以项目的 [MIT License](LICENSE) 授权你的贡献。
