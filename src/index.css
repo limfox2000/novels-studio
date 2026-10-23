@@ -1,0 +1,133 @@
+@import "tailwindcss";
+
+/* ---- 设计令牌（Tailwind 4 CSS-first）：冷静中性 + 靛蓝单一强调色 ---- */
+@theme {
+  --font-sans: "Inter", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --font-reading: "Source Han Serif SC", "Noto Serif SC", "Songti SC", SimSun, Georgia, serif;
+
+  --color-brand-50: #eef2ff;
+  --color-brand-100: #e0e7ff;
+  --color-brand-200: #c7d2fe;
+  --color-brand-400: #818cf8;
+  --color-brand-500: #6366f1;
+  --color-brand-600: #4f46e5;
+  --color-brand-700: #4338ca;
+
+  --radius-control: 10px;
+  --radius-panel: 16px;
+
+  --shadow-float: 0 10px 30px -12px rgb(15 23 42 / 0.2);
+  --shadow-panel: 0 24px 64px -16px rgb(15 23 42 / 0.28);
+}
+
+:root {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  /* 顶栏底部到视口顶部的距离（单一来源）：所有浮层 top 偏移由它派生 */
+  --topbar-h: 94px;
+}
+@media (min-width: 640px) {
+  :root {
+    --topbar-h: 102px;
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+/* 阅读视图：衬线 + 段首缩进 + 舒适行距（--rd-* 由面板根提供） */
+.reading {
+  font-family: var(--font-reading);
+  text-wrap: pretty;
+  letter-spacing: 0.01em;
+}
+
+/* ---- React Flow 微调 ---- */
+.react-flow__handle {
+  border: 2px solid #fff !important;
+}
+.react-flow__attribution {
+  font-size: 10px;
+  opacity: 0.6;
+}
+.react-flow__node {
+  cursor: grab;
+}
+.react-flow__node.dragging {
+  cursor: grabbing;
+}
+
+/* ---- 小说模拟器画布皮肤 ---- */
+.nv-canvas {
+  background:
+    radial-gradient(ellipse at 50% -10%, #1b2a4a55 0%, transparent 60%),
+    #070b15;
+}
+.nv-canvas .react-flow__controls {
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.nv-canvas .react-flow__controls-button {
+  background: #0f1729;
+  border-color: #26324f;
+  fill: #cbd5e1;
+}
+.nv-canvas .react-flow__controls-button:hover {
+  background: #1a2439;
+}
+.nv-canvas .react-flow__controls-button svg {
+  fill: #cbd5e1;
+}
+.nv-canvas .react-flow__attribution {
+  background: transparent;
+  color: #5b6785;
+}
+.nv-canvas .react-flow__attribution a {
+  color: #5b6785;
+}
+@keyframes nv-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.nv-in {
+  animation: nv-in 0.35s ease-out both;
+}
+
+/* ---- 细滚动条（颜色可随阅读主题 --rd-scroll 变化） ---- */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--rd-scroll, #cbd5e1);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+* {
+  scrollbar-color: var(--rd-scroll, #cbd5e1) transparent;
+  scrollbar-width: thin;
+}
+
+/* 设定 Agent 流式光标 */
+.agent-cursor {
+  animation: agent-blink 1s steps(2) infinite;
+}
+@keyframes agent-blink {
+  50% { opacity: 0; }
+}

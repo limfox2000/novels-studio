@@ -1,0 +1,12 @@
+{
+  "default": "public",
+  "private": {
+    "base_url": "http://127.0.0.1:8188",
+    "model": "your-checkpoint.safetensors"
+  },
+  "public": {
+    "base_url": "https://your-image-endpoint.example.com",
+    "api_key": "YOUR_API_KEY",
+    "model_list": ["your-image-model"]
+  }
+}

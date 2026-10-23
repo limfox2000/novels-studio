@@ -1,0 +1,37 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 运行期生成的数据（作品存档、生成图片/视频/音频、人物素材、技能索引）
+graphs/
+imagegraphs/
+images/
+audiofiles/
+videos/
+charassets/
+simgraphs/
+skills.json
+
+# 生图中转配置（含 API Key，仅存服务器）
+imgconfig.json
+
+# 日志与临时文件
+*.log
+.DS_Store
+vidconfig.json
+
+# 部署凭据（含密码，绝不入库；模板除外）
+.env
+.env.*
+!.env.example
+
+# 脚本生成中转配置（含 API Key，仅存服务器）
+scriptconfig.json
+
+# Qwen 章纲推演配置（租用 GPU 服务地址/模型，仅存服务器）
+qwenconfig.json
+__pycache__/
+*.pyc
+
+# 编辑器/助手本地状态
+.claude/

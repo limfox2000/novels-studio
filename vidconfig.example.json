@@ -1,0 +1,10 @@
+{
+  "base_url": "https://your-comfyui-endpoint.example.com",
+  "token": "",
+  "workflow_single": "your-single-image-workflow",
+  "workflow_flf": "your-first-last-frame-workflow",
+  "workflow_multi_fast": "your-multi-image-fast-workflow",
+  "workflow_multi_quality": "your-multi-image-quality-workflow",
+  "resolutions": ["768p横", "768p竖", "480p"],
+  "durations": [5, 6, 10]
+}

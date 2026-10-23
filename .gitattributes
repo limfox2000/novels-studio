@@ -1,0 +1,3 @@
+# 换行符规则：bash 脚本强制 LF（CRLF 会让 bash 报错）
+* text=auto
+*.sh text eol=lf

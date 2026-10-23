@@ -1,0 +1,586 @@
+/** 创作台页（#/studio）：地图式画布——🧑 人物节点 + 🏗 环境节点（建筑/房间/社区/城镇等，自由拖放摆位），画布即地图。
+ *  规则/目标/卷章与大纲正文生成（双引擎分工：🏠 私有模型 / 🌐 公共模型）；编辑室为右侧 AI 对话面板。
+ *  存档：localStorage persist（nc2-sim-v1）+ 本地命名快照（nc2-sim-archives-v1），不上传服务器。 */
+import { useCallback, useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent } from 'react';
+import {
+  ReactFlow,
+  ReactFlowProvider,
+  Background,
+  BackgroundVariant,
+  Controls,
+  MiniMap,
+  useReactFlow,
+  type Edge,
+} from '@xyflow/react';
+import { useStudioStore, findContainerAt, absPositionOf } from '../../stores/studioStore';
+import { useEditorRoomStore } from '../../stores/editorRoomStore';
+import { useEditorialStore } from '../../stores/editorialStore';
+import { useUiStore } from '../../stores/uiStore';
+import type { SimData, SimNodeType } from '../../types/sim';
+import { ENV_TYPE_META, genderOf } from '../../types/sim';
+import { genRandomCharacter } from '../../engines/studioEngine';
+import { pickRandomCharAsset } from '../../services/charAssetApi';
+import { GENDER_STYLE, simNodeTypes } from './SimNodes';
+import { SimInspector } from './SimInspector';
+import { EditorRoomPanel } from './EditorRoomPanel';
+import { OutlineManager } from './OutlineManager';
+import { ContentManager } from './ContentManager';
+import { Bookshelf } from './Bookshelf';
+import {
+  saveLocal,
+} from '../../services/studioSync';
+import { useQwenStore } from '../../shared/qwenStore';
+import { ModelCenterPanel } from './ModelCenterPanel';
+import { Dialog } from '../ui/Dialog';
+import { Button } from '../ui/Button';
+import { Field, Textarea } from '../ui/Field';
+import { Badge, StatusDot } from '../ui/Badge';
+import {
+  ArrowLeft,
+  Cpu,
+  Dna,
+  FileText,
+  Landmark,
+  LibraryBig,
+  ListTree,
+  MessagesSquare,
+  Save,
+  ScrollText,
+  SlidersHorizontal,
+  Target,
+  UserCheck,
+  UserPlus,
+} from 'lucide-react';
+
+function StudioCanvas() {
+  const nodes = useStudioStore((s) => s.nodes);
+  const edges = useStudioStore((s) => s.edges);
+  const onNodesChange = useStudioStore((s) => s.onNodesChange);
+  const onEdgesChange = useStudioStore((s) => s.onEdgesChange);
+  // 属性面板开关：用户拍板不随节点点击自动弹出，由顶栏「⚙ 属性」开/关（v2.4）
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  // 作品书架：每次进入先见书架（着陆视图）；「打开 / 返回首页」也回到这里
+  const [shelfOpen, setShelfOpen] = useState(true);
+
+  // 节点点击：Ctrl+点人物节点=插入人名到大纲管理器「本章需求」
+  const onNodeClick = useCallback((e: ReactMouseEvent, node: SimNodeType) => {
+    // ✎ Ctrl/Cmd+点人物节点：把人名插进「本章需求」光标处（OutlineManager 挂载时才监听，未开面板静默）
+    if ((e.ctrlKey || e.metaKey) && node.data.kind === 'character') {
+      const name = (node.data as { name?: string }).name?.trim();
+      if (name) window.dispatchEvent(new CustomEvent('sim-insert-char-name', { detail: name }));
+    }
+  }, []);
+
+  // Del/Backspace 删除：自行 confirm + deleteNode，返回 false 阻止 RF 默认变更流
+  const onBeforeDelete = useCallback(async ({ nodes: doomed }: { nodes: SimNodeType[]; edges: Edge[] }) => {
+    if (!doomed.length) return true; // 仅选中边：走 RF 默认（直接删边）
+    if (!window.confirm(`删除选中的 ${doomed.length} 个节点？（父环境的内部节点将提升回根层）`)) return false;
+    const st = useStudioStore.getState();
+    doomed.forEach((n) => st.deleteNode(n.id));
+    return false; // 已自行删除，阻止 RF 默认变更
+  }, []);
+
+  // 拖拽落点重定父级（层级语义）：拖动停止时若「中心点」落在某个环境节点内 → 成为它的子节点（随父移动）；
+  // 移出（含拖出原父容器）→ 提升回根层；中心没进但矩形与容器重叠 ≥45% 也算放进去了（贴边放置不漏判）。
+  // 框选多个一起拖 = 整组逐个判归入：祖先也在拖拽集的子项随祖先走（不拆家）。
+  // ⚠ 坐标/尺寸一律以 store 为基准（拖拽期间 position/dimensions change 已实时写入 store）：
+  //   曾用 reactFlow.getInternalNode 取绝对坐标，取不到时退回 dragged.position——对已嵌套子节点那是
+  //   **相对父坐标**，被误当绝对坐标 → 判定点错乱 → 识别不准/瞬移（拖进去不见）/挂错容器不跟随（v2.17a 修复）。
+  const onNodeDragStop = useCallback(
+    (_e: unknown, node: SimNodeType, nodes: SimNodeType[]) => {
+      const st = useStudioStore.getState();
+      const draggedSet = new Set((nodes?.length ? nodes : [node]).map((n) => n.id));
+      const byId = new Map(st.nodes.map((n) => [n.id, n]));
+      for (const dragged of st.nodes) {
+        if (!draggedSet.has(dragged.id)) continue;
+        // 祖先也在拖拽集中 → 随祖先整体走，只判拖拽集顶层
+        const guard = new Set<string>([dragged.id]);
+        let p = dragged.parentId;
+        let withAncestor = false;
+        while (p && !guard.has(p)) {
+          guard.add(p);
+          if (draggedSet.has(p)) {
+            withAncestor = true;
+            break;
+          }
+          p = byId.get(p)?.parentId;
+        }
+        if (withAncestor) continue;
+        const abs = absPositionOf(dragged, byId);
+        const w = dragged.width ?? dragged.measured?.width ?? 0;
+        const h = dragged.height ?? dragged.measured?.height ?? 0;
+        const container = findContainerAt(st.nodes, abs.x + w / 2, abs.y + h / 2, dragged.id, {
+          x: abs.x,
+          y: abs.y,
+          w,
+          h,
+        });
+        st.reparentNode(dragged.id, container?.id ?? null);
+      }
+    },
+    [],
+  );
+
+  return (
+    <div className="w-screen h-screen overflow-hidden bg-slate-50">
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onNodeDragStop={onNodeDragStop}
+        onBeforeDelete={onBeforeDelete}
+        onNodeClick={onNodeClick}
+        nodeTypes={simNodeTypes}
+        deleteKeyCode={['Delete', 'Backspace']}
+        zoomOnDoubleClick={false}
+        fitView
+        fitViewOptions={{ padding: 0.3, maxZoom: 0.9 }}
+        minZoom={0.15}
+        maxZoom={1.6}
+        className="bg-slate-50"
+      >
+        <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} color="#dbe2ea" />
+        <Controls position="bottom-right" showInteractive={false} />
+        <MiniMap
+          position="bottom-left"
+          pannable
+          zoomable
+          className="!bg-white/80 !rounded-lg !shadow-lg"
+          nodeColor={(node) => {
+            const d = node.data as SimData;
+            // 人物按性别细分点色（男蓝=默认/女玫红），环境按类型点色（v2.18 ENV_TYPE_META 清淡配色）
+            return d.kind === 'character' ? GENDER_STYLE[genderOf(d.gender)].dot : (ENV_TYPE_META[d.etype]?.dot ?? '#64748b');
+          }}
+        />
+      </ReactFlow>
+      {!shelfOpen && nodes.length === 0 && (
+        // 空画布引导（不挡交互；书架打开期间不显示）
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-6">
+          <div className="max-w-xl text-center text-slate-400">
+            <p className="text-[14px] font-semibold text-slate-500">在画布上搭建你的故事世界</p>
+            <p className="mt-2 text-[13px] leading-relaxed">
+              用顶栏「人物」「环境」创建节点；「属性」打开左侧面板，编辑名称、类型与基础信息/身份信息——节点面上只展示、不直接输入。
+              <br />
+              写清「目标」与「规则」，在大纲里分卷、添加章节并生成大纲，再按大纲生成正文。
+              <br />
+              选中环境后拖角缩放；把环境拖进另一个环境形成层级（镇 → 建筑 → 房间），人物永远浮在环境之上。
+            </p>
+          </div>
+        </div>
+      )}
+      <SimInspector open={inspectorOpen} onClose={() => setInspectorOpen(false)} />
+      {!shelfOpen && (
+        <SimBar inspectorOpen={inspectorOpen} onToggleInspector={() => setInspectorOpen((v) => !v)} onOpenShelf={() => setShelfOpen(true)} />
+      )}
+      {shelfOpen && <Bookshelf onClose={() => setShelfOpen(false)} />}
+    </div>
+  );
+}
+
+// ── 全文规则对话框（世界级约束，只此一条；章节大纲规则在「大纲」管理器内单独编辑） ──
+
+function RulesDialog({ onClose }: { onClose: () => void }) {
+  const rules = useStudioStore((s) => s.rules);
+  return (
+    <Dialog
+      onClose={onClose}
+      width="lg"
+      icon={<ScrollText />}
+      title="全文规则"
+      subtitle={
+        <>
+          只规定两点：<b>世界法则</b>（这个世界如何运作的规律、约束与代价）与<b>写作文风</b>（叙述、语言、节奏的写法要求）。
+          故事走向不写在这里——统一方向用「全文目标」表达。随地图存档保存；<b>正文生成</b>遵守（编辑室与大纲生成不注入规则）；
+          <b>章节大纲规则</b>在「章节大纲」管理器内单独设置。
+        </>
+      }
+      footer={
+        <Button variant="primary" onClick={onClose}>
+          完成
+        </Button>
+      }
+    >
+      <Field label="全文规则（世界法则 / 写作文风）" counter={`${rules.length}/3000`}>
+        <Textarea
+          value={rules}
+          onChange={(e) => useStudioStore.getState().setRules(e.target.value)}
+          maxLength={3000}
+          rows={12}
+          placeholder={
+            '例：\n· 这是一个人人躺平的修仙世界——灵气充裕到无人苦修，宗门排名比的是谁躺得更快；境界越高越懒，斗法全靠傀儡和嘴炮\n· 文风：轻松诙谐、反差幽默；短句为主，对话推动剧情；避免说教和大段独白'
+          }
+        />
+      </Field>
+    </Dialog>
+  );
+}
+
+// ── 人物生成规则对话框（「＋人物」随机生成 + 编辑室批量设计人物共用；随地图存档） ──
+
+function CharRulesDialog({ onClose }: { onClose: () => void }) {
+  const charGenRules = useStudioStore((s) => s.charGenRules);
+  return (
+    <Dialog
+      onClose={onClose}
+      width="lg"
+      icon={<Dna />}
+      title="人物规则"
+      subtitle={
+        <>
+          规定如何随机生成人物（出身/性格/命名/性别分布等要求）。<b>规则存在时，每次点「＋ 人物」自动按规则随机生成一个人物</b>；
+          编辑室批量设计人物时同样遵守。规则为空则「＋ 人物」只创建空白节点。随地图存档保存。
+        </>
+      }
+      footer={
+        <Button variant="primary" onClick={onClose}>
+          完成
+        </Button>
+      }
+    >
+      <Field label="人物生成规则" counter={`${charGenRules.length}/1000`}>
+        <Textarea
+          value={charGenRules}
+          onChange={(e) => useStudioStore.getState().setCharGenRules(e.target.value)}
+          maxLength={1000}
+          rows={10}
+          placeholder={
+            '例：\n· 修仙世界散修，境界随机（练气~金丹）；名字 2~3 字中式名，不与已有人物重名\n· 每人一个与「躺平」相关的怪癖；性格随机（社恐/话痨/戏精…）\n· 性别男女随机；年龄 16~88 岁；背景与本地图的环境相关'
+          }
+        />
+      </Field>
+    </Dialog>
+  );
+}
+
+// ── 全文目标对话框（几句话写明整部小说的主要目标——各处生成的统一方向；v2.16，随地图存档） ──
+
+function GoalDialog({ onClose }: { onClose: () => void }) {
+  const mainGoal = useStudioStore((s) => s.mainGoal);
+  return (
+    <Dialog
+      onClose={onClose}
+      width="lg"
+      icon={<Target />}
+      title="全文目标"
+      subtitle={
+        <>
+          用几句话写明这部小说的主要目标（要讲一个什么样的故事、最终达成什么）。<b>所有生成都会带上它作为统一方向</b>：
+          编辑室、章节大纲、正文、随机人物。章节间的整体方向用「卷」表达（在「章节大纲」管理器里分卷并写卷介绍，控制整卷各章大纲）。
+          随地图存档保存。
+        </>
+      }
+      footer={
+        <Button variant="primary" onClick={onClose}>
+          完成
+        </Button>
+      }
+    >
+      <Field label="全文目标（几句话，整部小说的统一方向）" counter={`${mainGoal.length}/500`}>
+        <Textarea
+          value={mainGoal}
+          onChange={(e) => useStudioStore.getState().setMainGoal(e.target.value)}
+          maxLength={500}
+          rows={8}
+          placeholder={
+            '例：\n· 讲一个躺平散修被迫一路「卷赢」的故事——用爆笑的方式写出「内卷无意义」\n· 最终目标：主角以躺平哲学化解宗门大战，全书收束于「无为而治」的爽点结局\n· 读者读完的感受：爽、轻松、想安利朋友'
+          }
+        />
+      </Field>
+    </Dialog>
+  );
+}
+
+// ── 顶栏：跨页导航 / 图名 / 存档 / ⚙ 属性开关 / ＋人物 / ＋环境 ──
+
+function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOpen: boolean; onToggleInspector: () => void; onOpenShelf: () => void }) {
+  const graphName = useStudioStore((s) => s.graphName);
+  const saveStatus = useUiStore((s) => s.saveStatus);
+  const saveMsg = useUiStore((s) => s.saveMsg);
+  const modelCenterOpen = useUiStore((s) => s.modelCenterOpen);
+  const [agentOpen, setAgentOpen] = useState(false);
+  const [rulesOpen, setRulesOpen] = useState(false);
+  const [charRulesOpen, setCharRulesOpen] = useState(false);
+  const [goalOpen, setGoalOpen] = useState(false);
+  const [outlineOpen, setOutlineOpen] = useState(false);
+  const [contentOpen, setContentOpen] = useState(false);
+  // 📜 已设全文规则徽标：非空即亮（amber）；章节大纲规则徽标在大纲管理器内
+  const hasRules = useStudioStore((s) => !!s.rules.trim());
+  // 🧬 已设人物生成规则徽标：非空即亮（amber）——＋人物会自动随机生成
+  const hasCharRules = useStudioStore((s) => !!s.charGenRules.trim());
+  // 🎯 已设全文目标徽标：非空即亮（amber）——各处生成注入统一方向
+  const hasMainGoal = useStudioStore((s) => !!s.mainGoal.trim());
+  // 🏛 作品责任编辑（v2.21）：顶栏选择、随作品存档——其职责与对应技能记忆注入各处生成与总编辑对话
+  const responsibleId = useStudioStore((s) => s.responsibleId);
+  const localEditors = useEditorialStore((s) => s.localEditors);
+  const serverEditors = useEditorialStore((s) => s.serverEditors);
+  const editorOptions = useMemo(() => [...localEditors, ...serverEditors].filter((e) => e.enabled), [localEditors, serverEditors]);
+  // 📋 章节数（大纲管理器入口徽标）
+  const chapterCount = useStudioStore((s) => s.chapters.length);
+  // 📝 已成文章节数（正文管理器入口徽标）
+  const contentCount = useStudioStore((s) => s.chapters.reduce((a, c) => a + (c.content.trim() ? 1 : 0), 0));
+  // Qwen 引擎可达性（全站共用 qwenStore；两个独立 selector，避免整对象重渲染）
+  const qwenStatus = useQwenStore((s) => s.status);
+  const qwenMsg = useQwenStore((s) => s.msg);
+  const reactFlow = useReactFlow();
+
+  // 挂载即后台探测一次：⚡ 徽章立刻有意义，也预热 ensureOnline 的 60s 新鲜缓存
+  useEffect(() => {
+    void useQwenStore.getState().check();
+    // 正式编辑列表只在内存缓存：进创作台即拉取，顶栏「👤 责编」与「🏛 编辑部」才能看到全部正式编辑
+    void useEditorialStore.getState().loadServerEditors();
+  }, []);
+
+  // 地图落点：视口中心（连续创建按节点数级进错开，避免叠死）
+  const dropPos = () => {
+    const c = reactFlow.screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
+    const n = useStudioStore.getState().nodes.length;
+    return { x: c.x + n * 24, y: c.y + n * 24 };
+  };
+
+  // 创建节点：落点在某个环境容器内 → 创建即归入（与拖放嵌套语义一致）
+  const addNode = (kind: 'character' | 'environment') => {
+    const st = useStudioStore.getState();
+    const pos = dropPos();
+    const id = kind === 'character' ? st.createCharacter(pos) : st.createEnvironment(pos);
+    // ⚠ excludeId=新节点自身：判定点 pos 正是新节点左上角，不排除会「创建即挂到自己」
+    // （self-parent + 相对坐标 {0,0}，RF12 定位坏掉 → 节点凭空消失，v2.1 踩坑）
+    const container = findContainerAt(useStudioStore.getState().nodes, pos.x, pos.y, id);
+    if (container) st.reparentNode(id, container.id);
+    // 🧬 人物生成规则存在 → ＋人物自动按规则随机生成（v2.15）：先落空节点（位置/嵌套照旧），生成完填属性
+    if (kind === 'character') void autoFillCharacter(id);
+  };
+
+  // 🧬 人物自动生成填充：占位「生成中…」→ 成功填名字/性别/基础信息/身份信息；失败/互斥回空节点可手填（不吞掉节点）
+  const autoFillCharacter = async (id: string) => {
+    const st = useStudioStore.getState();
+    if (!st.charGenRules.trim()) return;
+    st.updateCharacter(id, { name: '生成中…' });
+    const engine = useEditorRoomStore.getState().settings.engine;
+    // 🏛 作品责任编辑：注入其职责与该模块技能记忆（v2.21）
+    const responsible = useEditorialStore.getState().getWorkResponsibleData('人物生成');
+    const r = await genRandomCharacter({ engine, ...(responsible ? { responsible } : {}) });
+    const s2 = useStudioStore.getState();
+    if (r.ok && r.block) {
+      const gender = genderOf(r.block.gender);
+      const avatar = await pickRandomCharAsset(gender === 'female' ? '女' : '男', r.block.age).catch(() => undefined);
+      s2.updateCharacter(id, {
+        name: r.block.name,
+        gender,
+        age: r.block.age,
+        basicInfo: r.block.basicInfo ?? '',
+        identityInfo: r.block.identityInfo ?? '',
+        relations: r.block.relations,
+        avatar,
+      });
+    } else {
+      s2.updateCharacter(id, { name: '' });
+      if (r.error && r.error !== '已有生成任务进行中') window.alert(`⚠ 人物自动生成失败：${r.error}（已保留空白人物节点，可手动填写）`);
+    }
+  };
+
+  const saveTone: 'ok' | 'warn' | 'down' = saveStatus === 'error' ? 'down' : saveStatus === 'saving' ? 'warn' : 'ok';
+  const qwenTone = qwenStatus === 'ok' ? 'ok' : qwenStatus === 'down' ? 'down' : qwenStatus === 'checking' ? 'warn' : 'idle';
+  const qwenLabel =
+    qwenStatus === 'checking' ? '检测中' : qwenStatus === 'ok' ? `在线 ${qwenMsg}` : qwenStatus === 'down' ? '离线' : '检测';
+
+  return (
+    <>
+      {/* 两级顶栏：第一行作品身份与主操作，第二行写作/画布工具（窄屏横向滚动） */}
+      <div className="fixed left-2 right-2 top-2 z-40 sm:left-1/2 sm:right-auto sm:top-4 sm:w-[min(calc(100vw-2rem),1000px)] sm:-translate-x-1/2">
+        <div className="overflow-hidden rounded-[16px] border border-slate-200/80 bg-white/95 shadow-float backdrop-blur">
+          {/* 第一行：返回 / 作品名 / 保存状态 / 保存 + 属性、模型、编辑室 */}
+          <div className="flex h-12 items-center gap-1.5 px-2 sm:gap-2 sm:px-3">
+            <button
+              onClick={onOpenShelf}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
+              title="返回作品书架"
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </button>
+            <input
+              value={graphName}
+              onChange={(e) => useStudioStore.getState().setGraphName(e.target.value)}
+              title="作品名（保存用）"
+              placeholder="未命名作品"
+              className="h-8 w-24 min-w-0 shrink rounded-[8px] border border-transparent bg-transparent px-1.5 text-[14px] font-semibold text-slate-800 transition hover:border-slate-200 focus:border-brand-400 focus:bg-white focus:outline-none focus:ring-4 focus:ring-brand-500/10 sm:w-44"
+            />
+            <span
+              className={`flex shrink-0 items-center gap-1 whitespace-nowrap text-[12px] ${
+                saveStatus === 'error' ? 'text-rose-500' : saveStatus === 'saving' ? 'text-amber-600' : 'text-slate-400'
+              }`}
+            >
+              <StatusDot tone={saveTone} pulse={saveStatus === 'saving'} />
+              <span className="max-sm:hidden">{saveMsg}</span>
+            </span>
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={<Save />}
+              onClick={() => saveLocal()}
+              title="保存到本地存档（本机浏览器，不上传服务器）"
+              className="max-sm:px-2"
+            >
+              <span className="max-sm:hidden">保存</span>
+            </Button>
+            <span className="flex-1" />
+            <Button
+              size="sm"
+              variant={inspectorOpen ? 'soft' : 'ghost'}
+              icon={<SlidersHorizontal />}
+              onClick={onToggleInspector}
+              title="打开/关闭左侧属性面板（选中节点后在此编辑名称/类型与基础信息/身份信息）"
+              className="max-sm:px-2"
+            >
+              <span className="max-sm:hidden">属性</span>
+            </Button>
+            <button
+              onClick={() => useUiStore.getState().setModelCenterOpen(true)}
+              title={`模型中心：文本/推理/生图统一配置（私有模型：${qwenMsg || '未检测'}）`}
+              className="flex h-8 shrink-0 items-center gap-1.5 rounded-[10px] border border-slate-200 bg-white px-2 text-[13px] text-slate-600 transition hover:bg-slate-50 sm:px-2.5"
+            >
+              <StatusDot tone={qwenTone} pulse={qwenStatus === 'checking'} />
+              <Cpu className="h-4 w-4 shrink-0 text-slate-400" />
+              <span className="max-sm:hidden">{qwenLabel}</span>
+            </button>
+            <Button
+              size="sm"
+              variant={agentOpen ? 'primary' : 'soft'}
+              icon={<MessagesSquare />}
+              onClick={() => setAgentOpen((v) => !v)}
+              title="编辑室（右侧 AI 对话：让 AI 设计人物/环境/设定，一键落为画布节点）"
+              className="max-sm:px-2"
+            >
+              <span className="max-sm:hidden">编辑室</span>
+            </Button>
+          </div>
+
+          {/* 第二行：书架（打开/新建都在书架中完成） · 写作 · 画布 · 责编 */}
+          <div className="flex h-9 items-center gap-1 overflow-x-auto border-t border-slate-100 bg-slate-50/70 px-2 [scrollbar-width:none] sm:gap-1.5 sm:px-3 [&::-webkit-scrollbar]:hidden">
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<LibraryBig />}
+              onClick={onOpenShelf}
+              title="作品书架：打开已有作品或新建作品"
+            >
+              书架
+            </Button>
+            <span className="mx-0.5 h-4 w-px shrink-0 bg-slate-200" />
+            <Button
+              size="sm"
+              variant={hasRules ? 'soft' : 'ghost'}
+              icon={<ScrollText />}
+              onClick={() => setRulesOpen(true)}
+              title="全文规则：规定小说世界的法则与写作文风（正文生成遵守；随地图存档）"
+            >
+              规则
+              {hasRules && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-brand-500" />}
+            </Button>
+            <Button
+              size="sm"
+              variant={hasCharRules ? 'soft' : 'ghost'}
+              icon={<Dna />}
+              onClick={() => setCharRulesOpen(true)}
+              title="人物规则：规定如何随机生成人物——规则存在时「＋人物」自动随机生成；编辑室批量设计人物也遵守（随地图存档）"
+            >
+              人物规则
+              {hasCharRules && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-brand-500" />}
+            </Button>
+            <Button
+              size="sm"
+              variant={hasMainGoal ? 'soft' : 'ghost'}
+              icon={<Target />}
+              onClick={() => setGoalOpen(true)}
+              title="全文目标：几句话写明整部小说的主要目标——所有生成都会带上它作为统一方向（随地图存档）"
+            >
+              目标
+              {hasMainGoal && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-brand-500" />}
+            </Button>
+            <span className="mx-0.5 h-4 w-px shrink-0 bg-slate-200" />
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<ListTree />}
+              onClick={() => setOutlineOpen(true)}
+              title="章节大纲管理器（半页浮层）：添加章节、写本章需求、按章节大纲规则生成大纲（章节大纲规则在此设置）"
+            >
+              大纲
+              {chapterCount > 0 && <Badge className="h-4 px-1.5 text-[11px]">{chapterCount}</Badge>}
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<FileText />}
+              onClick={() => setContentOpen(true)}
+              title="正文管理器（半页浮层）：按本章大纲生成正文——本章大纲已生成后，对应章节的生成正文才可点击"
+            >
+              正文
+              {contentCount > 0 && <Badge className="h-4 px-1.5 text-[11px]">{contentCount}</Badge>}
+            </Button>
+            <span className="mx-0.5 h-4 w-px shrink-0 bg-slate-200" />
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<UserPlus />}
+              onClick={() => addNode('character')}
+              title={hasCharRules ? '新建人物（已设人物规则：自动按规则随机生成人物）' : '新建人物节点（选中后在左侧属性面板填人名/基础信息/身份信息）'}
+            >
+              人物
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<Landmark />}
+              onClick={() => addNode('environment')}
+              title="新建环境节点（选中后拖角缩放；属性在左侧面板编辑）"
+            >
+              环境
+            </Button>
+            <label
+              className="flex h-8 shrink-0 items-center gap-1 rounded-[10px] border border-slate-200 bg-white px-2 text-slate-600"
+              title="作品责任编辑：把关本作品——其职责与对应能力的技能记忆会注入大纲/正文/人物等生成与总编辑对话（随作品存档）"
+            >
+              <UserCheck className="h-4 w-4 shrink-0 text-slate-400" />
+              <select
+                value={responsibleId}
+                onChange={(e) => useStudioStore.getState().setResponsibleId(e.target.value)}
+                className="max-w-[120px] cursor-pointer bg-transparent text-[13px] text-slate-600 focus:outline-none"
+              >
+                <option value="">责编：未设置</option>
+                {editorOptions.map((e) => (
+                  <option key={e.id} value={e.id}>
+                    责编：{e.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <span className="w-1 shrink-0" />
+          </div>
+        </div>
+      </div>
+      {rulesOpen && <RulesDialog onClose={() => setRulesOpen(false)} />}
+      {charRulesOpen && <CharRulesDialog onClose={() => setCharRulesOpen(false)} />}
+      {goalOpen && <GoalDialog onClose={() => setGoalOpen(false)} />}
+      {outlineOpen && <OutlineManager onClose={() => setOutlineOpen(false)} />}
+      {contentOpen && <ContentManager onClose={() => setContentOpen(false)} />}
+      {agentOpen && <EditorRoomPanel onClose={() => setAgentOpen(false)} />}
+      {modelCenterOpen && (
+        <ModelCenterPanel
+          onClose={() => {
+            useUiStore.getState().setModelCenterOpen(false);
+            void useQwenStore.getState().check(); // 配置可能已改，重探刷新徽章
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+export function StudioPage() {
+  return (
+    <ReactFlowProvider>
+      <StudioCanvas />
+    </ReactFlowProvider>
+  );
+}

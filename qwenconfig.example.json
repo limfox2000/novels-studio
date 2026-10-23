@@ -1,0 +1,10 @@
+{
+  "base_url": "https://your-llm-endpoint.example.com",
+  "model": "your-model-name",
+  "api_key": "YOUR_API_KEY",
+  "public": {
+    "base_url": "",
+    "api_key": "",
+    "model": ""
+  }
+}
