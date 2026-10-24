@@ -27,11 +27,11 @@
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
   /* 顶栏底部到视口顶部的距离（单一来源）：所有浮层 top 偏移由它派生 */
-  --topbar-h: 94px;
+  --topbar-h: 132px;
 }
 @media (min-width: 640px) {
   :root {
-    --topbar-h: 102px;
+    --topbar-h: 140px;
   }
 }
 

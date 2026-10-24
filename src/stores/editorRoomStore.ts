@@ -82,6 +82,10 @@ interface EditorRoomState {
   /** 非活动对话驻留区（key=editor.id 或 'chief'；切换对话对象时与 messages/summary 整体互换，随 persist 保存） */
   savedConvs: Record<string, { messages: EditorRoomMessage[]; summary: string }>;
   settings: EditorRoomSettings;
+  /** 当前活动对话的归属键（'chief' 或编辑 id；随 messages/summary 一起持久化）。
+   *  chatEditor 对象本身不持久化（职责/技能记忆以 editorialStore 为准，避免旧副本），
+   *  刷新后靠 activeConvKey + 编辑名单恢复对话对象，否则会话会被误显示成总编辑的。 */
+  activeConvKey: string;
   /** 对话对象（v2.19b）：null=总编辑（默认）；设置为编辑部某位编辑=与其单独对话（不持久化） */
   chatEditor: Editor | null;
   /** 🏛 作品责编技能记忆表（v2.21，纯数据不持久化）：key=生成能力模块，memory=该编辑在该模块的技能记忆；
@@ -104,6 +108,10 @@ interface EditorRoomState {
   appendMessage: (m: Pick<EditorRoomMessage, 'role' | 'text' | 'writes'>) => void;
   /** 切换对话对象（总编辑 / 编辑部某位编辑；传 null 回总编辑） */
   setChatEditor: (e: Editor | null) => void;
+  /** 刷新后恢复：把持久化的活动会话重新绑回该编辑（不交换 messages/summary——它们本就是这份会话） */
+  restoreChatEditor: (e: Editor) => void;
+  /** 活动会话所属编辑已删除/停用：消息原样归档到该编辑键下，载入总编辑的上下文 */
+  dropOrphanConv: () => void;
   /** 记录【生图】块的生成结果（按块序号 i；同块重生成覆盖） */
   attachImage: (msgId: string, i: number, url: string) => void;
   setSettings: (patch: Partial<EditorRoomSettings>) => void;
@@ -224,6 +232,7 @@ export const useEditorRoomStore = create<EditorRoomState>()(
         summary: '',
         savedConvs: {},
         settings: { reasoningEffort: 'off', autoCompact: true, chatWidth: 'medium', engine: 'private', contentEngine: 'private', carryRules: false, editorUnlimited: true },
+        activeConvKey: 'chief',
         chatEditor: null,
         mentorByModule: {},
         busy: false,
@@ -235,7 +244,9 @@ export const useEditorRoomStore = create<EditorRoomState>()(
 
         send: async (userText) => {
           const text = userText.trim();
-          const { busy, messages } = get();
+          const { busy, messages, chatEditor, activeConvKey } = get();
+          // 刷新后编辑会话尚在恢复（编辑名单未就绪）：先别发，避免这条消息错发到总编辑上下文
+          if (activeConvKey !== 'chief' && !chatEditor) return;
           if (!text || busy) return;
           await streamTurn(messages, text, { id: `u-${Date.now()}`, role: 'user', text, ts: Date.now() });
         },
@@ -243,7 +254,8 @@ export const useEditorRoomStore = create<EditorRoomState>()(
         stop: () => stopGeneration(),
 
         regenerate: async () => {
-          const { messages, busy } = get();
+          const { messages, busy, chatEditor, activeConvKey } = get();
+          if (activeConvKey !== 'chief' && !chatEditor) return; // 同 send：会话尚在恢复时不重发
           if (busy) return;
           const last = messages[messages.length - 1];
           if (!last || last.role !== 'agent') return;
@@ -267,7 +279,7 @@ export const useEditorRoomStore = create<EditorRoomState>()(
         appendMessage: (m) =>
           set((s) => {
             const msg = { ...m, id: `n-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, ts: Date.now() };
-            if ((s.chatEditor?.id ?? 'chief') === 'chief')
+            if ((s.activeConvKey || s.chatEditor?.id || 'chief') === 'chief')
               return { messages: [...s.messages, msg].slice(-MAX_MESSAGES) };
             const parked = s.savedConvs.chief ?? { messages: [], summary: '' };
             return { savedConvs: { ...s.savedConvs, chief: { ...parked, messages: [...parked.messages, msg].slice(-MAX_MESSAGES) } } };
@@ -288,13 +300,33 @@ export const useEditorRoomStore = create<EditorRoomState>()(
         setChatEditor: (e) =>
           set((s) => {
             if (s.busy) return {}; // 生成中不切换（面板 select 已禁用，双保险）
-            const prevKey = s.chatEditor?.id ?? 'chief';
+            // ⚠ 用 activeConvKey：刷新后 chatEditor 尚未恢复时，不能把它误判成总编辑
+            const prevKey = s.activeConvKey || s.chatEditor?.id || 'chief';
             const nextKey = e?.id ?? 'chief';
             if (prevKey === nextKey) return { chatEditor: e };
             const saved = { ...s.savedConvs, [prevKey]: { messages: s.messages, summary: s.summary } };
             const next = saved[nextKey] ?? { messages: [], summary: '' };
             delete saved[nextKey];
-            return { chatEditor: e, savedConvs: saved, messages: next.messages, summary: next.summary, error: '', usage: null };
+            return { chatEditor: e, activeConvKey: nextKey, savedConvs: saved, messages: next.messages, summary: next.summary, error: '', usage: null };
+          }),
+
+        /** 刷新恢复：只重新绑定对象，不换上下文（messages/summary 已由 persist 按 activeConvKey 载入） */
+        restoreChatEditor: (e) =>
+          set((s) => {
+            if (s.chatEditor?.id === e.id) return { chatEditor: e };
+            if (s.activeConvKey !== e.id) return {};
+            return { chatEditor: e };
+          }),
+
+        /** 活动会话的编辑已被删除/停用：消息按原键归档，回到总编辑上下文（会话不丢，重新启用后可切回） */
+        dropOrphanConv: () =>
+          set((s) => {
+            const key = s.activeConvKey;
+            if (!key || key === 'chief') return {};
+            const saved = { ...s.savedConvs, [key]: { messages: s.messages, summary: s.summary } };
+            const chief = saved.chief ?? { messages: [], summary: '' };
+            delete saved.chief;
+            return { savedConvs: saved, activeConvKey: 'chief', chatEditor: null, messages: chief.messages, summary: chief.summary, error: '', usage: null };
           }),
 
         deleteMessage: (id) => set((s) => ({ messages: s.messages.filter((m) => m.id !== id) })),
@@ -339,7 +371,8 @@ export const useEditorRoomStore = create<EditorRoomState>()(
     {
       name: 'nc2-sim-agent-v1',
       version: 1,
-      partialize: (s) => ({ messages: s.messages, summary: s.summary, savedConvs: s.savedConvs, settings: s.settings }) as Partial<EditorRoomState>,
+      partialize: (s) =>
+        ({ messages: s.messages, summary: s.summary, savedConvs: s.savedConvs, settings: s.settings, activeConvKey: s.activeConvKey }) as Partial<EditorRoomState>,
       // settings 深合并：旧存档缺新字段时补默认值，而不是整对象覆盖
       merge: (persisted, current) => {
         const p = persisted as Partial<EditorRoomState>;
@@ -376,9 +409,30 @@ export const useEditorRoomStore = create<EditorRoomState>()(
           delete legacy.thinking;
         }
         if (!REASONING_EFFORTS.includes(settings.reasoningEffort)) settings.reasoningEffort = 'off';
+        // 活动会话归属：新档直接读 activeConvKey；旧档（该键不存在）从消息里的 editorId 推断——
+        // 修复「单独对话刷新后被当成总编辑」的旧存档：messages 是那位编辑的会话，savedConvs.chief 才是总编辑的
+        const inferredConvKey =
+          (typeof p.activeConvKey === 'string' && p.activeConvKey) ||
+          [...messages].reverse().find((m) => m.role === 'agent' && m.editorId)?.editorId ||
+          'chief';
+        // 旧版刷新 bug 的残留：单独对话曾被误存进 chief 槽（总编辑的消息绝不会带 editorId）。
+        // 按其中最后一条带 editorId 的 agent 消息认回原编辑；同键已有旧会话时保留时间更新的那份。
+        const savedConvs = { ...(p.savedConvs ?? {}) };
+        const misParked = savedConvs.chief;
+        const misOwner = misParked
+          ? [...misParked.messages].reverse().find((m) => m.role === 'agent' && m.editorId)?.editorId
+          : undefined;
+        if (misOwner && misOwner !== 'chief') {
+          const latest = (ms: EditorRoomMessage[]) => ms.reduce((t, m) => Math.max(t, m.ts || 0), 0);
+          const existing = savedConvs[misOwner];
+          if (!existing || latest(misParked!.messages) >= latest(existing.messages)) savedConvs[misOwner] = misParked!;
+          delete savedConvs.chief;
+        }
         return {
           ...current,
           ...p,
+          activeConvKey: inferredConvKey,
+          savedConvs,
           messages: messages.map((m) =>
             (m.engine as string) === 'primary'
               ? { ...m, engine: 'private' as const }

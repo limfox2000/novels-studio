@@ -5,9 +5,11 @@
 import { qwGenerate, REASONING_EFFORT_MAX_TOKENS, type QwenChatMessage, type QwenUsage, type ReasoningEffort } from '../shared/qwenClient';
 import { GenerationAborted } from '../shared/generation';
 import { agentGate, promptCharBudget } from '../shared/agentShared';
-import { buildMaterialBlock, buildReadBlock, parseSimOutput, chaptersBlock, EDITOR_MODULE_CAPS, WRITE_TARGETS, matchMentorModules, type MaterialKey, type SimChatMsg, type SimBlock, type SimWriteBlock, type WriteField } from './studioEngine';
+import { buildMaterialBlock, buildReadBlock, parseSimOutput, chaptersBlock, simCanvasIndex, canvasLookupBlock, chapterAgentBlockIfRelevant, EDITOR_MODULE_CAPS, WRITE_TARGETS, matchMentorModules, type MaterialKey, type SimChatMsg, type SimBlock, type SimWriteBlock, type WriteField } from './studioEngine';
 import { sanitizeMemoryEntries, TEMPLATE_CRAFT_SECTIONS } from './memoryTemplates';
 import { useUiStore } from '../stores/uiStore';
+import { useStudioStore } from '../stores/studioStore';
+import { stateReferenceAgentContext } from '../stores/snapshotRefs';
 import { useEditorRoomStore } from '../stores/editorRoomStore';
 import { startGeneration } from '../shared/generation';
 
@@ -322,20 +324,45 @@ function editorExecProtocol(): string {
   const chaptered = writeFields.filter((f) => f === 'chapterRequirement' || f === 'chapterOutline');
   const chLabel = chaptered.map((f) => WRITE_TARGETS[f].label).join('/');
   const lines: string[] = [
-    `用户要求生成/设计人物时，输出【人物设定】块（段名一字不差；要几个就输出几个）：
+    `用户要求生成/设计人物，或修改画布上已有的人物时，输出【人物设定】块（段名一字不差；要几个就输出几个）：
 【人物设定】
-名字：（人名，12 字以内）
+名字：（人名，12 字以内；修改已有的人物时写该人物当前名字，系统按名字自动识别为修改）
+更新：（仅改名时填写：该人物当前名字，一字不差）
 性别：（男/女 二选一）
-年龄：（必填，数字年龄，不可省略）
+年龄：（新建时必填数字年龄；修改时只写要改的字段，未写的保留原值）
 基础信息：（长相/身材/习惯穿搭/性格，一段话）
 身份信息：（职业/身份/与故事相关的特殊设计，一段话）
-- 不要输出关系信息段；用户点「📎 落为人物」落到画布`,
-    `用户要求生成/设计环境、建筑、房间时，输出【环境设定】块（段名一字不差；要几个就输出几个）：
+所在：（用户指定了位置才填写：父环境名或层级路径，如「清风镇＞铁匠铺」；从【画布索引】/【画布检索】一字不差抄写；修改已有节点的普通更新不要写本行，只有用户明确要求移动归属时才写）
+卷：（用户明确要求写到其它卷画布时才填写：目标卷名，必须从【画布索引】的「全部画布」一字不差抄写；省略=当前画布；找不到或重名时不要猜测，先请用户确认）
+- 不要输出关系信息段；用户点「📎 落为人物」/「✏️ 更新…」确认后生效；修改时不要另建重复人物
+- 新建人物自动带默认状态「状态0」；对人已有人的年龄/基础信息/身份信息更新只改**当前状态**，人名/性别跨状态稳定
+- 写了「卷：」时，查找同名人物、所在环境都只在目标卷画布内进行；目标卷找不到就说明找不到，不要改落到当前画布
+- 用户要求统一修改某个环境里的全部人物（如统一服装要求）：以【画布检索】的「人物名单」为准，为名单里每一个人输出一个【人物设定】块（「名字」逐字抄名单里的名字），每块只写要统一的字段；名单是系统从画布查出的实际名字，不要回答「无法确定人物名字」`,
+    `用户要求新建/切换/重命名/删除人物状态，或修改**非当前状态**时，输出【人物状态】块（段名一字不差；只操作已有人的状态，不创建人物，不改人名/性别/所在环境/形象/写真）：
+【人物状态】
+人物：（已有人的当前名字，从【画布索引】/【画布检索】一字不差抄写）
+卷：（用户明确要求写到其它卷画布时才填写：目标卷名，从【画布索引】的「全部画布」一字不差抄写；省略=当前画布）
+动作：（新建 / 修改 / 切换 / 重命名 / 删除 五选一）
+状态：（新建=新状态名，人物内唯一；修改/切换/重命名/删除=已有状态名，一字不差；修改省略=当前状态）
+新状态名：（仅重命名填写）
+基于：（仅新建可选，省略=当前状态）
+年龄：（可选）
+基础信息：（可选，只写要改成的完整段落）
+身份信息：（可选，只写要改成的完整段落）
+关系信息：（可选，只写要改成的完整段落）
+- 新建复制「基于」状态的全部属性与写真引用，再覆盖写出字段，并设为当前状态；修改只改指定状态；切换=设为当前；重命名只改标签；删除默认状态（首个）或最后一个状态不允许
+- 找不到人物/状态、状态名重复时如实说明，不要猜；不要用【人物设定】冒充状态操作，也不要自动创建人物
+- 人物有多个状态时，【人物设定】只改当前状态；要改非当前状态必须用本块`,
+    `用户要求生成/设计环境、建筑、房间，或修改画布上已有的环境时，输出【环境设定】块（段名一字不差；要几个就输出几个）：
 【环境设定】
-名字：（环境名，16 字以内）
+名字：（环境名，16 字以内；修改已有环境时写当前名字，系统按名字自动识别为修改）
+更新：（仅改名时填写：该环境当前名字，一字不差）
 类型：（房间/建筑/社区/城镇/区域/床/物品 七选一；床=容纳人物休息睡觉的容器，物品=非容器的物件标记）
 描述：（外观/功能/氛围，一段话）
-- 用户点「📎 落为环境」落到画布；镇＞建筑＞房间的嵌套由用户在画布拖拽完成，需要时在块外用一句话建议「谁放进谁里面」`,
+所在：（用户要求放进指定环境才填写：父环境名或层级路径，如「清风镇＞铁匠铺」；父环境必须是容器类型，物品不能作为所在环境；修改已有节点时只有用户明确要求移动归属才写）
+卷：（用户明确要求写到其它卷画布时才填写：目标卷名，必须从【画布索引】的「全部画布」一字不差抄写；省略=当前画布；找不到或重名时不要猜测，先请用户确认）
+- 用户点「📎 落为环境」/「✏️ 更新…」确认后生效；「给某某建筑增加两个房间」这类请求：名字写新房间名、所在写该建筑名，系统会自动创建为子环境并排好位置
+- 写了「卷：」时，所在环境也只在目标卷画布内查找；目标卷里没有这个环境就说明，不要自行改到当前画布`,
     `用户要求分卷/创建卷时，每一卷输出一个段名【卷设定】块（一字不差；要几卷就在同一次回复全部输出，按卷序排列）：
 【卷设定】
 名字：（卷名，20 字以内，如「第一卷 初入宗门」）
@@ -349,13 +376,16 @@ function editorExecProtocol(): string {
   ];
   return `【执行协议】你是作家编辑：所有生成能力都可执行（输出协议块，用户点击按钮确认后才落地生效）：
 ${lines.join('\n\n')}
-- 正文生成：聊天里不直接产出正文——你的职责与技能记忆会在 📝 正文管理器生成时作为责编注入把关；对话中提供专业分析、示范与修改建议即可`;
+- 正文生成：聊天里不直接产出正文——你的职责与技能记忆会在 📝 正文管理器生成时作为责编注入把关；对话中提供专业分析、示范与修改建议即可
+- 跨卷复制/移动由用户在画布顶栏「复制到卷」手动执行。你不得声称已经执行复制，也不要为了复制而输出设定块；需要跨卷新增内容时，用「卷：」明确写出目标卷，由用户逐块落地
+- 目标卷尚不存在时，先输出【卷设定】让用户新建卷与空白画布；画布创建成功后，再在后续回复里用「卷：」写人物/环境
+- 章节快照、章节名单与区域是用户手动采集的只读资料：你只能修改工作画布上的人物/状态/环境；不得声称已修改某章快照、名单或区域，也不得说快照会自动同步。修改被引用状态会影响历史章节表现，必要时提醒用户手动刷新快照`;
 }
 
-function editorChatSystem(e: Editor, userMsg: string): string {
-  // 画布舞台常驻（编辑分析的工作对象）；全文目标/全文规则等资料不默认注入——
-  // 仅本轮消息提到时按需附上（buildReadBlock，与总编辑对话同一套触发词）；用户没要求读就不给
-  const materials = buildMaterialBlock(['canvas']).slice(0, CHAT_MATERIAL_CAP);
+function editorChatSystem(e: Editor, userMsg: string, history: SimChatMsg[] = []): string {
+  // 画布只常驻极短索引；用户本轮提到的环境/人物按名字检索（如「医院里都有谁」→ 搜到「仁和医院」再按归属列出成员）。
+  // 不问全局就不注入整张画布；详细描述/基础信息只随命中的节点带出。
+  const canvasCtx = `${simCanvasIndex()}${canvasLookupBlock(userMsg, history)}`;
   const readBlock = buildReadBlock(userMsg);
   const mem = (e.memory ?? '').trim();
   // 🧠 话题锚定：命中模块 → 标注本轮聚焦能力 + 只加载该模块的技能记忆（执行哪个能力带哪份记忆）
@@ -365,6 +395,14 @@ function editorChatSystem(e: Editor, userMsg: string): string {
   const skillBlock = skillMem ? `\n\n【你的技能记忆：${focus}】（该能力的工作技法与调教经验，执行时逐条遵循）\n${skillMem}` : '';
   // 话题命中章节类能力时附上章节列表（标题一字不差才写得到章）
   const chapters = focus === '章节大纲规则' || focus === '章节需求' ? `\n【章节】（写 章节需求 / 本章大纲 时，章节名从这里取，一字不差）\n${chaptersBlock().slice(0, 2500)}` : '';
+  // R5：涉及状态/引用/章节时才附快照引用摘要（只读）
+  const refBlock = /状态|引用|快照|名单|章节|本章|历史/.test(userMsg)
+    ? (() => {
+        const st = useStudioStore.getState();
+        return `\n\n【状态引用】（只读）\n${stateReferenceAgentContext(st.chapters, st.boards, st.volumes, { boardId: st.activeBoardId })}`;
+      })()
+    : '';
+  const chapterBlock = chapterAgentBlockIfRelevant(userMsg);
   return `你是小说创作团队的编辑「${e.name}」（擅长题材：${e.specialty || '不限'}），现在与创作者（用户）单独交流，不在会议里。
 按你的职责与审视维度提供专业帮助：分析、给建议、按用户要求示范或改写；发言只从你的专业角度出发，其他领域点到即止。
 【你的职责】（简短要求，必须遵守）
@@ -373,8 +411,8 @@ ${e.persona.trim() || '（未设置，按擅长题材交流）'}
 【你的主记忆】（协作方式与通用偏好，常驻遵循；与职责冲突时以职责为准）
 ${mem || '（暂无主记忆——用户认可的做法与要求会随对话积累到这里）'}${skillBlock}
 
-【项目资料】（画布舞台常驻；全文目标/规则等仅在你说到时随本轮附上，按需参考，不要整段复读）
-${materials}${readBlock}${chapters}${focusLine}
+【项目资料】（画布索引常驻；用户提到的环境/人物会按名字检索出成员与归属，全文目标/规则等仅在你说到时随本轮附上，按需参考，不要整段复读）
+${canvasCtx}${readBlock}${chapters}${chapterBlock}${refBlock}${focusLine}
 
 【职责改进协议】当用户对「你的职责/审视维度/工作方式」提出调整意见，或讨论中形成了对你职责的改进共识时，在回复最末输出（块前不要写「现在补上：」之类的引入语，正文说完直接输出块）：
 【更新职责】
@@ -439,7 +477,7 @@ export async function genEditorTurn(opts: {
   const gate = await agentGate(engine);
   if (gate) return { ok: false, error: gate };
   const msgs: QwenChatMessage[] = [
-    { role: 'system', content: editorChatSystem(opts.editor, opts.userMsg) },
+    { role: 'system', content: editorChatSystem(opts.editor, opts.userMsg, opts.history) },
     ...opts.history.map((m) => ({ role: m.role === 'agent' ? ('assistant' as const) : ('user' as const), content: m.text })),
     { role: 'user', content: opts.userMsg },
   ];

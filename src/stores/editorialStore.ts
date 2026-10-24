@@ -154,6 +154,8 @@ interface EditorialState {
   localEditors: Editor[];
   serverEditors: Editor[];
   serverError: string;
+  /** 正式编辑首次拉取是否已结束（成功/失败都算；不持久化）——刷新恢复编辑室会话时用它区分「还没加载」与「编辑已删除」 */
+  serverLoaded: boolean;
   draft: MeetingDraft;
   status: MeetingStatus;
   topic: string;
@@ -200,6 +202,7 @@ export const useEditorialStore = create<EditorialState>()(
       localEditors: EDITOR_PRESETS.map((p, i) => ({ ...p, id: PRESET_IDS[i], enabled: true, storage: 'local' as const, skills: blankSkillMemories() })),
       serverEditors: [],
       serverError: '',
+      serverLoaded: false,
       draft: { editorIds: PRESET_IDS.slice(0, 2), materials: ['mainGoal', 'canvas'], rounds: 2 },
       status: 'idle',
       topic: '',
@@ -224,9 +227,9 @@ export const useEditorialStore = create<EditorialState>()(
       loadServerEditors: async () => {
         try {
           const items = toServerEditors(await snippetList());
-          set({ serverEditors: items, serverError: '' });
+          set({ serverEditors: items, serverError: '', serverLoaded: true });
         } catch (e) {
-          set({ serverError: `正式编辑读取失败：${errMsg(e)}` });
+          set({ serverError: `正式编辑读取失败：${errMsg(e)}`, serverLoaded: true });
         }
       },
 

@@ -7,13 +7,18 @@
  *  章节大纲规则的编辑入口在本管理器内（📜 大纲规则，与全文规则分开各自编辑）；📚 卷的创建/编辑也在本管理器（📚 卷）。
  *  引擎/思考开关复用编辑室 ⚙ 设置；与编辑室共用全局生成互斥，关面板不中断生成。 */
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import { useStudioStore } from '../../stores/studioStore';
+import { flushStudioPersist, useStudioStore, volumeBoardId } from '../../stores/studioStore';
+import { chapterBoardOf, findChapterRegion } from '../../stores/chapterRegions';
+import { snapshotIssueText } from '../../stores/chapterSnapshots';
 import { useEditorRoomStore } from '../../stores/editorRoomStore';
 import { useUiStore } from '../../stores/uiStore';
 import { DEFAULT_OUTLINE_RULES, genChapterOutline } from '../../engines/studioEngine';
 import { useEditorialStore } from '../../stores/editorialStore';
 import { stopGeneration } from '../../shared/generation';
 import { READER_PREF_KEY, READER_THEMES } from './readerThemes';
+import { useActiveChapterId } from './useActiveChapter';
+import { beginChapterRegion } from './chapterRegionActions';
+import { ChapterRosterPanel } from './ChapterRosterPanel';
 import type { SimChapter } from '../../types/sim';
 import {
   ArrowDown,
@@ -26,6 +31,7 @@ import {
   ScrollText,
   Sparkles,
   Square,
+  SquareDashed,
   Trash2,
   X,
 } from 'lucide-react';
@@ -122,15 +128,16 @@ function OutlineRulesDialog({ onClose }: { onClose: () => void }) {
 
 // ── 📚 卷管理弹层（v2.17：创建/编辑卷——卷介绍注入该卷各章的大纲生成，统一整卷方向） ──
 
-function VolumesDialog({ onClose }: { onClose: () => void }) {
+export function VolumesDialog({ onClose }: { onClose: () => void }) {
   const volumes = useStudioStore((s) => s.volumes);
   const chapters = useStudioStore((s) => s.chapters);
+  const boards = useStudioStore((s) => s.boards);
   return (
     <Dialog
       onClose={onClose}
       icon={<BookOpen />}
       title="卷管理"
-      subtitle="把章节分卷（第 1~3 章都属于第一卷…），给每卷写一段介绍——生成该卷各章大纲时会注入卷介绍，控制整卷方向、防止各章割裂。章节归卷在阅读区的「卷」下拉选择。随地图存档保存。"
+      subtitle="每卷对应一张独立画布：把章节分卷（第 1~3 章都属于第一卷…），给每卷写一段介绍——生成该卷各章大纲时会注入卷介绍与该卷画布。章节归卷在阅读区的「卷」下拉选择。删除卷会一并删除它的画布与节点（章节回到未分卷）。随地图存档保存。"
       footer={
         <>
           <Button
@@ -155,6 +162,8 @@ function VolumesDialog({ onClose }: { onClose: () => void }) {
       <div className="space-y-2">
         {volumes.map((v, i) => {
           const count = chapters.filter((c) => c.volumeId === v.id).length;
+          const nodeCount = boards[volumeBoardId(v.id)]?.nodes.length ?? 0;
+          const regionCount = boards[volumeBoardId(v.id)]?.regions.length ?? 0;
           return (
             <div key={v.id} className="rounded-[10px] border border-slate-200 bg-slate-50/60 p-2.5">
               <div className="mb-1.5 flex items-center gap-2">
@@ -165,13 +174,19 @@ function VolumesDialog({ onClose }: { onClose: () => void }) {
                   placeholder={`第${i + 1}卷`}
                   className="h-8 min-w-0 flex-1 font-semibold"
                 />
-                <span className="whitespace-nowrap text-[12px] text-slate-400">{count} 章</span>
+                <span className="whitespace-nowrap text-[12px] text-slate-400">
+                  {nodeCount} 节点 · {count} 章
+                </span>
                 <IconButton
                   icon={<Trash2 />}
-                  title="删除本卷（卷内章节回到未分卷，章节本身不删）"
+                  title="删除本卷及其画布（卷内节点一并删除；章节回到未分卷，章节本身不删）"
                   onClick={() => {
-                    if (window.confirm(`删除「${v.title || '未命名卷'}」？（卷内章节回到「未分卷」，章节本身不删）`))
-                      useStudioStore.getState().deleteVolume(v.id);
+                    const regionLine = regionCount > 0 ? `\n画布上的 ${regionCount} 个章节区域也会一并删除。` : '';
+                    const msg =
+                      nodeCount > 0
+                        ? `删除「${v.title || '未命名卷'}」？\n将一并删除该卷画布及其中 ${nodeCount} 个节点，且不可恢复。${regionLine}\n卷内 ${count} 章将回到「未分卷」（章节本身不删）。`
+                        : `删除「${v.title || '未命名卷'}」？${regionLine}\n卷内 ${count} 章将回到「未分卷」（章节本身不删）。`;
+                    if (window.confirm(msg)) useStudioStore.getState().deleteVolume(v.id);
                   }}
                 />
               </div>
@@ -193,13 +208,20 @@ function VolumesDialog({ onClose }: { onClose: () => void }) {
 export function OutlineManager({ onClose }: { onClose: () => void }) {
   const chapters = useStudioStore((s) => s.chapters);
   const volumes = useStudioStore((s) => s.volumes);
+  const boards = useStudioStore((s) => s.boards);
   const busyId = useStudioStore((s) => s.outlineBusyId);
   const generating = useUiStore((s) => s.generating);
   const engine = useEditorRoomStore((s) => s.settings.engine);
   const hasOutlineRules = useStudioStore((s) => !!s.outlineRules.trim());
-  const [selId, setSelId] = useState<string | null>(null);
+  // 📐 当前章节与正文管理器/画布区域高亮共用
+  const selId = useActiveChapterId();
+  const setActiveChapterId = useUiStore((s) => s.setActiveChapterId);
   const [rulesOpen, setRulesOpen] = useState(false);
   const [volumesOpen, setVolumesOpen] = useState(false);
+  // 推理耗尽 → 自动关闭推理重试的提示（仅本次生成有效）
+  const [fallbackNotice, setFallbackNotice] = useState('');
+  // 本次生成使用的舞台（快照/工作画布）与快照未同步提示
+  const [stageNotice, setStageNotice] = useState('');
   // 阅读系统配色：偏好存 nc2-reader-v1，默认米黄
   const [themeKey, setThemeKey] = useState('sepia');
 
@@ -210,6 +232,7 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
   // 📚 当前章所属卷（v2.17）+ 卷速查表（侧栏徽标用；派生 Map 走 useMemo，§8.6 坑）
   const volById = useMemo(() => new Map(volumes.map((v) => [v.id, v])), [volumes]);
   const volOfSel = sel?.volumeId ? volById.get(sel.volumeId) : undefined;
+  const selRegion = sel ? findChapterRegion(boards, sel.id) : null;
 
   // ✎ Ctrl+点画布人物节点 → 画布侧 dispatch，这里把人名以 [人名] 形式插进「本章需求」光标处（面板挂载才收得到，§8.8）。
   //  方括号标记画布人物（v2.14a 用户拍板）：原生 textarea 无法内嵌着色，用符号框住人名即可辨识；生成时 AI 也能看懂标记
@@ -260,37 +283,67 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
     }
   }, [themeKey]);
 
-  // 默认选中：无选中或选中章被删 → 落到首章
-  useEffect(() => {
-    if (chapters.length && !chapters.some((c) => c.id === selId)) setSelId(chapters[0].id);
-  }, [chapters, selId]);
-
   const addChapter = () => {
     const id = useStudioStore.getState().addChapter();
-    setSelId(id);
+    setActiveChapterId(id);
   };
 
   const removeChapter = (c: SimChapter) => {
-    if (!window.confirm(`删除《${c.title || '未命名'}》？（其需求与大纲一并删除）`)) return;
+    if (!window.confirm(`删除《${c.title || '未命名'}》？（其需求、大纲与章节区域一并删除）`)) return;
+    const i = chapters.findIndex((x) => x.id === c.id);
+    const next = chapters[i + 1] ?? chapters[i - 1] ?? null;
     useStudioStore.getState().deleteChapter(c.id);
+    setActiveChapterId(next?.id ?? null);
+  };
+
+  const changeVolume = (nextVolumeId: string) => {
+    if (!sel) return;
+    const st = useStudioStore.getState();
+    const from = chapterBoardOf(sel.volumeId, volumes, boards);
+    const to = chapterBoardOf(nextVolumeId, volumes, boards);
+    if (selRegion && from !== to) {
+      const ok = window.confirm('本章已绑定区域。更换所属卷会删除该区域（需在新画布重新绘制），继续？');
+      if (!ok) return;
+    }
+    st.updateChapter(sel.id, { volumeId: nextVolumeId });
+  };
+
+  const openRegion = () => {
+    if (!sel) return;
+    const r = beginChapterRegion(sel.id);
+    if (!r.ok) {
+      window.alert(r.message);
+      return;
+    }
+    onClose();
   };
 
   const gen = async () => {
     if (!sel || isBusy || generating) return;
     const st = useStudioStore.getState();
     const idx = st.chapters.findIndex((c) => c.id === sel.id);
+    const latest = st.chapters[idx];
+    const snap = latest?.snapshot;
+    const snapBoard = snap ? st.boards[snap.boardId] : undefined;
+    const staleText = snap
+      ? snapshotIssueText(snap, snapBoard, snapBoard?.regions.find((r) => r.chapterId === sel.id))
+      : '';
     st.updateChapter(sel.id, { outline: '' });
     st.setOutlineBusy(sel.id);
+    setFallbackNotice('');
+    setStageNotice('');
     let lastFlush = 0;
     const { engine: eng, reasoningEffort } = useEditorRoomStore.getState().settings;
     // 🏛 作品责任编辑：注入其职责与「章节大纲规则」技能记忆（v2.21）
     const responsible = useEditorialStore.getState().getWorkResponsibleData('章节大纲规则');
     const r = await genChapterOutline({
+      chapterId: sel.id,
       chapter: { title: sel.title, requirement: sel.requirement, volumeId: sel.volumeId },
       prevChapters: st.chapters.slice(Math.max(0, idx - 3), idx),
       engine: eng,
       reasoningEffort,
       ...(responsible ? { responsible } : {}),
+      onFallback: setFallbackNotice,
       onDelta: (acc) => {
         const now = Date.now();
         if (now - lastFlush > 400) {
@@ -303,6 +356,15 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
     s2.setOutlineBusy(null);
     if (r.ok && r.outline !== undefined) s2.updateChapter(sel.id, { outline: r.outline });
     else if (r.error && r.error !== '已停止') window.alert(`❌ 生成失败：${r.error}`);
+    const notes: string[] = [];
+    if (staleText) notes.push(`本章快照未同步（${staleText}）；本次仍按快照生成，请到「本章名单」手动刷新`);
+    if (r.ok && r.stage) {
+      if (r.stage.capturedNow) notes.push('已自动记录本章名单，后续生成将按名单约束');
+      else if (r.stage.mode === 'legacy') notes.push('本章未记录快照，本次使用工作画布全部资料');
+      for (const w of r.stage.warnings) if (!notes.some((n) => n.includes(w))) notes.push(w);
+    }
+    if (notes.length) setStageNotice(notes.join('；'));
+    flushStudioPersist();
   };
 
   // 阅读主题 → CSS 变量（子元素用任意值类取 --rd-card / --rd-btn / --rd-border / --rd-sub）
@@ -340,6 +402,11 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
           <span className="hidden items-center gap-1 whitespace-nowrap text-[12px] sm:flex" style={{ color: t.sub }}>
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
             生成中
+          </span>
+        )}
+        {fallbackNotice && (
+          <span className="flex items-center gap-1 whitespace-nowrap text-[12px] text-amber-600" title={fallbackNotice}>
+            ⚠ 已关闭推理重试
           </span>
         )}
         {/* 阅读配色（与正文阅读器互通） */}
@@ -398,7 +465,7 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
             {chapters.map((c, i) => (
               <button
                 key={c.id}
-                onClick={() => setSelId(c.id)}
+                onClick={() => setActiveChapterId(c.id)}
                 className={`flex w-full items-center gap-1.5 rounded-[8px] px-2 py-1.5 text-left text-[12.5px] transition ${
                   c.id === selId ? 'font-semibold' : 'hover:bg-[var(--rd-btn-hover)]'
                 }`}
@@ -445,7 +512,7 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
                 </span>
                 <select
                   value={sel.volumeId}
-                  onChange={(e) => useStudioStore.getState().updateChapter(sel.id, { volumeId: e.target.value })}
+                  onChange={(e) => changeVolume(e.target.value)}
                   className="rounded-[8px] border px-2 py-1 text-[12.5px] transition"
                   style={{ borderColor: t.border, background: t.card, color: t.text }}
                   title="本章所属卷：生成大纲时注入该卷的卷介绍，控制整卷方向（卷的创建/编辑在右上「卷」）"
@@ -462,6 +529,24 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
                     {volOfSel.intro.trim() || '（卷介绍未填写——点右上「卷」编辑）'}
                   </span>
                 )}
+                <button
+                  type="button"
+                  onClick={openRegion}
+                  className="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-[8px] border px-2 py-1 text-[12px] transition hover:opacity-80"
+                  style={
+                    selRegion
+                      ? { background: t.accentSoft, color: t.accent, borderColor: t.border }
+                      : { background: t.card, color: t.sub, borderColor: t.border }
+                  }
+                  title={
+                    selRegion
+                      ? '本章区域已绑定：点击切到所属画布并定位区域'
+                      : '为本章绘制区域：在画布上拖出矩形，用于圈定本章的舞台范围'
+                  }
+                >
+                  <SquareDashed className="h-3.5 w-3.5" />
+                  {selRegion ? '区域已绑定' : '画区域'}
+                </button>
               </div>
               {/* 章名（点题即改）+ 排序/删除 */}
               <div className="flex items-center gap-0.5">
@@ -519,6 +604,8 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
                   className="w-full resize-y bg-transparent text-[13.5px] leading-7 placeholder:opacity-40 focus:outline-none"
                 />
               </div>
+              {/* 🎭 本章名单 / 📸 快照（R2/R3） */}
+              <ChapterRosterPanel chapter={sel} onRequestClose={onClose} />
               {/* 生成行 */}
               <div className="mt-3 flex flex-wrap items-center gap-2">
                 {isBusy ? (
@@ -551,6 +638,11 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
                   <span className="text-[12px] tabular-nums" style={{ color: t.sub }}>{sel.outline.length} 字</span>
                 )}
               </div>
+              {stageNotice && (
+                <div className="mt-1.5 rounded-[8px] border border-amber-300/60 bg-amber-50/60 px-2.5 py-1.5 text-[11.5px] leading-relaxed text-amber-800">
+                  {stageNotice}
+                </div>
+              )}
               {/* 大纲正文（阅读视图，衬线+宽行距，随主题取色） */}
               <div className="mt-4">
                 {sel.outline.trim() ? (

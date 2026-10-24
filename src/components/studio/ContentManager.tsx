@@ -6,15 +6,19 @@
  *  配色沿用阅读器四档主题（与大纲管理器/正文阅读器共用 nc2-reader-v1 偏好互通）；
  *  与全局生成互斥共用，关面板不中断生成。 */
 import { useEffect, useState, type CSSProperties } from 'react';
-import { useStudioStore } from '../../stores/studioStore';
+import { flushStudioPersist, useStudioStore } from '../../stores/studioStore';
+import { findChapterRegion } from '../../stores/chapterRegions';
+import { snapshotIssueText } from '../../stores/chapterSnapshots';
+import { ChapterRosterPanel } from './ChapterRosterPanel';
 import { useEditorRoomStore } from '../../stores/editorRoomStore';
 import { useUiStore } from '../../stores/uiStore';
 import { genChapterContent } from '../../engines/studioEngine';
 import { stopGeneration } from '../../shared/generation';
 import { useEditorialStore } from '../../stores/editorialStore';
 import { READER_PREF_KEY, READER_THEMES } from './readerThemes';
+import { useActiveChapterId } from './useActiveChapter';
 import type { SimChapter } from '../../types/sim';
-import { BookOpen, ChevronDown, ChevronRight, Cpu, FileText, Loader2, Minus, Plus, RotateCcw, Sparkles, Square, X } from 'lucide-react';
+import { BookOpen, ChevronDown, ChevronRight, Cpu, FileText, Loader2, Minus, Plus, RotateCcw, Sparkles, Square, SquareDashed, X } from 'lucide-react';
 
 /** 大纲速览（正文上方的参考折叠条）：## 小标题/列表/段落 简化渲染 + **加粗** */
 function fmt(text: string): string {
@@ -102,11 +106,15 @@ function readReaderPref(): { theme: string; font: number } {
 
 export function ContentManager({ onClose }: { onClose: () => void }) {
   const chapters = useStudioStore((s) => s.chapters);
+  const boards = useStudioStore((s) => s.boards);
   const busyId = useStudioStore((s) => s.contentBusyId);
   const generating = useUiStore((s) => s.generating);
   const contentEngine = useEditorRoomStore((s) => s.settings.contentEngine);
-  const [selId, setSelId] = useState<string | null>(null);
+  // 📐 当前章节与大纲管理器/画布区域高亮共用
+  const selId = useActiveChapterId();
+  const setActiveChapterId = useUiStore((s) => s.setActiveChapterId);
   const [peekOpen, setPeekOpen] = useState(false);
+  const [stageNotice, setStageNotice] = useState('');
   // 阅读系统配色/字号：与正文阅读器/大纲管理器共用偏好（nc2-reader-v1），默认米黄 + 18px
   const [initialPref] = useState(readReaderPref);
   const [themeKey, setThemeKey] = useState(initialPref.theme);
@@ -114,6 +122,7 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
 
   const selIdx = chapters.findIndex((c) => c.id === selId);
   const sel = selIdx >= 0 ? chapters[selIdx] : null;
+  const selRegion = sel ? findChapterRegion(boards, sel.id) : null;
   const isBusy = !!sel && busyId === sel.id;
   // 硬门槛：本章大纲已生成 → 生成正文才可点击
   const canGen = !!sel && !!sel.outline.trim();
@@ -128,24 +137,27 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
     }
   }, [themeKey, fontSize]);
 
-  // 默认选中：无选中或选中章被删 → 落到首章
-  useEffect(() => {
-    if (chapters.length && !chapters.some((c) => c.id === selId)) setSelId(chapters[0].id);
-  }, [chapters, selId]);
-
   const gen = async () => {
     if (!sel || !canGen || isBusy || generating) return;
     const st = useStudioStore.getState();
     const idx = st.chapters.findIndex((c) => c.id === sel.id);
+    const latest = st.chapters[idx];
+    const snap = latest?.snapshot;
+    const snapBoard = snap ? st.boards[snap.boardId] : undefined;
+    const staleText = snap
+      ? snapshotIssueText(snap, snapBoard, snapBoard?.regions.find((r) => r.chapterId === sel.id))
+      : '';
     st.updateChapter(sel.id, { content: '' });
     st.setContentBusy(sel.id);
     setPeekOpen(false);
+    setStageNotice('');
     let lastFlush = 0;
     const engine = useEditorRoomStore.getState().settings.contentEngine;
     // 🏛 作品责任编辑：注入其职责与「正文生成」技能记忆（v2.21）
     const responsible = useEditorialStore.getState().getWorkResponsibleData('正文生成');
     const r = await genChapterContent({
-      chapter: { title: sel.title, requirement: sel.requirement, outline: sel.outline },
+      chapterId: sel.id,
+      chapter: { title: sel.title, requirement: sel.requirement, outline: sel.outline, volumeId: sel.volumeId },
       prevChapters: st.chapters.slice(Math.max(0, idx - 3), idx),
       engine,
       ...(responsible ? { responsible } : {}),
@@ -161,6 +173,15 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
     s2.setContentBusy(null);
     if (r.ok && r.content !== undefined) s2.updateChapter(sel.id, { content: r.content });
     else if (r.error && r.error !== '已停止') window.alert(`❌ 生成失败：${r.error}`);
+    const notes: string[] = [];
+    if (staleText) notes.push(`本章快照未同步（${staleText}）；本次仍按快照生成，请到「大纲 → 本章名单」手动刷新`);
+    if (r.ok && r.stage) {
+      if (r.stage.capturedNow) notes.push('已自动记录本章名单，后续生成将按名单约束');
+      else if (r.stage.mode === 'legacy') notes.push('本章未记录快照，本次使用工作画布全部资料');
+      for (const w of r.stage.warnings) if (!notes.some((n) => n.includes(w))) notes.push(w);
+    }
+    if (notes.length) setStageNotice(notes.join('；'));
+    flushStudioPersist();
   };
 
   // 阅读主题 → CSS 变量（子元素 Tailwind 任意值类取色）
@@ -268,7 +289,7 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
             {chapters.map((c, i) => (
               <button
                 key={c.id}
-                onClick={() => setSelId(c.id)}
+                onClick={() => setActiveChapterId(c.id)}
                 className={`flex w-full items-center gap-1.5 rounded-[8px] px-2 py-1.5 text-left text-[12.5px] transition ${
                   c.id === selId ? 'font-semibold' : 'hover:bg-[var(--rd-btn-hover)]'
                 }`}
@@ -298,6 +319,16 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
               {/* 章名（展示，编辑在大纲管理器） */}
               <div className="flex items-center gap-2">
                 <span className="min-w-0 flex-1 truncate text-[18px] font-semibold">{sel.title || '未命名'}</span>
+                {selRegion && (
+                  <span
+                    className="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border px-1.5 py-0.5 text-[11px]"
+                    style={{ borderColor: t.border, color: t.sub }}
+                    title="本章已在画布上绑定区域（在大纲面板可定位或重画）"
+                  >
+                    <SquareDashed className="h-3 w-3" />
+                    区域已绑定
+                  </span>
+                )}
                 {!isBusy && sel.content.trim() && (
                   <span className="whitespace-nowrap text-[12px] tabular-nums" style={{ color: t.sub }}>{sel.content.length} 字</span>
                 )}
@@ -328,6 +359,8 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
                   本章还没有大纲——正文生成的依据是大纲，请先到「大纲」为本章生成大纲。
                 </div>
               )}
+              {/* 🎭 本章名单 / 📸 快照（只读摘要；编辑在大纲管理器） */}
+              <ChapterRosterPanel chapter={sel} readonly />
               {/* 生成行 */}
               <div className="mt-3 flex flex-wrap items-center gap-2">
                 {isBusy ? (
@@ -360,6 +393,11 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
                   <span className="text-[12px]" style={{ color: t.sub }}>按本章大纲写正文，{ENGINE_LABEL[contentEngine]}执笔</span>
                 )}
               </div>
+              {stageNotice && (
+                <div className="mt-1.5 rounded-[8px] border border-amber-300/60 bg-amber-50/60 px-2.5 py-1.5 text-[11.5px] leading-relaxed text-amber-800">
+                  {stageNotice}
+                </div>
+              )}
               {/* 作品责编在顶栏选择（v2.21）：生成正文时注入其职责与「正文生成」技能记忆 */}
               {/* 正文阅读视图 */}
               <div className="mt-4">

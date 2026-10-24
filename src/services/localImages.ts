@@ -1,6 +1,7 @@
 /** 本地图片仓（IndexedDB）：AI 生成的图片以 data URL 存浏览器本地，持久化数据里不留服务器 URL——
  *  服务器 media GC（10 分钟保护窗）自动回收无引用文件，本地副本长期保留。
- *  单库单 store，key 按用途加前缀：portrait:<nodeId>（人物写真）/ chat:<msgId>:<i>（编辑室生图块）… */
+ *  单库单 store，key 按用途加前缀：portrait:<nodeId>:<stateId>（人物状态写真；旧 portrait:<nodeId> 仅迁移状态0）/
+ *  chat:<msgId>:<i>（编辑室生图块）… */
 import { urlToDataUrl } from './imgApi';
 
 const DB_NAME = 'nc2-imglocal-v1';
@@ -42,6 +43,15 @@ export async function localImgSet(key: string, dataUrl: string): Promise<void> {
 
 export async function localImgDel(key: string): Promise<void> {
   await tx('readwrite', (s) => s.delete(key));
+}
+
+/** 复制本地图片（跨卷「复制为新」：portrait:<旧ID> → portrait:<新ID>）。
+ *  返回 'missing'=源人物本来就没有写真（不算失败，不提示）；读写异常则抛出，由调用方降级为警告，不阻塞节点复制。 */
+export async function localImgCopy(fromKey: string, toKey: string): Promise<'copied' | 'missing'> {
+  const data = await localImgGet(fromKey);
+  if (!data) return 'missing';
+  await localImgSet(toKey, data);
+  return 'copied';
 }
 
 /** 生成完成后立即把服务器临时图片抓回本地转 data URL 存仓（抢在 10 分钟 GC 前），返回 data URL */

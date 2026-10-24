@@ -1,19 +1,33 @@
 /** 🎭 编辑室右侧停靠面板（创作台页内浮层）：AI 对话搭建故事舞台。
  *  流式回复、停止/重生成/复制/删除/清空、⚙ 设置（列宽/压缩/📜附带规则与目标——v2.19 默认不注入规则/目标；模型与推理统一移到「模型中心」，v2.27）、历史持久化（nc2-sim-agent-v1）；
  *  回复带【人物设定】/【环境设定】块时气泡下方出「📎 落为人物/环境」按钮——创建节点、填好属性、
- *  落点在某环境内自动归入嵌套（与顶栏创建同语义）；带【区域规划】块时出「📎 落为规划」——
+ *  落点在某环境内自动归入嵌套（与顶栏创建同语义）；块名与画布节点同名（或块带「更新：已有节点名」）时
+ *  自动识别为修改，出「✏️ 更新…」，只覆盖块里写出的字段、未写字段保留原值（重名等无法判定才给下拉）；
+ *  带【区域规划】块时出「📎 落为规划」——
  *  容器+N 座建筑整组落地，建筑按 AI 给的大小/位置摆好并自动成为容器子节点（v2.7）。
  *  关面板不中断生成，重开继续看流式进度。 */
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useReactFlow } from '@xyflow/react';
 import { useEditorRoomStore, type EditorRoomMessage, type EditorRoomSettings } from '../../stores/editorRoomStore';
-import { useStudioStore, findContainerAt } from '../../stores/studioStore';
+import {
+  useStudioStore,
+  findContainerAt,
+  findViewportDropPosition,
+  findChildDropPosition,
+  resolveBoardRef,
+  boardLabel,
+  ENV_DEFAULT_W,
+  ENV_DEFAULT_H,
+} from '../../stores/studioStore';
+import { ENV_TYPE_LABELS, isContainerEnv, type EnvironmentData, type SimNodeType } from '../../types/sim';
 import { useUiStore } from '../../stores/uiStore';
 import { REASONING_EFFORT_LABEL } from '../../shared/qwenClient';
-import { genImage, type EditorRoomBlock, type ResponsibleEditor, type SimBlock, type SimImageBlock, type SimPlanBlock, type SimVolumeBlock } from '../../engines/studioEngine';
+import { genImage, type EditorRoomBlock, type EditorStateBlock, type ResponsibleEditor, type SimBlock, type SimImageBlock, type SimPlanBlock, type SimVolumeBlock } from '../../engines/studioEngine';
+import { activeCharacterState, characterStateIndex, DEFAULT_STATE_ID } from '../../stores/characterStates';
+import { referenceChapterText, stateReferenceSummary } from '../../stores/snapshotRefs';
 import { SimWriteButtons } from './SimWriteButtons';
 import { pickRandomCharAsset } from '../../services/charAssetApi';
-import { localImgGet, localImgSaveFromUrl } from '../../services/localImages';
+import { localImgDel, localImgGet, localImgSaveFromUrl } from '../../services/localImages';
 import { EDITOR_MODULES, useEditorialStore } from '../../stores/editorialStore';
 import { MeetingView } from './MeetingView';
 import { EditorialDeptDialog } from './EditorialDeptDialog';
@@ -52,6 +66,58 @@ function fmt(text: string): string {
 }
 
 /** token 数缩写：1234 → 1.2K，1234567 → 1.2M */
+// 人物节点渲染前没有实测尺寸：落点居中/避让按经验尺寸估算（与 StudioPage 一致）
+const CHAR_NOMINAL_SIZE = { w: 144, h: 104 };
+
+/** 节点名归一化（去引号/空白/前置类型词），用于把设定块名字/「更新：」目标与画布节点对上 */
+function normNodeName(s: string | undefined): string {
+  return (s || '').replace(/[「」『』《》"'“”]/g, '').replace(/\s+/g, '').replace(/^(?:人物|环境)/, '');
+}
+
+/** 「所在」路径拆分：「清风镇＞铁匠铺」→ ['清风镇','铁匠铺']（兼容 ＞ / > / → / 斜杠） */
+function splitEnvRef(ref: string): string[] {
+  return ref
+    .split(/[＞>→/／]/)
+    .map((s) => normNodeName(s))
+    .filter(Boolean);
+}
+
+/** 按环境名/层级路径定位画布上的容器环境：路径匹配祖先链末尾，同名环境可用「镇＞建筑」区分。
+ *  只返回可容纳子节点的容器（物品不算）。 */
+type EnvNode = SimNodeType & { data: EnvironmentData };
+function findEnvByRef(nodes: SimNodeType[], ref: string | undefined): EnvNode[] {
+  const segs = ref ? splitEnvRef(ref) : [];
+  if (!segs.length) return [];
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const pathOf = (n: SimNodeType): string[] => {
+    const out: string[] = [];
+    const guard = new Set<string>();
+    let cur: SimNodeType | undefined = n;
+    while (cur && cur.data.kind === 'environment' && !guard.has(cur.id)) {
+      guard.add(cur.id);
+      out.unshift(normNodeName(cur.data.name));
+      cur = cur.parentId ? byId.get(cur.parentId) : undefined;
+    }
+    return out;
+  };
+  // 兼容 AI 在名字前带上类型词（「建筑铁匠铺」）：路径名与引用词两侧都试一次去前缀
+  const stripType = (s: string) => s.replace(/^(?:房间|建筑|社区|城镇|区域|床|物品)/, '');
+  return nodes.filter((n) => {
+    if (n.data.kind !== 'environment' || !isContainerEnv(n.data.etype)) return false;
+    const path = pathOf(n);
+    if (path.length < segs.length) return false;
+    const tail = path.slice(path.length - segs.length);
+    return tail.every((name, i) => name === segs[i] || stripType(name) === segs[i] || name === stripType(segs[i]));
+  }) as EnvNode[];
+}
+
+/** 更新目标下拉的展示名：同名环境用「所在环境」区分 */
+function nodeOptionLabel(n: SimNodeType, nodes: SimNodeType[]): string {
+  const name = n.data.name || '未命名';
+  const parent = n.parentId ? nodes.find((x) => x.id === n.parentId) : undefined;
+  return parent && parent.data.kind === 'environment' ? `${name}（在${parent.data.name || '未命名'}内）` : name;
+}
+
 function fmtK(n: number): string {
   return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
 }
@@ -214,44 +280,334 @@ function SettingsPop({ onClose }: { onClose: () => void }) {
 
 // ── 📎 设定块按钮行：「📎 落为人物 / 落为环境 / 落为规划」（逐块落，落过的置灰防重复） ──
 
+const NO_NODES: SimNodeType[] = [];
+
 function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
   const [dropped, setDropped] = useState<Set<number>>(new Set());
   const [doneMsg, setDoneMsg] = useState('');
   const reactFlow = useReactFlow();
+  const boards = useStudioStore((s) => s.boards);
+  const volumes = useStudioStore((s) => s.volumes);
+  const activeBoardId = useStudioStore((s) => s.activeBoardId);
+  const nodes = useStudioStore((s) => s.boards[s.activeBoardId]?.nodes) ?? NO_NODES;
   if (!msg.blocks?.length) return null;
 
-  // 视口中心级进落点（与顶栏 ＋人物/＋环境 一致）
-  const centerPos = () => {
-    const c = reactFlow.screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
-    const n = useStudioStore.getState().nodes.length;
-    return { x: c.x + n * 24, y: c.y + n * 24 };
+  // 🗂 卷目标解析：省略「卷：」= 当前画布；写错/重名绝不回退当前画布。
+  const resolveBlockBoard = (b: { volume?: string }) => {
+    // 用实时 store：批量落地时前一秒刚创建的节点/卷也要能被后续块看到
+    const st = useStudioStore.getState();
+    if (!b.volume) {
+      const board = st.boards[st.activeBoardId];
+      return board
+        ? ({ board, label: boardLabel(board, st.volumes) } as const)
+        : ({ error: '当前画布不存在' } as const);
+    }
+    const r = resolveBoardRef(st.boards, st.volumes, b.volume);
+    if ('error' in r) return { error: r.message } as const;
+    return { board: r.board, label: boardLabel(r.board, st.volumes) } as const;
   };
+
+  // 视口中心落点（与顶栏 ＋人物/＋环境 一致：按节点尺寸居中，附近小范围错开，始终在可视区内）。
+  // 指定非当前卷时用目标画布自己的视口/节点，不借用当前标签的视口。
+  const dropPos = (size: { w: number; h: number }, board = boards[activeBoardId]) => {
+    if (!board) return { x: 0, y: 0 };
+    if (board.id === activeBoardId) {
+      const tl = reactFlow.screenToFlowPosition({ x: 0, y: 0 });
+      const br = reactFlow.screenToFlowPosition({ x: window.innerWidth, y: window.innerHeight });
+      return findViewportDropPosition(board.nodes, { x: tl.x, y: tl.y, w: br.x - tl.x, h: br.y - tl.y }, size);
+    }
+    const vp = board.viewport;
+    const visible = vp
+      ? {
+          x: -vp.x / vp.zoom,
+          y: -vp.y / vp.zoom,
+          w: window.innerWidth / vp.zoom,
+          h: window.innerHeight / vp.zoom,
+        }
+      : { x: 0, y: 0, w: window.innerWidth, h: window.innerHeight };
+    return findViewportDropPosition(board.nodes, visible, size);
+  };
+
+  const boardSuffix = (board: { id: string }, label: string) =>
+    board.id === activeBoardId ? '' : `，已落到「${label}」画布`;
 
   const drop = (b: EditorRoomBlock, i: number) => {
     setDoneMsg('');
+    const rb = resolveBlockBoard(b);
+    if ('error' in rb) {
+      setDoneMsg(`⚠ ${rb.error}，未落地`);
+      return;
+    }
+    const board = rb.board;
+    const boardNodes = board.nodes;
     const st = useStudioStore.getState();
-    const pos = centerPos();
-    const id = b.kind === 'character' ? st.createCharacter(pos) : st.createEnvironment(pos);
+    const size = b.kind === 'character' ? CHAR_NOMINAL_SIZE : { w: ENV_DEFAULT_W, h: ENV_DEFAULT_H };
+    // 📍「所在」：按名字/层级路径在目标画布定位父环境 → 容器内排位，创建后挂为其子节点（容器不够大则自动扩展）
+    const parentHits = b.parent ? findEnvByRef(boardNodes, b.parent) : [];
+    const parentNode = parentHits.length === 1 ? parentHits[0] : undefined;
+    const childSpot = parentNode ? findChildDropPosition(boardNodes, parentNode.id, size) : undefined;
+    const pos = childSpot?.pos ?? dropPos(size, board);
+    const select = board.id === activeBoardId;
+    const id =
+      b.kind === 'character'
+        ? st.createCharacterOnBoard(board.id, pos, { select })
+        : st.createEnvironmentOnBoard(board.id, pos, undefined, { select });
+    if (!id) {
+      setDoneMsg('⚠ 目标画布不存在，未落地');
+      return;
+    }
     if (b.kind === 'character') {
       const gender = b.gender ?? 'male';
-      st.updateCharacter(id, {
-        name: b.name,
-        gender,
-        age: b.age,
-        basicInfo: b.basicInfo ?? '',
-        identityInfo: b.identityInfo ?? '',
-        relations: b.relations,
-      });
+      st.updateCharacterOnBoard(board.id, id, { name: b.name, gender });
+      // 新建人物固定先写默认状态「状态0」；显式 stateId，异步形象也不会写进用户后来切到的状态
+      st.updateCharacterStateOnBoard(
+        board.id,
+        id,
+        {
+          ...(b.age ? { age: b.age } : {}),
+          basicInfo: b.basicInfo ?? '',
+          identityInfo: b.identityInfo ?? '',
+          relations: b.relations,
+        },
+        DEFAULT_STATE_ID,
+      );
       void pickRandomCharAsset(gender === 'female' ? '女' : '男', b.age)
         .then((avatar) => {
-          if (avatar) useStudioStore.getState().updateCharacter(id, { avatar });
+          if (avatar) useStudioStore.getState().updateCharacterStateOnBoard(board.id, id, { avatar }, DEFAULT_STATE_ID);
         })
         .catch(() => undefined);
-    } else st.updateEnvironment(id, { name: b.name, desc: b.desc ?? '', etype: b.etype ?? 'building' });
-    const container = findContainerAt(useStudioStore.getState().nodes, pos.x, pos.y, id);
-    if (container) st.reparentNode(id, container.id);
+    } else st.updateEnvironmentOnBoard(board.id, id, { name: b.name, desc: b.desc ?? '', etype: b.etype ?? 'building' });
+    if (parentNode) {
+      st.reparentNodeOnBoard(board.id, id, parentNode.id);
+      if (childSpot?.grow) st.resizeEnvironmentOnBoard(board.id, parentNode.id, childSpot.grow.w, childSpot.grow.h);
+    } else {
+      const latest = useStudioStore.getState().boards[board.id]?.nodes ?? [];
+      const container = findContainerAt(latest, pos.x + size.w / 2, pos.y + size.h / 2, id);
+      if (container) st.reparentNodeOnBoard(board.id, id, container.id);
+    }
     setDropped((prev) => new Set(prev).add(i));
-    setDoneMsg(b.kind === 'character' ? `✓ 人物「${b.name}」已落为画布节点` : `✓ 环境「${b.name}」已落为画布节点`);
+    // 明确反馈落点：在指定环境内创建成功 / 所在环境没唯一找到（退回视口落点）
+    const inParent =
+      parentNode
+        ? `，已创建在${ENV_TYPE_LABELS[parentNode.data.etype]}「${parentNode.data.name || '未命名'}」内`
+        : b.parent && parentHits.length !== 1
+          ? `（所在环境「${b.parent}」${parentHits.length > 1 ? '有多处同名' : '未找到'}，已按视口落点创建）`
+          : '';
+    setDoneMsg(
+      (b.kind === 'character'
+        ? `✓ 人物「${b.name}」已落为画布节点${inParent}`
+        : `✓ 环境「${b.name}」已落为画布节点${inParent}`) + boardSuffix(board, rb.label),
+    );
+  };
+
+  // ✏️ 更新已有节点：只覆盖块里写出的字段，未写字段保留原值（改名时「名字」写新名，target 仍是原名）
+  const updateExisting = (b: EditorRoomBlock, i: number, node: SimNodeType) => {
+    setDoneMsg('');
+    const rb = resolveBlockBoard(b);
+    if ('error' in rb) {
+      setDoneMsg(`⚠ ${rb.error}，未更新`);
+      return;
+    }
+    const board = rb.board;
+    const st = useStudioStore.getState();
+    const oldName = node.data.name || '未命名';
+    // 名字同样按归一化比较：仅书写差异（空格/引号）不算改名，避免「同名修改」把节点名改掉
+    const newName = b.name && b.name !== '未命名' && normNodeName(b.name) !== normNodeName(oldName) ? b.name : '';
+    if (b.kind === 'character' && node.data.kind === 'character') {
+      st.updateCharacterOnBoard(board.id, node.id, {
+        ...(newName ? { name: newName } : {}),
+        ...(b.gender ? { gender: b.gender } : {}),
+      });
+      // 旧【人物设定】块只改**当前状态**；要改指定状态必须用【人物状态】
+      st.updateActiveCharacterStateOnBoard(board.id, node.id, {
+        ...(b.age ? { age: b.age } : {}),
+        ...(b.basicInfo?.trim() ? { basicInfo: b.basicInfo } : {}),
+        ...(b.identityInfo?.trim() ? { identityInfo: b.identityInfo } : {}),
+        ...(b.relations?.trim() ? { relations: b.relations } : {}),
+      });
+    } else if (b.kind === 'environment' && node.data.kind === 'environment') {
+      st.updateEnvironmentOnBoard(board.id, node.id, {
+        ...(newName ? { name: newName } : {}),
+        ...(b.etype ? { etype: b.etype } : {}),
+        ...(b.desc?.trim() ? { desc: b.desc } : {}),
+      });
+    } else return;
+    // 📍「所在」也用于修改：把节点移入指定环境（重新定父级；目标环境须唯一）
+    let moved = '';
+    if (b.parent) {
+      const hits = findEnvByRef(board.nodes, b.parent);
+      const target = hits.length === 1 ? hits[0] : undefined;
+      if (target && target.id !== node.id) {
+        st.reparentNodeOnBoard(board.id, node.id, target.id);
+        moved = `，已移入${ENV_TYPE_LABELS[target.data.etype]}「${target.data.name || '未命名'}」`;
+      } else if (hits.length !== 1) {
+        moved = `（所在环境「${b.parent}」${hits.length > 1 ? '有多处同名' : '未找到'}，未移动归属）`;
+      }
+    }
+    setDropped((prev) => new Set(prev).add(i));
+    const renamed = newName ? ` → 「${newName}」` : '';
+    setDoneMsg(
+      `✓ 已更新${b.kind === 'character' ? '人物' : '环境'}「${oldName}」${renamed}${moved}` +
+        boardSuffix(board, rb.label),
+    );
+  };
+
+  // 🧬 人物状态块落地：只操作目标画布上按名唯一匹配的已有人物（绝不创建人物；找不到/重名就禁用）
+  const dropState = (b: EditorStateBlock, i: number) => {
+    setDoneMsg('');
+    if (b.parseError) {
+      setDoneMsg(`⚠ 状态块未落地：${b.parseError}`);
+      return;
+    }
+    const rb = resolveBlockBoard(b);
+    if ('error' in rb) {
+      setDoneMsg(`⚠ ${rb.error}，未落地`);
+      return;
+    }
+    const board = rb.board;
+    const st = useStudioStore.getState();
+    const key = normNodeName(b.character);
+    const hits = key ? board.nodes.filter((n) => n.data.kind === 'character' && normNodeName(n.data.name) === key) : [];
+    if (hits.length !== 1) {
+      setDoneMsg(
+        `⚠ ${hits.length > 1 ? '目标画布有多个同名人物' : '目标画布上未找到该人物'}「${b.character}」，未落地`,
+      );
+      return;
+    }
+    const node = hits[0];
+    if (node.data.kind !== 'character') return;
+    const d = node.data;
+    const err = (code: string) =>
+      ({
+        'not-found': '人物或状态不存在',
+        'base-not-found': '要复制的基准状态不存在',
+        'empty-label': '状态名不能为空',
+        'duplicate-label': '人物内已有同名状态',
+        protected: '默认状态（首项）不可删除',
+        'last-state': '人物至少保留一个状态',
+      })[code] || code;
+    const opErr = (r: { ok: true } | { ok: false; error: string }): string => (r.ok ? '' : err(r.error));
+    const patch = {
+      ...(typeof b.age === 'number' ? { age: b.age } : {}),
+      ...(b.basicInfo !== undefined ? { basicInfo: b.basicInfo } : {}),
+      ...(b.identityInfo !== undefined ? { identityInfo: b.identityInfo } : {}),
+      ...(b.relations !== undefined ? { relations: b.relations } : {}),
+    };
+    const target = b.state ? d.states.find((s) => s.label === b.state) : undefined;
+    // R5：状态块落地前提示引用影响（只提示，不阻止）
+    const impactTarget =
+      b.action === 'update' ? (target ?? activeCharacterState(d))
+      : b.action === 'rename' || b.action === 'delete' ? target
+      : undefined;
+    const impact = impactTarget ? stateReferenceSummary(st.chapters, board.id, node.id, impactTarget.id) : null;
+    const impactText = impact?.count
+      ? `\n\n该状态被 ${impact.count} 章引用：${referenceChapterText(impact, 6)}。${b.action === 'delete' ? '删除后这些章节会显示「资料缺失」' : '原地修改会改变这些历史章节的表现'}；快照不会自动更新。`
+      : '';
+    if (impactText && (b.action === 'update' || b.action === 'rename')) {
+      const verb = b.action === 'update' ? '修改' : '重命名';
+      if (!window.confirm(`将${verb}人物「${d.name || '未命名'}」的状态「${impactTarget!.label}」？${impactText}`)) return;
+    }
+    let ok = false;
+    let msg = '';
+    if (b.action === 'create') {
+      const label = (b.state || '').trim();
+      if (!label) {
+        setDoneMsg('⚠ 新建状态缺少状态名，未落地');
+        return;
+      }
+      if (d.states.some((s) => s.label === label)) {
+        setDoneMsg(`⚠ 人物「${d.name || '未命名'}」已有状态「${label}」，未落地`);
+        return;
+      }
+      const base = b.baseState ? d.states.find((s) => s.label === b.baseState) : activeCharacterState(d);
+      if (!base) {
+        setDoneMsg(`⚠ 基准状态「${b.baseState}」不存在，未落地`);
+        return;
+      }
+      const r = st.addCharacterStateOnBoard(board.id, node.id, {
+        label,
+        baseStateId: base.id,
+        patch,
+        activate: true,
+      });
+      ok = r.ok;
+      msg = ok
+        ? `✓ 人物「${d.name || '未命名'}」新建状态「${label}」（复制自「${base.label}」），已切换为当前状态`
+        : `⚠ 未新建状态：${opErr(r)}`;
+    } else if (b.action === 'update') {
+      const targetState = target ?? activeCharacterState(d);
+      if (b.state && !target) {
+        setDoneMsg(`⚠ 人物「${d.name || '未命名'}」没有状态「${b.state}」，未落地`);
+        return;
+      }
+      const r = st.updateCharacterStateOnBoard(board.id, node.id, patch, targetState.id);
+      ok = r.ok;
+      msg = ok
+        ? `✓ 已更新人物「${d.name || '未命名'}」状态「${targetState.label}」`
+        : `⚠ 未更新状态：${opErr(r)}`;
+    } else if (b.action === 'switch') {
+      if (!target) {
+        setDoneMsg(`⚠ 人物「${d.name || '未命名'}」没有状态「${b.state}」，未落地`);
+        return;
+      }
+      const r = st.switchCharacterStateOnBoard(board.id, node.id, target.id);
+      ok = r.ok;
+      msg = ok
+        ? `✓ 已切换人物「${d.name || '未命名'}」到状态「${target.label}」`
+        : `⚠ 未切换状态：${opErr(r)}`;
+    } else if (b.action === 'rename') {
+      if (!target) {
+        setDoneMsg(`⚠ 人物「${d.name || '未命名'}」没有状态「${b.state}」，未落地`);
+        return;
+      }
+      if (!b.newLabel) {
+        setDoneMsg('⚠ 重命名缺少新状态名，未落地');
+        return;
+      }
+      if (d.states.some((s) => s.id !== target.id && s.label === b.newLabel)) {
+        setDoneMsg(`⚠ 人物「${d.name || '未命名'}」已有状态「${b.newLabel}」，未落地`);
+        return;
+      }
+      const r = st.renameCharacterStateOnBoard(board.id, node.id, target.id, b.newLabel);
+      ok = r.ok;
+      msg = ok
+        ? `✓ 已将人物「${d.name || '未命名'}」状态「${target.label}」重命名为「${b.newLabel}」`
+        : `⚠ 未重命名状态：${opErr(r)}`;
+    } else if (b.action === 'delete') {
+      if (!target) {
+        setDoneMsg(`⚠ 人物「${d.name || '未命名'}」没有状态「${b.state}」，未落地`);
+        return;
+      }
+      if (characterStateIndex(d, target.id) === 0) {
+        setDoneMsg(`⚠ 状态「${target.label}」是默认状态（首项），不可删除`);
+        return;
+      }
+      if (!window.confirm(`删除人物「${d.name || '未命名'}」的状态「${target.label}」？该状态属性与写真引用会一并移除。${impactText}`)) return;
+      const r = st.deleteCharacterStateOnBoard(board.id, node.id, target.id);
+      ok = r.ok;
+      if (ok) {
+        const removedKey = r.ok ? r.removed?.portraitKey : undefined;
+        if (removedKey) {
+          const still = Object.values(useStudioStore.getState().boards).some((bd) =>
+            bd.nodes.some((n) => n.data.kind === 'character' && n.data.states.some((s) => s.portraitKey === removedKey)),
+          );
+          if (!still) void localImgDel(removedKey).catch(() => {});
+        }
+      }
+      msg = ok
+        ? `✓ 已删除人物「${d.name || '未命名'}」状态「${target.label}」`
+        : `⚠ 未删除状态：${opErr(r)}`;
+    } else {
+      setDoneMsg('⚠ 未识别状态动作，未落地');
+      return;
+    }
+    if (ok && impactText) {
+      msg += b.action === 'delete'
+        ? '；历史章节快照未变，相关名单将显示「资料缺失」'
+        : '；历史章节引用未变，快照不会自动更新';
+    }
+    if (ok) setDropped((prev) => new Set(prev).add(i));
+    setDoneMsg(msg + (ok ? boardSuffix(board, rb.label) : ''));
   };
 
   // 区域规划整组落地：容器（按规划范围尺寸）+ N 座建筑（按规划大小/位置摆好，reparentNode 自动换算相对坐标）。
@@ -259,10 +615,12 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
   const dropPlan = (b: SimPlanBlock, i: number) => {
     setDoneMsg('');
     const st = useStudioStore.getState();
-    const pos = centerPos();
-    const pid = st.createEnvironment(pos, { w: b.w, h: b.h });
+    const size = { w: b.w, h: b.h };
+    const pos = dropPos(size);
+    const pid = st.createEnvironment(pos, size);
     st.updateEnvironment(pid, { name: b.name, desc: b.desc ?? '', etype: b.etype });
-    const container = findContainerAt(useStudioStore.getState().nodes, pos.x, pos.y, pid);
+    const activeNodes = useStudioStore.getState().boards[useStudioStore.getState().activeBoardId]?.nodes ?? [];
+    const container = findContainerAt(activeNodes, pos.x + size.w / 2, pos.y + size.h / 2, pid);
     if (container) st.reparentNode(pid, container.id);
     for (const it of b.items) {
       const cid = st.createEnvironment({ x: pos.x + it.x, y: pos.y + it.y }, { w: it.w, h: it.h });
@@ -271,18 +629,18 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
     }
     // 收尾重选容器（创建过程每个新节点都自动选中过，归位于容器便于直接改名/拖动整组）
     const after = useStudioStore.getState();
-    after.onNodesChange(after.nodes.map((n2) => ({ id: n2.id, type: 'select' as const, selected: n2.id === pid })));
+    const afterNodes = after.boards[after.activeBoardId]?.nodes ?? [];
+    after.onNodesChange(afterNodes.map((n2) => ({ id: n2.id, type: 'select' as const, selected: n2.id === pid })));
     setDropped((prev) => new Set(prev).add(i));
     setDoneMsg(`✓ 规划「${b.name}」已落地（${b.items.length} 座建筑已嵌套）`);
   };
 
-  // 卷块：新建一卷（只新建，不覆盖已有卷）；标题重名不去重，由用户自行调整
+  // 卷块：新建卷 + 空画布（同名卷不重复创建；不自动切换当前标签——编辑室不改变用户视角）
   const dropVolume = (b: SimVolumeBlock, i: number) => {
     setDoneMsg('');
-    const id = useStudioStore.getState().addVolume();
-    useStudioStore.getState().updateVolume(id, { title: b.name, intro: b.intro });
+    const r = useStudioStore.getState().addVolumeFromBlock(b.name, b.intro);
     setDropped((prev) => new Set(prev).add(i));
-    setDoneMsg(`✓ 卷「${b.name}」已新建`);
+    setDoneMsg(r.created ? `✓ 卷「${b.name}」已新建（含空白画布）` : `✓ 同名卷「${b.name}」已存在，未重复创建`);
   };
 
   // 生图块：点按钮才真正调用生图 API（轮询到完成 → 展示 + 写入消息持久化；同块可重生成）
@@ -325,20 +683,57 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
     <div className="mt-1 flex flex-wrap items-center gap-1.5 px-1">
       {/* 🧬 批量落人物（v2.15）：回复含 ≥2 个未落的人物设定块时，一键全部落地（配合人物生成规则的批量产出） */}
       {(() => {
+        // 只批量新建画布上没有同名节点的块；同名块已自动识别为「修改」，不能重复创建
         const pending = msg.blocks
           .map((b, i) => ({ b, i }))
-          .filter((x): x is { b: EditorRoomBlock; i: number } => x.b.kind === 'character' && !dropped.has(x.i));
+          .filter((x): x is { b: EditorRoomBlock; i: number } => {
+            if (x.b.kind !== 'character' || x.b.target || !x.b.age || dropped.has(x.i)) return false;
+            const rb = resolveBlockBoard(x.b);
+            if ('error' in rb) return false; // 卷目标不明确：不批量落地，避免写错画布
+            const key = normNodeName(x.b.name);
+            return !key || !rb.board.nodes.some((n) => n.data.kind === 'character' && normNodeName(n.data.name) === key);
+          });
         return pending.length >= 2 ? (
           <button
             onClick={() => {
               pending.forEach(({ b, i }) => drop(b, i));
               setDoneMsg(`✓ ${pending.length} 个人物已全部落为画布节点`);
             }}
-            title="把本条回复的全部人物设定块逐个落为画布人物节点（属性按块填好，性别随块）"
+            title="把本条回复的全部新人物设定块逐个落为画布人物节点（同名人物会识别为修改，不在批量新建内）"
             className="flex items-center gap-1 rounded-full bg-brand-600 px-2.5 py-1 text-[12px] font-medium text-white transition hover:bg-brand-700"
           >
             <UserPlus className="h-3.5 w-3.5" />
             全部落为人物（{pending.length}）
+          </button>
+        ) : null;
+      })()}
+      {/* ✏️ 批量更新：回复里 ≥2 个块都能唯一匹配到画布已有节点（如「给医院里所有人统一加服装要求」）→ 一键全部更新；
+          同名节点只更新一次（以最后一个块为准），避免重复点击逐个确认 */}
+      {(() => {
+        const seen = new Map<string, { b: EditorRoomBlock; i: number; node: SimNodeType }>();
+        msg.blocks.forEach((b, i) => {
+          if (dropped.has(i) || (b.kind !== 'character' && b.kind !== 'environment')) return;
+          const block = b as EditorRoomBlock;
+          const key = normNodeName(block.target || block.name);
+          if (!key) return;
+          const rb = resolveBlockBoard(block);
+          if ('error' in rb) return;
+          const hits = rb.board.nodes.filter((n) => n.data.kind === block.kind && normNodeName(n.data.name) === key);
+          // 不同卷画布可能有同 ID 镜像节点：去重键必须带上画布
+          if (hits.length === 1) seen.set(`${rb.board.id}:${hits[0].id}`, { b: block, i, node: hits[0] });
+        });
+        const list = [...seen.values()];
+        return list.length >= 2 ? (
+          <button
+            onClick={() => {
+              list.forEach(({ b, i, node }) => updateExisting(b, i, node));
+              setDoneMsg(`✓ 已按本条回复更新 ${list.length} 个节点`);
+            }}
+            title="把本条回复里所有能唯一匹配到画布节点的设定块一次性更新（只覆盖块里写出的字段）"
+            className="flex items-center gap-1 rounded-full bg-emerald-600 px-2.5 py-1 text-[12px] font-medium text-white transition hover:bg-emerald-700"
+          >
+            <PenLine className="h-3.5 w-3.5" />
+            全部更新（{list.length}）
           </button>
         ) : null;
       })()}
@@ -382,6 +777,290 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
               {g?.status === 'generating' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ImageIcon className="h-3.5 w-3.5" />}
               {g?.status === 'generating' ? `生成中${g.progress ? ` ${g.progress}%` : '…'}` : g?.status === 'done' ? '重新生成图片' : '生成图片'}
             </button>
+          );
+        }
+        // 🧬 人物状态块：只操作已有人的状态；找不到人物/状态、重名、默认状态删除等一律禁用并说明原因
+        if (b.kind === 'characterState') {
+          const isDropped = dropped.has(i);
+          const rb = resolveBlockBoard(b);
+          if ('error' in rb) {
+            return (
+              <span key={`state-${b.character}-${i}`} className="inline-flex items-center gap-1">
+                <button
+                  disabled
+                  title={`${rb.error}。请让编辑室确认卷名，或先创建该卷；不会落到当前画布。`}
+                  className="flex cursor-not-allowed items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[12px] text-amber-700 opacity-80"
+                >
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  状态·{b.character} → 卷「{b.volume}」：{rb.error}
+                </button>
+              </span>
+            );
+          }
+          const key = normNodeName(b.character);
+          const hits = key
+            ? rb.board.nodes.filter((n) => n.data.kind === 'character' && normNodeName(n.data.name) === key)
+            : [];
+          const node = hits.length === 1 ? hits[0] : undefined;
+          const d = node?.data.kind === 'character' ? node.data : undefined;
+          let issue = b.parseError || '';
+          if (!issue && !key) issue = '缺少人物名';
+          if (!issue && hits.length > 1) issue = '目标画布有多个同名人物，请让编辑室用更准确的名字或先改名';
+          if (!issue && !node) issue = '目标画布上未找到该人物（状态块不会创建人物）';
+          if (!issue && d) {
+            const target = b.state ? d.states.find((s) => s.label === b.state) : undefined;
+            if (b.action === 'create') {
+              if (b.state && d.states.some((s) => s.label === b.state)) issue = `人物已有状态「${b.state}」`;
+              if (b.baseState && !d.states.some((s) => s.label === b.baseState)) issue = `基准状态「${b.baseState}」不存在`;
+            } else if (b.action === 'update') {
+              if (b.state && !target) issue = `人物没有状态「${b.state}」`;
+            } else if (b.action === 'switch' || b.action === 'rename' || b.action === 'delete') {
+              if (!target) issue = `人物没有状态「${b.state || '（未写）'}」`;
+            }
+            if (!issue && b.action === 'delete' && target && characterStateIndex(d, target.id) === 0) {
+              issue = '默认状态（首项）不可删除';
+            }
+            if (
+              !issue &&
+              b.action === 'rename' &&
+              b.newLabel &&
+              d.states.some((s) => s.label === b.newLabel)
+            ) {
+              issue = `人物已有状态「${b.newLabel}」`;
+            }
+          }
+          const current = d ? activeCharacterState(d) : undefined;
+          const targetLabel = b.state || current?.label || '当前状态';
+          const actLabel =
+            b.action === 'create'
+              ? `新建状态「${targetLabel}」`
+              : b.action === 'update'
+                ? `更新状态「${targetLabel}」`
+                : b.action === 'switch'
+                  ? `切换状态「${targetLabel}」`
+                  : b.action === 'rename'
+                    ? `重命名「${targetLabel}」→「${b.newLabel || '?'}」`
+                    : b.action === 'delete'
+                      ? `删除状态「${targetLabel}」`
+                      : '状态操作无效';
+          const title = issue
+            ? issue
+            : isDropped
+              ? '已执行（要再改可让它重新输出）'
+              : b.action === 'delete'
+                ? '删除该非默认状态（会先确认；默认状态与最后一个状态不可删）'
+                : b.action === 'create'
+                  ? `复制「${b.baseState || current?.label || '当前状态'}」的全部属性与写真引用，创建后设为当前状态`
+                  : b.action === 'rename'
+                    ? '只改状态标签，状态 ID 与属性不变'
+                    : b.action === 'switch'
+                      ? '把该状态设为当前状态（画布展示与后续章节生成使用它）'
+                      : '只覆盖块里写出的状态属性，未写的保留';
+          return (
+            <span key={`state-${b.character}-${i}`} className="inline-flex items-center gap-1">
+              {b.volume && (
+                <span
+                  title={`目标卷画布：${rb.label}`}
+                  className={`max-w-[110px] shrink-0 truncate rounded-full px-1.5 py-0.5 text-[11px] ${
+                    rb.board.id !== activeBoardId ? 'bg-brand-50 text-brand-700' : 'bg-slate-100 text-slate-500'
+                  }`}
+                >
+                  🗂{rb.label}
+                </span>
+              )}
+              <button
+                disabled={isDropped || !!issue}
+                onClick={() => dropState(b, i)}
+                title={title}
+                className={`flex items-center gap-1 rounded-full border px-2.5 py-1 text-[12px] transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                  issue
+                    ? 'border-amber-200 bg-amber-50 text-amber-700 opacity-80'
+                    : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                }`}
+              >
+                {isDropped ? (
+                  <>
+                    <Check className="h-3.5 w-3.5 text-emerald-500" />
+                    {b.character}·{actLabel} 已完成
+                  </>
+                ) : issue ? (
+                  <>
+                    <AlertTriangle className="h-3.5 w-3.5" />
+                    状态·{b.character}：{issue}
+                  </>
+                ) : (
+                  <>
+                    <Layers className="h-3.5 w-3.5" />
+                    {b.character}·{actLabel}
+                  </>
+                )}
+              </button>
+            </span>
+          );
+        }
+        // ✏️ 人物/环境块：创建与修改自动区分——
+        //   块名与画布上同名节点唯一匹配（或 AI 写了「更新：」）→ 修改已有节点，只覆盖块里写出的字段；
+        //   无同名节点 → 纯创建，不再给创建块挂「更新已有」选择器。
+        //   只有重名/找不到目标这类无法自动判定的情况才出选择器。
+        if (b.kind === 'character' || b.kind === 'environment') {
+          const isDropped = dropped.has(i);
+          const kindLabel = b.kind === 'character' ? '人物' : '环境';
+          const rb = resolveBlockBoard(b);
+          if ('error' in rb) {
+            // 卷目标写错/重名：禁用落地，绝不静默写进当前画布
+            return (
+              <span key={`${b.kind}-${b.name}-${i}`} className="inline-flex items-center gap-1">
+                <button
+                  disabled
+                  title={`${rb.error}。请让编辑室确认卷名，或先创建该卷；不会落到当前画布。`}
+                  className="flex cursor-not-allowed items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[12px] text-amber-700 opacity-80"
+                >
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  {kindLabel}「{b.name}」→ 卷「{b.volume}」：{rb.error}
+                </button>
+              </span>
+            );
+          }
+          const blockNodes = rb.board.nodes;
+          const crossBoard = rb.board.id !== activeBoardId;
+          const boardHint = crossBoard ? `「${rb.label}」画布` : '';
+          const sameKind = blockNodes.filter((n) => n.data.kind === b.kind);
+          const lookupName = normNodeName(b.target || b.name);
+          const hits = lookupName ? sameKind.filter((n) => normNodeName(n.data.name) === lookupName) : [];
+          const targetNode = hits.length === 1 ? hits[0] : undefined;
+          const autoMatched = !b.target && !!targetNode; // 块名即目标画布已有节点名 → 识别为修改
+          const ambiguous = hits.length > 1;
+          const missingTarget = !!b.target && hits.length === 0;
+          const issue = ambiguous
+            ? `目标画布有多个同名节点，请用右侧选择器指定`
+            : missingTarget
+              ? `${boardHint || '画布'}上未找到该节点`
+              : '';
+          // 📍「所在」：目标父环境（名字或 镇＞建筑 路径唯一定位）——只在目标画布内找
+          const parentHits = b.parent ? findEnvByRef(blockNodes, b.parent) : [];
+          const parentNode = parentHits.length === 1 ? parentHits[0] : undefined;
+          const parentHint = b.parent
+            ? parentNode
+              ? `将在${ENV_TYPE_LABELS[parentNode.data.etype]}「${parentNode.data.name || '未命名'}」内创建并归为其子节点`
+              : `未唯一找到所在环境「${b.parent}」（${parentHits.length > 1 ? '有多处同名' : '未找到'}），将按视口落点创建`
+            : '';
+          return (
+            <span key={`${b.kind}-${b.name}-${i}`} className="inline-flex items-center gap-1">
+              {b.volume && (
+                <span
+                  title={`目标卷画布：${rb.label}`}
+                  className={`max-w-[110px] shrink-0 truncate rounded-full px-1.5 py-0.5 text-[11px] ${
+                    crossBoard ? 'bg-brand-50 text-brand-700' : 'bg-slate-100 text-slate-500'
+                  }`}
+                >
+                  🗂{rb.label}
+                </span>
+              )}
+              {targetNode ? (
+                <button
+                  onClick={() => { if (targetNode) updateExisting(b, i, targetNode); }}
+                  disabled={isDropped}
+                  title={
+                    isDropped
+                      ? '已更新（要再改可让它重新输出）'
+                      : autoMatched
+                        ? `${boardHint || '画布上'}已有同名${kindLabel}，自动识别为修改：只覆盖块里写出的字段，其余保留原值`
+                        : `更新${boardHint || ''}已有${kindLabel}「${targetNode.data.name || '未命名'}」：只覆盖块里写出的字段，其余保留原值`
+                  }
+                  className="flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[12px] text-emerald-700 transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {isDropped ? <Check className="h-3.5 w-3.5" /> : <PenLine className="h-3.5 w-3.5" />}
+                  {isDropped
+                    ? `已更新${kindLabel}「${b.name}」`
+                    : `更新${kindLabel}「${targetNode.data.name || '未命名'}」`}
+                </button>
+              ) : ambiguous || missingTarget ? (
+                <button
+                  disabled
+                  title={issue}
+                  className="flex cursor-not-allowed items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[12px] text-amber-700 opacity-80"
+                >
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  {kindLabel}「{b.target || b.name}」：{issue}
+                </button>
+              ) : b.kind === 'character' && !b.age ? (
+                // 无同名节点 = 新建；新建人物仍要求年龄（修改块可省略年龄，但必须有同名/「更新：」目标）
+                <button
+                  disabled
+                  title="新建人物需要年龄：若这是修改已有节点，请让块名与画布节点当前名字一致，或让编辑室重新生成带年龄的设定"
+                  className="flex cursor-not-allowed items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[12px] text-amber-700 opacity-80"
+                >
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  {kindLabel}「{b.name}」：缺少年龄
+                </button>
+              ) : (
+                <button
+                  onClick={() => drop(b, i)}
+                  disabled={isDropped}
+                  title={
+                    isDropped
+                      ? `已落为画布${kindLabel}（再要一份可让它重新输出）`
+                      : b.parent
+                        ? parentHint
+                        : `落到画布视口中心：创建${kindLabel}并填好属性`
+                  }
+                  className="flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[12px] text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {isDropped ? (
+                    <>
+                      <Check className="h-3.5 w-3.5 text-emerald-500" />
+                      {kindLabel}「{b.name}」已落
+                    </>
+                  ) : (
+                    <>
+                      <Plus className="h-3.5 w-3.5" />
+                      落为{kindLabel}「{b.name}」
+                    </>
+                  )}
+                </button>
+              )}
+              {/* 📍所在位置提示：创建会进该父环境；修改会把节点移入该环境 */}
+              {b.parent && !isDropped && (
+                <span
+                  title={parentHint}
+                  className={`max-w-[120px] shrink-0 truncate rounded-full px-1.5 py-0.5 text-[11px] ${
+                    parentNode ? 'bg-slate-100 text-slate-500' : 'bg-amber-50 text-amber-600'
+                  }`}
+                >
+                  📍{parentNode ? parentNode.data.name || '未命名' : parentHits.length > 1 ? '所在重名' : '所在未找到'}
+                </span>
+              )}
+              {/* 仅无法自动判定（重名/AI 目标不存在）时才给选择器 */}
+              {(ambiguous || missingTarget) && !isDropped && sameKind.length > 0 && (
+                <select
+                  value=""
+                  onChange={(e) => {
+                    const node = sameKind.find((n) => n.id === e.target.value);
+                    if (node) updateExisting(b, i, node);
+                  }}
+                  title={`把设定块更新到已有${kindLabel}：只覆盖块里写出的字段，其余保留原值`}
+                  className="max-w-[160px] rounded-full border border-slate-200 bg-white px-2 py-1 text-[12px] text-slate-500 transition hover:bg-slate-50"
+                >
+                  <option value="">{b.target ? '✏️ 换更新目标…' : '✏️ 选择要更新的节点…'}</option>
+                  {sameKind.map((n) => (
+                    <option key={n.id} value={n.id}>
+                      {nodeOptionLabel(n, blockNodes)}
+                    </option>
+                  ))}
+                </select>
+              )}
+              {/* AI 指定的目标不存在时，仍可当新建用，避免块无法落地（新建人物仍需年龄） */}
+              {missingTarget && !isDropped && !(b.kind === 'character' && !b.age) && (
+                <button
+                  onClick={() => drop(b, i)}
+                  title={`不更新已有节点，另建一个新${kindLabel}`}
+                  className="flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-400 transition hover:bg-slate-50 hover:text-slate-600"
+                >
+                  <Plus className="h-3 w-3" />
+                  新建
+                </button>
+              )}
+            </span>
           );
         }
         const isDropped = dropped.has(i);
@@ -479,13 +1158,26 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   // 🧑‍💼 对话对象（v2.19b）：总编辑（默认）或编辑部某位编辑；名单合并必须 useMemo（选择器禁返回新数组）
   const chatEditor = useEditorRoomStore((s) => s.chatEditor);
+  const activeConvKey = useEditorRoomStore((s) => s.activeConvKey);
   const localEditors = useEditorialStore((s) => s.localEditors);
   const serverEditors = useEditorialStore((s) => s.serverEditors);
+  const serverLoaded = useEditorialStore((s) => s.serverLoaded);
   const editors = useMemo(() => [...localEditors, ...serverEditors].filter((e) => e.enabled), [localEditors, serverEditors]);
-  // 编辑被删除/停用后自动回总编辑
+  // 刷新恢复：chatEditor 对象不持久化，按 activeConvKey 从编辑名单找回（上下文随 messages/summary 已载入）；
+  // 正式编辑还没拉完时先等，确认编辑已删除/停用才把活动会话归档并回总编辑
   useEffect(() => {
-    if (chatEditor && !editors.some((e) => e.id === chatEditor.id)) useEditorRoomStore.getState().setChatEditor(null);
-  }, [chatEditor, editors]);
+    if (activeConvKey !== 'chief' && !editors.some((e) => e.id === activeConvKey) && !serverLoaded) return;
+    if (chatEditor) {
+      if (!editors.some((e) => e.id === chatEditor.id)) useEditorRoomStore.getState().dropOrphanConv();
+      return;
+    }
+    if (activeConvKey === 'chief') return;
+    const ed = editors.find((e) => e.id === activeConvKey);
+    if (ed) useEditorRoomStore.getState().restoreChatEditor(ed);
+    else useEditorRoomStore.getState().dropOrphanConv();
+  }, [chatEditor, activeConvKey, editors, serverLoaded]);
+  // 会话恢复中（编辑名单未就绪）：暂停发送，避免消息错发到总编辑上下文
+  const restoringConv = activeConvKey !== 'chief' && !chatEditor;
 
   // 🏛 作品责编技能记忆（v2.21）：作品责编（顶栏选择，随作品存档）在各模块的技能记忆解析为纯数据写入
   //  editorRoomStore（避免 store 循环依赖），总编辑对话（genSimTurn）按本轮话题命中注入；无技能记忆的模块不注入
@@ -805,7 +1497,7 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
           <>
             <span className="ml-1 whitespace-nowrap text-[12px] text-slate-400">对话对象</span>
             <select
-              value={chatEditor?.id ?? 'chief'}
+              value={chatEditor?.id ?? activeConvKey}
               onChange={(e) => {
                 const v = e.target.value;
                 if (v === 'chief') {
@@ -919,7 +1611,13 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
                 }
               }}
               rows={2}
-              placeholder={meetingRunning && routeChat ? '插话：会进入正在进行的会议讨论（Enter 发送）' : '描述想要的舞台：地点、人物、氛围…（Enter 发送）'}
+              placeholder={
+                restoringConv
+                  ? '正在恢复单独对话的上下文…'
+                  : meetingRunning && routeChat
+                    ? '插话：会进入正在进行的会议讨论（Enter 发送）'
+                    : '描述想要的舞台：地点、人物、氛围…（Enter 发送）'
+              }
               className="min-w-0 flex-1 resize-none rounded-[10px] border border-slate-200 bg-slate-50 px-3 py-2 text-[14px] leading-[1.7] text-slate-700 transition placeholder:text-slate-400 focus:border-brand-400 focus:bg-white focus:outline-none focus:ring-4 focus:ring-brand-500/10"
             />
             {meetingRunning ? (
@@ -931,7 +1629,13 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
                 停止
               </Button>
             ) : (
-              <Button variant="primary" icon={<Send />} onClick={send} disabled={!input.trim()}>
+              <Button
+                variant="primary"
+                icon={<Send />}
+                onClick={send}
+                disabled={!input.trim() || restoringConv}
+                title={restoringConv ? '正在恢复单独对话的上下文，请稍候' : undefined}
+              >
                 发送
               </Button>
             )}

@@ -5,9 +5,16 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent, MouseEvent } from 'react';
-import { BookOpen, ChevronLeft, ChevronRight, LibraryBig, Plus, X } from 'lucide-react';
-import { useStudioStore } from '../../stores/studioStore';
-import { deleteLocalArchive, listLocalArchives, loadLocalArchive } from '../../services/studioSync';
+import { BookOpen, ChevronLeft, ChevronRight, Download, LibraryBig, Plus, Upload, X } from 'lucide-react';
+import { useStudioStore, DEFAULT_BOARD_ID, emptyBoard } from '../../stores/studioStore';
+import {
+  archiveResultSummary,
+  deleteLocalArchive,
+  exportLocalArchive,
+  importLocalArchive,
+  listLocalArchives,
+  loadLocalArchive,
+} from '../../services/studioSync';
 import { bookHue } from '../../services/bookCover';
 import { IconButton } from '../ui/IconButton';
 
@@ -93,8 +100,10 @@ export function Bookshelf({ onClose }: { onClose: () => void }) {
   const [items, setItems] = useState(() => listLocalArchives());
   const graphName = useStudioStore((s) => s.graphName);
   const liveCover = useStudioStore((s) => s.cover);
-  const nodeCount = useStudioStore((s) => s.nodes.length);
+  // 书架节点数 = 全部画布合计（默认主画布 + 各卷）
+  const nodeCount = useStudioStore((s) => Object.values(s.boards).reduce((n, b) => n + b.nodes.length, 0));
   const rowRef = useRef<HTMLDivElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
   const [overflow, setOverflow] = useState<{ left: boolean; right: boolean }>({ left: false, right: false });
 
   const hasLive = nodeCount > 0 || graphName !== '未命名';
@@ -127,12 +136,65 @@ export function Bookshelf({ onClose }: { onClose: () => void }) {
   // 行为镜像原「打开/新建」按钮：确认文案一致；载入失败（快照损坏）不关书架
   const openArchive = (name: string) => {
     if (nodeCount > 1 && !window.confirm('载入将替换当前画布内容（当前内容已在本机留存），确定？')) return;
-    if (loadLocalArchive(name)) onClose();
+    const r = loadLocalArchive(name);
+    if (!r.ok) {
+      window.alert(r.error || `❌ 载入「${name}」失败。`);
+      return;
+    }
+    const summary = archiveResultSummary(r);
+    if (summary) window.alert(`已载入「${name}」（v${r.fromVersion} → v${r.fromVersion >= 3 ? r.fromVersion : 3}）\n\n${summary}`);
+    onClose();
+  };
+
+  const exportCurrent = () => {
+    if (!items.some((a) => a.name === graphName)) {
+      window.alert('当前作品还没有命名存档。先点顶栏「保存」再导出。');
+      return;
+    }
+    const r = exportLocalArchive(graphName);
+    if (!r.ok) {
+      window.alert(`导出失败：${r.error}`);
+      return;
+    }
+    const blob = new Blob([r.json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${graphName.replace(/[\\/:*?"<>|]/g, '_') || 'novels-canvas'}.novels-canvas.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importFile = async (file: File) => {
+    const text = await file.text();
+    let r = importLocalArchive(text, file.name);
+    if (r.conflict) {
+      if (!window.confirm(`本地已有同名存档「${r.name}」。覆盖该存档？`)) return;
+      r = importLocalArchive(text, file.name, { overwrite: true });
+    }
+    if (!r.ok) {
+      window.alert(`导入失败：${r.error || '未知错误'}（现有存档未改动）`);
+      return;
+    }
+    setItems(listLocalArchives());
+    const summary = archiveResultSummary(r);
+    window.alert(`已导入存档「${r.name}」到书架。${summary ? '\n\n' + summary : ''}`);
   };
   const startNewWork = () => {
     // replaceState 是合并语义：全字段显式清空（同顶栏「新建」）
     if (nodeCount > 0 && !window.confirm('清空当前创作台画布，重新开始？（当前内容已在本机留存）')) return;
-    useStudioStore.getState().replaceState({ nodes: [], edges: [], rules: '', outlineRules: '', charGenRules: '', mainGoal: '', volumes: [], chapters: [], responsibleId: '', cover: '' });
+    useStudioStore.getState().replaceState({
+      boards: { [DEFAULT_BOARD_ID]: emptyBoard(DEFAULT_BOARD_ID) },
+      activeBoardId: DEFAULT_BOARD_ID,
+      rules: '',
+      outlineRules: '',
+      charGenRules: '',
+      mainGoal: '',
+      volumes: [],
+      chapters: [],
+      responsibleId: '',
+      cover: '',
+    });
     useStudioStore.getState().setGraphName('未命名');
     onClose();
   };
@@ -155,6 +217,33 @@ export function Bookshelf({ onClose }: { onClose: () => void }) {
           <p className="text-[12px] text-slate-500">创作内容只保存在本机浏览器、不上传服务器</p>
         </div>
         <span className="flex-1" />
+        <button
+          onClick={exportCurrent}
+          title="把当前作品的命名存档导出为 v3 JSON 文件"
+          className="flex items-center gap-1 rounded-[8px] border border-slate-200 bg-white/80 px-2.5 py-1.5 text-[12px] text-slate-600 transition hover:bg-white hover:text-slate-800"
+        >
+          <Download className="h-3.5 w-3.5" />
+          导出当前存档
+        </button>
+        <button
+          onClick={() => fileRef.current?.click()}
+          title="从 JSON 文件导入存档（校验后保存到书架，不覆盖当前作品）"
+          className="flex items-center gap-1 rounded-[8px] border border-slate-200 bg-white/80 px-2.5 py-1.5 text-[12px] text-slate-600 transition hover:bg-white hover:text-slate-800"
+        >
+          <Upload className="h-3.5 w-3.5" />
+          导入存档
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".json,.novels-canvas,application/json"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            e.target.value = '';
+            if (f) void importFile(f);
+          }}
+        />
         <IconButton icon={<X />} title="关闭书架，返回画布" onClick={onClose} />
       </header>
 

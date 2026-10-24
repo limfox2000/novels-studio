@@ -1,26 +1,42 @@
 /** 创作台引擎——🎭 编辑室聊天（🏠 私有模型=设计/推演，双引擎分工；流式走 /api/qwen/chat，
  *  private=自建/租用 GPU 动作前 agentGate 预检、public=SaaS 中转常在线，gate/安全上限复用 agentShared 实现）。
- *  回复内嵌【人物设定】/【环境设定】/【区域规划】结构块 → parseSimBlocks 拆块 → 面板「📎 落为…」落到画布。
+ *  回复内嵌【人物设定】/【环境设定】/【区域规划】结构块 → parseSimBlocks 拆块 → 面板「📎 落为…」落到画布；
+ *  人物/环境块带「更新：已有节点名」时走「✏️ 更新…」修改已有节点（只覆盖块里写出的字段）。
  *  📋 章节大纲生成 genChapterOutline（章节大纲规则+全文目标+本章所属卷介绍+画布舞台+前情大纲；v2.14c 起不带全文规则）；
  *  📝 正文生成 genChapterContent（大纲硬门槛，🏠 私有模型 / 🌐 公共模型 二选一，双引擎分工）。
  *  🎯 全文目标 mainGoal（v2.16）：大纲/正文/随机人物默认注入统一方向；🎭 编辑室 v2.19 起默认不注入任何规则/目标
  *  （创意环境不被默认约束），⚙「📜 附带规则与目标」开启后才以【项目资料（按需参考）】提供四类规则/目标；
  *  📚 卷（v2.17）：章节分卷+卷介绍——大纲生成注入本章所属卷介绍，控制整卷各章方向（替代已下线的长期目标节点方案）。 */
-import { useStudioStore, ENV_MIN_W, ENV_MIN_H } from '../stores/studioStore';
+import { useStudioStore, boardLabel, ENV_MIN_W, ENV_MIN_H } from '../stores/studioStore';
+import { normalizeVolumeTitle } from '../stores/boardOps';
+import { chapterBoardOf, findChapterRegion } from '../stores/chapterRegions';
+import { stateReferenceAgentContext } from '../stores/snapshotRefs';
+import {
+  buildChapterAgentBrief,
+  buildChapterStageBlock,
+  buildLegacyStageBlock,
+  type ChapterStageContext,
+  type StageMode,
+} from './chapterContext';
 import { useEditorRoomStore } from '../stores/editorRoomStore';
 import { useUiStore } from '../stores/uiStore';
 import { GenerationAborted } from '../shared/generation';
 import { qwGenerate, REASONING_EFFORT_MAX_TOKENS, type QwenChatMessage, type QwenUsage, type ReasoningEffort } from '../shared/qwenClient';
 import { startGeneration, stopGeneration } from '../shared/generation';
 import { agentGate, promptCharBudget, QWEN_SAFE_LIMIT } from '../shared/agentShared';
-import { ENV_TYPE_LABELS, ENV_TYPE_META, GENDER_LABELS, genderOf, type CharacterGender, type EnvironmentType, type SimChapter, type SimNodeType, type SimVolume } from '../types/sim';
+import { ENV_TYPE_LABELS, ENV_TYPE_META, GENDER_LABELS, genderOf, type CharacterData, type CharacterGender, type CharacterState, type EnvironmentType, type SimChapter, type SimNodeType, type SimVolume } from '../types/sim';
+import { activeCharacterState, characterStateOf, DEFAULT_STATE_ID, DEFAULT_STATE_LABEL, portraitKeyForState, STATE_LABEL_CAP } from '../stores/characterStates';
 import { imgSubmit, imgTask, imgConfigCached } from '../services/imgApi';
 
 // ── 画布结构摘要（注入编辑室系统上下文）：地图名 + 环境层级链 + 人物（≤900 字符） ──
 
-export function simCanvasSummary(opts: { full?: boolean } = {}): string {
+export function simCanvasSummary(opts: { full?: boolean; boardId?: string } = {}): string {
   const cut = (s: string, n: number) => (opts.full ? s : s.slice(0, n));
-  const { nodes, graphName } = useStudioStore.getState();
+  const st = useStudioStore.getState();
+  const board = opts.boardId ? st.boards[opts.boardId] : st.boards[st.activeBoardId];
+  const nodes = board?.nodes ?? [];
+  const graphName = st.graphName;
+  const boardName = board ? boardLabel(board, st.volumes) : '画布不存在';
   const byId = new Map(nodes.map((n) => [n.id, n]));
   // 环境的祖先链：城镇「清风镇」＞建筑「铁匠铺」
   const envPath = (n: SimNodeType): string => {
@@ -37,7 +53,7 @@ export function simCanvasSummary(opts: { full?: boolean } = {}): string {
     }
     return chain.join('＞');
   };
-  const lines: string[] = [`地图名：${graphName || '未命名'}`];
+  const lines: string[] = [`地图名：${graphName || '未命名'}；画布：${boardName}`];
   if (!nodes.length) lines.push('画布为空（尚无环境/人物）');
   for (const n of nodes) {
     const d = n.data;
@@ -48,21 +64,364 @@ export function simCanvasSummary(opts: { full?: boolean } = {}): string {
       lines.push(`${ENV_TYPE_META[d.etype].icon} ${envPath(n)}：${cut(first, 24) || '（无描述）'}`);
     } else {
       const p = n.parentId ? byId.get(n.parentId) : undefined;
-      const at = p && p.data.kind === 'environment' ? `，在${ENV_TYPE_LABELS[p.data.etype]}「${p.data.name || '未命名'}」内` : '';
+      // 完整祖先链（镇＞建筑＞房间），否则「某建筑里都有谁」只能看到直属房间
+      const at = p && p.data.kind === 'environment' ? `，在${envPath(p)}内` : '';
       // 年龄/关系信息（v2.20）：年龄是基础属性随手带上；关系信息让 AI 知道人物之间的关系
-      const age = typeof d.age === 'number' && Number.isFinite(d.age) && d.age > 0 ? `/${d.age}岁` : '';
+      // v2.30 多状态：画布摘要只按**当前状态**给出（状态列表在按名检索时展开）
+      const state = activeCharacterState(d);
+      const age = typeof state.age === 'number' && Number.isFinite(state.age) && state.age > 0 ? `/${state.age}岁` : '';
       // v2.27 人物设定两层：基础信息（样子/性情）+ 身份信息（世界位置与故事钩子）
-      const basicAll = (d.basicInfo || '').trim();
-      const identAll = (d.identityInfo || '').trim();
+      const basicAll = (state.basicInfo || '').trim();
+      const identAll = (state.identityInfo || '').trim();
       const first = opts.full
         ? [basicAll, identAll].filter(Boolean).join('；')
         : basicAll.split('\n')[0] || identAll.split('\n')[0] || '';
-      const relAll = (d.relations || '').trim();
+      const relAll = (state.relations || '').trim();
       const rel = opts.full ? relAll : relAll.split('\n')[0] || '';
-      lines.push(`🧑 ${d.name || '未命名'}（${GENDER_LABELS[genderOf(d.gender)]}${age}${at}）：${cut(first, 24) || '（无基础/身份信息）'}${rel ? `｜关系：${cut(rel, 32)}` : ''}`);
+      const stateNote = d.states.length > 1 ? `｜状态：${state.label}` : '';
+      lines.push(`🧑 ${d.name || '未命名'}（${GENDER_LABELS[genderOf(d.gender)]}${age}${at}）：${cut(first, 24) || '（无基础/身份信息）'}${rel ? `｜关系：${cut(rel, 32)}` : ''}${stateNote}`);
     }
   }
   return lines.join('\n').slice(0, opts.full ? READ_CAP : 900);
+}
+
+// ── 🌳 画布结构（索引 / 按名检索 / 完整树）：编辑上下文的归属信息统一从这里取 ──
+
+/** 画布父子索引（一次构建，树/检索共用；环与悬空 parentId 自然落到根层/兜底） */
+type CanvasIdx = {
+  graphName: string;
+  nodes: SimNodeType[];
+  byId: Map<string, SimNodeType>;
+  envChildren: Map<string, SimNodeType[]>;
+  charChildren: Map<string, SimNodeType[]>;
+  rootEnvs: SimNodeType[];
+  rootChars: SimNodeType[];
+};
+
+function canvasIdx(boardId?: string): CanvasIdx {
+  const st = useStudioStore.getState();
+  const board = boardId ? st.boards[boardId] : st.boards[st.activeBoardId];
+  const nodes = board?.nodes ?? [];
+  const graphName = st.graphName;
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const envChildren = new Map<string, SimNodeType[]>();
+  const charChildren = new Map<string, SimNodeType[]>();
+  const rootEnvs: SimNodeType[] = [];
+  const rootChars: SimNodeType[] = [];
+  const parentOf = (n: SimNodeType): string | undefined => (n.parentId && byId.has(n.parentId) ? n.parentId : undefined);
+  for (const n of nodes) {
+    if (n.data.kind === 'environment') {
+      const pid = parentOf(n);
+      if (pid) {
+        const arr = envChildren.get(pid) ?? [];
+        arr.push(n);
+        envChildren.set(pid, arr);
+      } else rootEnvs.push(n);
+    } else if (n.data.kind === 'character') {
+      const pid = parentOf(n);
+      if (pid) {
+        const arr = charChildren.get(pid) ?? [];
+        arr.push(n);
+        charChildren.set(pid, arr);
+      } else rootChars.push(n);
+    }
+  }
+  return { graphName, nodes, byId, envChildren, charChildren, rootEnvs, rootChars };
+}
+
+const charLabel = (n: SimNodeType): string => {
+  if (n.data.kind !== 'character') return '';
+  const state = activeCharacterState(n.data);
+  const age = typeof state.age === 'number' && state.age > 0 ? `，${state.age}岁` : '';
+  const st = n.data.states.length > 1 ? `｜${state.label}` : '';
+  return `${n.data.name || '未命名'}（${GENDER_LABELS[genderOf(n.data.gender)]}${age}${st}）`;
+};
+
+const envLabel = (n: SimNodeType): string => {
+  if (n.data.kind !== 'environment') return '';
+  return `${ENV_TYPE_META[n.data.etype].icon} ${ENV_TYPE_LABELS[n.data.etype]}「${n.data.name || '未命名'}」`;
+};
+
+/** 环境祖先链（不含自己）：城镇「清风镇」＞建筑「铁匠铺」 */
+function envAncestorPath(idx: CanvasIdx, n: SimNodeType): string {
+  const chain: string[] = [];
+  const guard = new Set<string>([n.id]);
+  let cur = n.parentId ? idx.byId.get(n.parentId) : undefined;
+  while (cur && cur.data.kind === 'environment' && !guard.has(cur.id)) {
+    guard.add(cur.id);
+    chain.unshift(envLabel(cur));
+    cur = cur.parentId ? idx.byId.get(cur.parentId) : undefined;
+  }
+  return chain.join('＞');
+}
+
+/** 画布索引（常驻、极短）：只列顶层环境名与人数——具体归属在用户提到名字时按需检索，不整张画布注入 */
+export function simCanvasIndex(boardId?: string): string {
+  const st = useStudioStore.getState();
+  const current = boardId ? st.boards[boardId] : st.boards[st.activeBoardId];
+  const idx = canvasIdx(current?.id);
+  const currentLabel = current ? boardLabel(current, st.volumes) : '画布不存在';
+  // 卷名重名时明确标注：编辑室不能拿它当「卷：」目标
+  const titleCount = new Map<string, number>();
+  for (const v of st.volumes) {
+    const key = normalizeVolumeTitle(v.title);
+    titleCount.set(key, (titleCount.get(key) ?? 0) + 1);
+  }
+  const boardList = Object.values(st.boards)
+    .map((b) => {
+      const label = boardLabel(b, st.volumes);
+      const dup = b.volumeId && (titleCount.get(normalizeVolumeTitle(label)) ?? 0) > 1 ? '，重名不可作为卷目标' : '';
+      return `${b.id === current?.id ? '▶' : ''}${label}（${b.nodes.length} 节点${dup}）`;
+    })
+    .join('；');
+  const head = `【画布索引】当前画布：${currentLabel}；地图名：${idx.graphName || '未命名'}；全部画布：${boardList || '（无）'}。`;
+  if (!idx.nodes.length) {
+    return `${head}当前画布为空（尚无环境/人物）。写【人物设定】/【环境设定】/【人物状态】可用「卷：卷名」指定其它卷（省略=当前画布）；卷名必须一字不差，找不到/重名时请用户确认，不得臆测。检索只覆盖当前画布`;
+  }
+  const top = idx.rootEnvs.slice(0, 12).map(envLabel);
+  const more = idx.rootEnvs.length > top.length ? `…等共 ${idx.rootEnvs.length} 个` : '';
+  const chars = idx.nodes.filter((n) => n.data.kind === 'character').length;
+  const multi = idx.nodes.filter((n) => n.data.kind === 'character' && n.data.states.length > 1).length;
+  const loose = idx.rootChars.length ? `（其中 ${idx.rootChars.length} 人未归属环境）` : '';
+  return `${head}当前画布顶层环境：${top.join('、') || '（无）'}${more}；人物 ${chars} 人${loose}${multi ? `，其中 ${multi} 人多状态（按当前状态工作，改指定状态用【人物状态】）` : ''}。提到某个环境/人物名时，系统会自动检索其成员、归属与当前状态（只检索当前画布，不要臆测其它卷成员）`;
+}
+
+/** 【画布结构】完整归属树（仅用户问全局/整体时才注入）：环境 → 子环境/人物，不含描述 */
+export function simCanvasTree(cap = 12000, boardId?: string): string {
+  const idx = canvasIdx(boardId);
+  const lines: string[] = [`地图名：${idx.graphName || '未命名'}`];
+  if (!idx.nodes.length) lines.push('（画布为空：尚无环境/人物）');
+  const seen = new Set<string>();
+  const walk = (env: SimNodeType, depth: number) => {
+    if (seen.has(env.id)) return;
+    seen.add(env.id);
+    const pad = '  '.repeat(depth);
+    const who = (idx.charChildren.get(env.id) ?? []).map(charLabel).filter(Boolean);
+    lines.push(`${pad}${envLabel(env)}${who.length ? `：${who.join('、')}` : ''}`);
+    for (const child of idx.envChildren.get(env.id) ?? []) walk(child, depth + 1);
+  };
+  for (const e of idx.rootEnvs) walk(e, 0);
+  for (const n of idx.nodes) if (n.data.kind === 'environment' && !seen.has(n.id)) walk(n, 0); // 环/悬空兜底
+  if (idx.rootChars.length) lines.push(`🧑 人物（未归属环境）：${idx.rootChars.map(charLabel).join('、')}`);
+  const out = `【画布结构】（环境/人物的完整归属；问「某建筑里都有谁」「某人物在哪」以此为准）\n${lines.join('\n')}`;
+  return out.length > cap ? `${out.slice(0, cap)}\n（画布结构较长，已截断）` : out;
+}
+
+// ── 🔎 按名检索：不整张画布注入，只检索用户本轮提到的环境/人物（含「医院」命中「仁和医院」这类部分匹配） ──
+
+const normLookup = (s: string): string =>
+  (s || '').replace(/[「」『』《》"'“”\s]/g, '').replace(/^(?:人物|环境)/, '');
+/** 泛化类型词不做部分匹配，避免「房间」「建筑」这类词命中一堆节点 */
+const GENERIC_LOOKUP = new Set(['房间', '病房', '建筑', '社区', '城镇', '区域', '物品', '床', '人物', '环境', '地图', '画布', '里面', '内部']);
+
+/** 名字与消息的匹配分：完整出现优先；否则取名字中最长的 2+ 字片段是否出现在消息里（如「医院」→「仁和医院」） */
+function lookupScore(name: string, msg: string): number {
+  const n = normLookup(name);
+  if (n.length < 2) return 0;
+  if (msg.includes(n)) return 100 + n.length;
+  let best = 0;
+  for (let len = n.length - 1; len >= 2 && !best; len--) {
+    for (let i = 0; i + len <= n.length; i++) {
+      const sub = n.slice(i, i + len);
+      if (GENERIC_LOOKUP.has(sub)) continue;
+      if (msg.includes(sub)) { best = len; break; }
+    }
+  }
+  return best;
+}
+
+/** 某环境（含全部下层）内的人物，带相对路径；path 为相对命中环境的子路径 */
+function collectEnvChars(idx: CanvasIdx, env: SimNodeType): Array<{ n: SimNodeType; path: string[] }> {
+  const out: Array<{ n: SimNodeType; path: string[] }> = [];
+  const seen = new Set<string>();
+  const walk = (e: SimNodeType, path: string[]) => {
+    if (seen.has(e.id)) return;
+    seen.add(e.id);
+    for (const c of idx.charChildren.get(e.id) ?? []) out.push({ n: c, path });
+    for (const ce of idx.envChildren.get(e.id) ?? []) walk(ce, [...path, envLabel(ce)]);
+  };
+  walk(env, []);
+  return out;
+}
+
+/** 环境处是否位于已命中环境的下层（避免同时输出「清风镇」和「清风镇」里的「铁匠铺」两份重复结果） */
+function hasAncestorIn(idx: CanvasIdx, n: SimNodeType, hits: Set<string>): boolean {
+  const guard = new Set<string>([n.id]);
+  let cur = n.parentId ? idx.byId.get(n.parentId) : undefined;
+  while (cur && !guard.has(cur.id)) {
+    if (hits.has(cur.id)) return true;
+    guard.add(cur.id);
+    cur = cur.parentId ? idx.byId.get(cur.parentId) : undefined;
+  }
+  return false;
+}
+
+/** 用户问的是全局整体（不点名，如「画布上都有谁」「所有人都在哪」）→ 注入完整树 */
+const GLOBAL_CANVAS_RE = /画布上|地图上|舞台上|整个画布|全部(?:人物|环境|节点)|所有(?:人物|环境|角色)|全体(?:人物|角色)|都有谁|都有什么人|都有哪些人|人物名单|谁在(?:画布|地图|哪里|哪)/;
+/** 命中人物名时，问题若在问「同环境还有谁」也把所在环境的成员带出来 */
+const ASK_OCCUPANTS_RE = /都有谁|都有什么人|还有谁|谁在|哪些人|几个人|几人|谁住|谁在住/;
+/** 续问：本轮没点名，但显然在说上一轮检索过的对象（「其中的人物」「给他们统一加…」）→ 沿用最近一次命中的范围 */
+const FOLLOWUP_RE = /其中|里面|内部|他们|她们|这些人|那些|人物|角色|全员|全体|全部|所有|统一|都(?:加|换|改|要|需要|安排|穿)|上述|刚才|这个|该(?:建筑|环境|医院|房间|城镇|村子)/;
+
+type LookupMsg = { role: string; text: string };
+type ScopeHit = { envHits: SimNodeType[]; charHits: SimNodeType[] };
+
+/** 从一段文本里按名字检索环境/人物（当前消息与最近历史共用这一套） */
+function matchScope(idx: CanvasIdx, text: string): ScopeHit {
+  const msg = normLookup(text);
+  if (!msg) return { envHits: [], charHits: [] };
+  const pick = (kind: 'environment' | 'character') =>
+    idx.nodes
+      .filter((n) => n.data.kind === kind)
+      .map((n) => ({ n, s: lookupScore(n.data.name || '', msg) }))
+      .filter((x) => x.s > 0)
+      .sort((a, b) => b.s - a.s)
+      .slice(0, 6)
+      .map((x) => x.n);
+  return { envHits: pick('environment'), charHits: pick('character') };
+}
+
+const nameOf = (n: SimNodeType): string => (n.data.name || '').trim();
+/** 「（男，32岁）」——名单里姓名单独标注后，性别/年龄用这个后缀，避免和名字混在一起 */
+const sexAge = (n: SimNodeType): string => {
+  if (n.data.kind !== 'character') return '';
+  const s = activeCharacterState(n.data);
+  const age = typeof s.age === 'number' && s.age > 0 ? `，${s.age}岁` : '';
+  return `（${GENDER_LABELS[genderOf(n.data.gender)]}${age}）`;
+};
+
+/** 按本轮消息检索画布：命中的环境给**确切人物名单**（含下层），命中的人物给完整归属路径。
+ *  history 用于续问（「给他们统一加服装要求」）沿用上一轮点名的医院/环境；
+ *  没有命中且不是全局问题 → 返回空串（只保留极短的【画布索引】）。 */
+export function canvasLookupBlock(
+  userMsg: string,
+  history: ReadonlyArray<LookupMsg> = [],
+  boardId?: string,
+): string {
+  const raw = (userMsg || '').trim();
+  if (!raw) return '';
+  const idx = canvasIdx(boardId);
+  if (!idx.nodes.length) return '';
+
+  let scope = matchScope(idx, raw);
+  let carriedFrom = '';
+  if (!scope.envHits.length && !scope.charHits.length && history.length && FOLLOWUP_RE.test(raw)) {
+    // 最近一次提到具体节点的用户消息作为当前话题（避开更早的无关对象）
+    const recent = history.filter((m) => m.role === 'user').slice(-12).reverse();
+    for (const m of recent) {
+      const s = matchScope(idx, m.text);
+      if (s.envHits.length || s.charHits.length) {
+        scope = s;
+        carriedFrom = m.text.trim();
+        break;
+      }
+    }
+  }
+  const { envHits, charHits } = scope;
+
+  if (!envHits.length && !charHits.length) {
+    return GLOBAL_CANVAS_RE.test(raw) ? `\n\n${simCanvasTree(8000, boardId)}` : '';
+  }
+
+  const parts: string[] = [];
+  const hitIds = new Set(envHits.map((n) => n.id));
+  const askWho = ASK_OCCUPANTS_RE.test(raw);
+  for (const env of envHits) {
+    if (env.data.kind !== 'environment') continue;
+    if (hasAncestorIn(idx, env, hitIds)) continue; // 祖先已被命中，成员已在祖先结果里
+    const chars = collectEnvChars(idx, env);
+    const anc = envAncestorPath(idx, env);
+    const head = `${envLabel(env)}${anc ? `（位于 ${anc} 内）` : ''}：内部共 ${chars.length} 人`;
+    const desc = (env.data.desc || '').trim();
+    const lines = [head];
+    if (desc) lines.push(`- 当前描述：${desc.slice(0, 500)}${desc.length > 500 ? '…' : ''}`);
+    if (chars.length) {
+      const named = chars.filter((c) => !!nameOf(c.n));
+      const unnamed = chars.length - named.length;
+      const roster = named.slice(0, 80).map((c) => nameOf(c.n)).join('、');
+      lines.push(
+        named.length
+          ? `- 人物名单（【人物设定】的「名字」行逐字使用这些名字；括号里的性别/年龄不属于名字；要统一修改时每人输出一个块）：${roster}${named.length > 80 ? `…等共 ${named.length} 人` : ''}`
+          : '- 人物名单：无可按名更新的人物（内部人物都还没有名字）',
+      );
+      if (unnamed) lines.push(`- 另有 ${unnamed} 个未命名人物（画布上没有名字，无法按名更新；需先在属性面板命名）`);
+      const multi = chars.filter((c) => c.n.data.kind === 'character' && c.n.data.states.length > 1);
+      if (multi.length) {
+        const statesNote = multi
+          .slice(0, 20)
+          .map((c) => `${nameOf(c.n) || '未命名'}：${c.n.data.kind === 'character' ? c.n.data.states.map((s) => s.label).join('/') : ''}`)
+          .join('；');
+        lines.push(
+          `- 多状态人物（【人物设定】只改当前状态；要改指定状态必须用【人物状态】，「状态」行逐字使用下列状态名）：${statesNote}${multi.length > 20 ? `…等 ${multi.length} 人` : ''}`,
+        );
+      }
+      for (const c of chars.slice(0, 60)) {
+        const sub = c.path.length ? ` — ${c.path.join('＞')}` : '';
+        const nm = nameOf(c.n);
+        const cur = c.n.data.kind === 'character' ? activeCharacterState(c.n.data) : undefined;
+        const st = cur && c.n.data.kind === 'character' && c.n.data.states.length > 1 ? `｜当前状态：${cur.label}` : '';
+        lines.push(
+          nm ? `- 名字：${nm}${sexAge(c.n)}${st}${sub}` : `- 未命名人物${sexAge(c.n)}${st}（无名字，无法按名更新）${sub}`,
+        );
+      }
+      if (chars.length > 60) lines.push(`- ……其余 ${chars.length - 60} 人见上方名单`);
+    } else lines.push('- （内部暂无人物）');
+    // 直属子环境及各自人数（一眼看清层级分布）
+    const kids = idx.envChildren.get(env.id) ?? [];
+    if (kids.length) {
+      const kidCount = (k: SimNodeType) => collectEnvChars(idx, k).length;
+      const list = kids.slice(0, 20).map((k) => `${envLabel(k)}（${kidCount(k)} 人）`);
+      lines.push(`- 子环境：${list.join('、')}${kids.length > 20 ? `…等 ${kids.length} 个` : ''}`);
+    }
+    parts.push(lines.join('\n'));
+  }
+  for (const ch of charHits) {
+    const anc = envAncestorPath(idx, ch);
+    const shot = (s: string | undefined) => {
+      const t = (s || '').trim();
+      return t ? t.slice(0, 500) + (t.length > 500 ? '…' : '') : '';
+    };
+    const attrsOf = (st: CharacterState): string[] => [
+      typeof st.age === 'number' && st.age > 0 ? `年龄：${st.age}岁` : '',
+      shot(st.basicInfo) ? `基础信息：${shot(st.basicInfo)}` : '',
+      shot(st.identityInfo) ? `身份信息：${shot(st.identityInfo)}` : '',
+      shot(st.relations) ? `关系信息：${shot(st.relations)}` : '',
+    ].filter(Boolean);
+    const d = ch.data.kind === 'character' ? ch.data : undefined;
+    const cur = d ? activeCharacterState(d) : undefined;
+    // 「李刚重伤后是什么样」：先命中人物，再在消息里匹配状态标签（长标签优先，避免 状态1 命中 状态10）
+    const wanted = d
+      ? [...d.states].sort((a, b) => normLookup(b.label).length - normLookup(a.label).length).find((s) => {
+          const label = normLookup(s.label);
+          return label.length >= 2 && normLookup(raw).includes(label);
+        })
+      : undefined;
+    const wantedAttrs = wanted && wanted.id !== cur?.id ? attrsOf(wanted) : [];
+    const stateInfo = d && cur
+      ? d.states.length > 1
+        ? `｜当前状态：${cur.label}（固定人名/性别；全部状态：${d.states.map((s) => s.label).join('、')}）`
+        : ''
+      : '';
+    const nm = nameOf(ch);
+    const currentAttrs = cur ? attrsOf(cur) : [];
+    parts.push(
+      nm
+        ? `名字：${nm}${sexAge(ch)} — 位于 ${anc ? `${anc}内` : '画布根层（未归属环境）'}${stateInfo}${currentAttrs.length ? `\n  当前状态属性：${currentAttrs.join('；')}` : ''}${wantedAttrs.length ? `\n  状态「${wanted!.label}」：${wantedAttrs.join('；')}` : ''}`
+        : `未命名人物${sexAge(ch)}（无名字，无法按名更新） — 位于 ${anc ? `${anc}内` : '画布根层（未归属环境）'}${stateInfo}`,
+    );
+    // 「李刚那个房间都有谁」这类：顺带列出其所在环境（非根层）的成员
+    if (askWho && ch.parentId) {
+      const env = idx.byId.get(ch.parentId);
+      if (env && env.data.kind === 'environment' && !hitIds.has(env.id)) {
+        hitIds.add(env.id);
+        const chars = collectEnvChars(idx, env);
+        const roster = chars.slice(0, 40).map((c) => nameOf(c.n) || '（未命名）').join('、');
+        parts.push(`${envLabel(env)}内部共 ${chars.length} 人：${roster}${chars.length > 40 ? '…' : ''}`);
+      }
+    }
+  }
+  const carried = carriedFrom ? `（本轮未点名，沿用最近提到的「${carriedFrom.slice(0, 40)}」）` : '';
+  return `\n\n【画布检索】${carried}（系统按名字从画布查出的真实名单与归属，以此为准；回答/修改必须使用名单中的实际名字，不要凭记忆自拟名字）\n${parts.join('\n')}`;
 }
 
 // ── 🎯 全文目标（v2.16）：各处生成的统一方向 ──
@@ -98,7 +457,8 @@ export const DEFAULT_OUTLINE_OUTPUT_NOTE = '【输出要求】各段直接写内
 function systemGuideBlock(): string {
   return `
 【系统说明】（你所在的小说创作套件的结构，用于理解用户的需求；本对话默认自由创意，不要求遵守下列规则）
-- 画布：环境（城镇＞建筑＞房间等嵌套）与人物构成故事舞台；编辑室产出的设定落到画布后，才进入后续创作流程
+- 画布：环境（城镇＞建筑＞房间等嵌套）与人物构成故事舞台；编辑室产出的设定落到画布后，才进入后续创作流程；已有节点可用设定块的「更新：」行修改，不必新建
+- 画布支持嵌套：设定块里写「所在：（父环境名）」可把新建的节点直接创建到该环境内部（成为其子节点）；用户说「在XX里/给XX增加」时按此填写
 - 🎯 全文目标（上限 500 字）：整部小说的统一方向，大纲/正文/随机人物生成时默认参照
 - 📜 全文规则（上限 3000 字）：正文生成的硬约束（世界观、文风等）
 - 📋 章节大纲规则（上限 2000 字）：约束章节大纲的结构与写法。未设置时，大纲按以下默认结构生成（■ 为段落标题，事件链编号 5-9 条）：
@@ -132,6 +492,15 @@ export interface EditorRoomBlock {
   kind: 'character' | 'environment';
   label: string; // 展示名（人物/环境）
   name: string;
+  /** 修改已有节点时的目标节点名（与【画布索引】/【画布检索】一字不差）；新建为空。
+   *  落地时按「同名且同类」唯一定位，只覆盖块里写出的字段，未写字段保留原值。 */
+  target?: string;
+  /** 创建位置：目标父环境名/层级路径（与【画布索引】/【画布检索】一致，如「清风镇＞铁匠铺」）。
+   *  新建时落地为父容器的子节点；修改时表示把节点移入该环境。省略=视口落点/保持原归属。 */
+  parent?: string;
+  /** 🗂 目标卷画布（v2.29）：卷标题，必须从【画布索引】一字不差抄写；省略=当前画布。
+   *  找不到/重名时落地按钮禁用，绝不静默回退当前画布。 */
+  volume?: string;
   /** 环境描述（环境块用；人物块改走 basicInfo/identityInfo，v2.27） */
   desc?: string;
   gender?: CharacterGender; // 仅人物块：性别基础属性（落节点随块带上）
@@ -187,8 +556,33 @@ export interface SimImageBlock {
   size: string; // 比例，如 1:1 / 4:3 / 16:9
 }
 
-/** 编辑室回复里的结构块（设定块 | 规划块 | 卷块 | 生图块），kind 判别 */
-export type SimBlock = EditorRoomBlock | SimPlanBlock | SimVolumeBlock | SimImageBlock;
+// ── 人物状态块（【人物状态】：v2.30 只操作已有人的状态，不创建人物、不改人名/性别/所在） ──
+
+export type EditorStateAction = 'create' | 'update' | 'switch' | 'rename' | 'delete' | 'invalid';
+
+export interface EditorStateBlock {
+  kind: 'characterState';
+  label: '人物状态';
+  /** 目标人物名（必须来自画布索引/检索，一字不差） */
+  character: string;
+  /** 目标卷画布（省略=当前画布） */
+  volume?: string;
+  action: EditorStateAction;
+  /** create=新状态名；其余=已有状态名（update 省略=当前状态） */
+  state?: string;
+  /** create 的复制基准（省略=当前状态） */
+  baseState?: string;
+  /** rename 的新状态名 */
+  newLabel?: string;
+  age?: number;
+  basicInfo?: string;
+  identityInfo?: string;
+  relations?: string;
+  parseError?: string;
+}
+
+/** 编辑室回复里的结构块（设定块 | 规划块 | 卷块 | 生图块 | 人物状态块），kind 判别 */
+export type SimBlock = EditorRoomBlock | SimPlanBlock | SimVolumeBlock | SimImageBlock | EditorStateBlock;
 
 const clampN = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, Math.round(v)));
 
@@ -253,8 +647,8 @@ function parsePlanBody(body: string): SimPlanBlock | null {
   };
 }
 
-/** 段名 → 块头（【人物设定】/【环境设定】/【区域规划】/【卷设定】/【生图】） */
-const SIM_HEAD_RE = /【(人物设定|环境设定|区域规划|卷设定|生图)】/;
+/** 段名 → 块头（【人物设定】/【环境设定】/【人物状态】/【区域规划】/【卷设定】/【生图】） */
+const SIM_HEAD_RE = /【(人物设定|环境设定|人物状态|区域规划|卷设定|生图)】/;
 
 /** 单行字段：名字：xxx / 类型：xxx（只取该行） */
 function fieldLine(block: string, names: string[]): string {
@@ -272,6 +666,26 @@ function fieldRest(block: string, names: string[]): string {
     if (m && m[1].trim()) return m[1].trim();
   }
   return '';
+}
+
+/** 「更新：人物「李刚」」→ 李刚（去引号与前置类型词，便于和画布节点名比对） */
+function cleanTargetName(s: string): string {
+  return s.replace(/[「」『』《》"'“”]/g, '').replace(/^(?:人物|环境)\s*/, '').trim().slice(0, 20);
+}
+
+/** 「卷：第二卷 初入宗门」→ 卷标题（去引号/首尾空白，最多 30 字） */
+function cleanVolumeRef(s: string): string {
+  return s.replace(/[「」『』《》"'“”]/g, '').replace(/\s+/g, ' ').trim().slice(0, 30);
+}
+
+/** 「所在：清风镇＞铁匠铺」→ 路径文本（保留 ＞/ 作为层级分隔，去掉引号与空白，最多 80 字） */
+function cleanParentRef(s: string): string {
+  return s
+    .replace(/[「」『』《》"'“”]/g, '')
+    .replace(/\s+/g, '')
+    .replace(/^(?:所在环境|父环境|所在|放入|放在)\s*[：:]?/, '')
+    .trim()
+    .slice(0, 80);
 }
 
 /** 人物块体 → { basicInfo, identityInfo, relations }（v2.27 三层）：
@@ -293,6 +707,84 @@ function parseCharBody(body: string): { basicInfo: string; identityInfo: string;
   return out;
 }
 
+/** 状态标签清洗：去引号、压空白、截断（与 characterStates.STATE_LABEL_CAP 同步） */
+function cleanStateLabel(s: string): string {
+  return s
+    .replace(/[「」『』《》"'“”]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, STATE_LABEL_CAP);
+}
+
+/** 解析【人物状态】块体 → EditorStateBlock（缺动作/状态等不丢弃，带 parseError 交给 UI 禁用并显示原因） */
+function parseStateBody(body: string): EditorStateBlock {
+  const character = cleanTargetName(fieldLine(body, ['人物', '人物名']));
+  const volume = cleanVolumeRef(fieldLine(body, ['目标卷', '所属卷', '卷画布', '卷']));
+  const actionRaw = fieldLine(body, ['动作', '操作']).replace(/\s+/g, '');
+  const action: EditorStateAction =
+    /^(新建|新增|创建|添加)/.test(actionRaw)
+      ? 'create'
+      : /^(更新|修改|编辑)/.test(actionRaw)
+        ? 'update'
+        : /^(切换|设为当前|启用)/.test(actionRaw)
+          ? 'switch'
+          : /^(重命名|改名)/.test(actionRaw)
+            ? 'rename'
+            : /^(删除|移除)/.test(actionRaw)
+              ? 'delete'
+              : 'invalid';
+  const newLabelRaw = fieldLine(body, ['新状态名', '新名称']);
+  const baseRaw = fieldLine(body, ['基于', '基准状态', '复制自']);
+  const stateRaw = fieldLine(body, ['状态']);
+  const newLabel = cleanStateLabel(newLabelRaw);
+  // create 的「状态」= 新状态名；其余 = 已有状态名；create 未写状态时允许用「新状态名」兜底
+  const state = cleanStateLabel(stateRaw) || (action === 'create' ? newLabel : '');
+  const baseState = cleanStateLabel(baseRaw);
+
+  // 控制行先剥掉，避免「状态：…」被多行属性字段吞进正文；控制行顺序不影响属性解析
+  const content = body
+    .replace(/^\s*(?:人物|人物名)\s*[：:].*$/m, '')
+    .replace(/^\s*(?:目标卷|所属卷|卷画布|卷)\s*[：:].*$/m, '')
+    .replace(/^\s*(?:动作|操作)\s*[：:].*$/m, '')
+    .replace(/^\s*新状态名\s*[：:].*$/m, '')
+    .replace(/^\s*(?:基于|基准状态|复制自)\s*[：:].*$/m, '')
+    .replace(/^\s*状态\s*[：:].*$/m, '');
+  const { basicInfo, identityInfo, relations } = parseCharBody(content);
+  const wrote = (names: string[]) => names.some((name) => new RegExp(`^\\s*${name}\\s*[：:]`, 'm').test(content));
+  const wroteAge = wrote(['年龄']);
+  const wroteBasic = wrote(['基础信息']);
+  const wroteIdentity = wrote(['身份信息']);
+  const wroteRelations = wrote(['关系信息', '关系']);
+  const aNum = fieldLine(content, ['年龄']).match(/\d+/);
+  const age = aNum ? Math.min(999, parseInt(aNum[0], 10)) : undefined;
+
+  let parseError = '';
+  if (!character) parseError = '缺少「人物」行（必须写画布上已有的人物名）';
+  else if (action === 'invalid') parseError = '缺少或无法识别「动作」行（新建/修改/切换/重命名/删除）';
+  else if (action === 'create' && !state) parseError = '新建状态缺少「状态」行（新状态名）';
+  else if (action !== 'create' && action !== 'update' && !state) parseError = '缺少「状态」行（已有状态名）';
+  else if (action === 'rename' && !newLabel) parseError = '重命名缺少「新状态名」行';
+  else if (action === 'update' && !wroteAge && !wroteBasic && !wroteIdentity && !wroteRelations) {
+    parseError = '修改未写任何可更新属性（年龄/基础信息/身份信息/关系信息）';
+  }
+
+  return {
+    kind: 'characterState',
+    label: '人物状态',
+    character,
+    ...(volume ? { volume } : {}),
+    action,
+    ...(state ? { state } : {}),
+    ...(baseState ? { baseState } : {}),
+    ...(newLabel ? { newLabel } : {}),
+    ...(wroteAge && age !== undefined ? { age } : {}),
+    ...(wroteBasic ? { basicInfo } : {}),
+    ...(wroteIdentity ? { identityInfo } : {}),
+    ...(wroteRelations ? { relations } : {}),
+    ...(parseError ? { parseError } : {}),
+  };
+}
+
 /** 解析编辑室输出 → 对话正文 + 结构块（设定块/规划块可多块连续输出；零宽字符/**加粗**容错） */
 export function parseSimBlocks(text: string): { chat: string; blocks: SimBlock[] } {
   const clean = text.replace(/\*\*/g, '').replace(/[​‌‍﻿]/g, '').trim();
@@ -300,13 +792,16 @@ export function parseSimBlocks(text: string): { chat: string; blocks: SimBlock[]
   if (!first) return { chat: clean, blocks: [] };
   const chat = clean.slice(0, first.index).trim();
   const blocks: SimBlock[] = [];
-  let skippedNoAge = 0;
-  const re = /【(人物设定|环境设定|区域规划|卷设定|生图)】[^\n]*\n?([\s\S]*?)(?=\n【(?:人物设定|环境设定|区域规划|卷设定|生图|更新职责|更新记忆[^】]*)】|$)/g;
+  const re = /【(人物设定|环境设定|人物状态|区域规划|卷设定|生图)】[^\n]*\n?([\s\S]*?)(?=\n【(?:人物设定|环境设定|人物状态|区域规划|卷设定|生图|更新职责|更新记忆[^】]*)】|$)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(clean))) {
     const head = m[1];
     const body = m[2].trim();
     if (!body) continue;
+    if (head === '人物状态') {
+      blocks.push(parseStateBody(body));
+      continue;
+    }
     if (head === '生图') {
       const prompt = fieldRest(body, ['描述', '提示词', '画面']).slice(0, 1000);
       if (prompt) blocks.push({ kind: 'image', label: '图片', prompt, size: fieldLine(body, ['尺寸', '比例']) || '1:1' });
@@ -323,40 +818,63 @@ export function parseSimBlocks(text: string): { chat: string; blocks: SimBlock[]
       continue;
     }
     const kind: 'character' | 'environment' = head === '人物设定' ? 'character' : 'environment';
+    // 「更新：已有节点名」= 修改已有节点；该行只用于定位，从字段正文剥掉，避免被多行字段吞进去
+    const target = cleanTargetName(fieldLine(body, ['更新对象', '更新节点', '更新']));
+    // 「所在：父环境名/层级路径」= 创建位置（新建时挂为该环境子节点）或修改时移入目标环境；该行只用于定位
+    const parent = cleanParentRef(fieldLine(body, ['所在环境', '父环境', '所在', '放入', '放在']));
+    // 🗂「卷：卷名」= 目标卷画布（省略=当前画布）；该行只用于定位，必须先从正文剥掉，避免被描述字段吞进去
+    const volume = cleanVolumeRef(fieldLine(body, ['目标卷', '所属卷', '卷画布', '画布', '卷']));
+    const content = body
+      .replace(/^\s*(?:更新对象|更新节点|更新)\s*[：:].*$/m, '')
+      .replace(/^\s*(?:所在环境|父环境|所在|放入|放在)\s*[：:].*$/m, '')
+      .replace(/^\s*(?:目标卷|所属卷|卷画布|画布|卷)\s*[：:].*$/m, '');
+    // 更新块可省略「名字」（保持原名）；新建块未写名字仍按未命名处理
     const name =
-      fieldLine(body, kind === 'character' ? ['名字', '人名', '名称'] : ['名字', '环境名', '名称']).slice(0, kind === 'character' ? 12 : 16) ||
+      fieldLine(content, kind === 'character' ? ['名字', '人名', '名称'] : ['名字', '环境名', '名称']).slice(0, kind === 'character' ? 12 : 16) ||
+      target ||
       '未命名';
     if (kind === 'character') {
-      // 性别基础属性：AI 按协议输出「性别：男/女」，非女一律归默认男
-      const gRaw = fieldLine(body, ['性别']);
-      // 年龄是必填基础属性：取首个数字串（容错「32岁/约 32」）；缺失或非正数则丢弃该块，无年龄人物不得落到画布
-      const aNum = fieldLine(body, ['年龄']).match(/\d+/);
+      // 性别基础属性：AI 按协议输出「性别：男/女」；更新块未写时保留原值（不默认男）
+      const gRaw = fieldLine(content, ['性别']);
+      // 年龄：修改块可省略（只改其他字段）；新建缺年龄的块也保留——
+      // 是否「修改」由 UI 按块名与画布节点自动判定，解析阶段拿不到画布，不能在这里丢弃
+      const aNum = fieldLine(content, ['年龄']).match(/\d+/);
       const age = aNum ? parseInt(aNum[0], 10) : 0;
-      if (age <= 0) {
-        skippedNoAge++;
-        continue;
-      }
       // 基础信息/身份信息（v2.27）为人物设定主体；关系信息（v2.20）可省略
-      const { basicInfo, identityInfo, relations } = parseCharBody(body);
+      const { basicInfo, identityInfo, relations } = parseCharBody(content);
       blocks.push({
         kind,
         label: '人物',
         name,
-        gender: /女/.test(gRaw) ? 'female' : 'male',
-        age: Math.min(999, age),
+        target: target || undefined,
+        ...(parent ? { parent } : {}),
+        ...(volume ? { volume } : {}),
+        ...(gRaw ? { gender: /女/.test(gRaw) ? 'female' as const : 'male' as const } : {}),
+        ...(age > 0 ? { age: Math.min(999, age) } : {}),
         basicInfo,
         identityInfo,
         relations: relations || undefined,
       });
     } else {
-      const rawType = fieldLine(body, ['类型']);
-      const hit = (Object.entries(ENV_TYPE_LABELS) as Array<[EnvironmentType, string]>).find(([, label]) => rawType.includes(label));
-      blocks.push({ kind, label: '环境', name, desc: fieldRest(body, ['描述', '详细信息', '设定']), etype: hit?.[0] ?? 'building' });
+      const rawType = fieldLine(content, ['类型']);
+      const hit = rawType
+        ? (Object.entries(ENV_TYPE_LABELS) as Array<[EnvironmentType, string]>).find(([, label]) => rawType.includes(label))
+        : undefined;
+      blocks.push({
+        kind,
+        label: '环境',
+        name,
+        target: target || undefined,
+        ...(parent ? { parent } : {}),
+        ...(volume ? { volume } : {}),
+        desc: fieldRest(content, ['描述', '详细信息', '设定']),
+        // 更新块未写「类型」时保留原值（不默认建筑）
+        ...(hit ? { etype: hit[0] } : {}),
+      });
     }
   }
-  const lead = chat || (blocks.length ? '已按模板整理出设定块，点下方按钮落地。' : skippedNoAge ? '' : clean);
-  const note = skippedNoAge ? `⚠ ${skippedNoAge} 个人物设定缺少有效年龄，已忽略，请让编辑室重新生成。` : '';
-  return { chat: [lead, note].filter(Boolean).join('\n\n'), blocks };
+  const lead = chat || (blocks.length ? '已按模板整理出设定块，点下方按钮落地。' : clean);
+  return { chat: lead, blocks };
 }
 
 // ── 📝 写入块（编辑室 → 文本设定；仅用户明确要求时输出，落地需用户点击确认） ──
@@ -383,7 +901,7 @@ export interface SimWriteBlock {
 
 // 块终止 lookahead 必须含协议头（更新记忆[^】]*同时覆盖【更新记忆】/【更新记忆：模块名】）：
 // 否则【写入】/设定块后跟协议块时，协议块被整段吞进块体（正文剥掉后看不见），记忆/职责提取也落空
-const WRITE_HEAD_RE = /【写入】([\s\S]*?)(?=\n【(?:人物设定|环境设定|区域规划|卷设定|生图|写入|更新职责|更新记忆[^】]*)】|$)/g;
+const WRITE_HEAD_RE = /【写入】([\s\S]*?)(?=\n【(?:人物设定|环境设定|人物状态|区域规划|卷设定|生图|写入|更新职责|更新记忆[^】]*)】|$)/g;
 
 function parseWriteBody(body: string): SimWriteBlock | null {
   const target = fieldLine(body, ['目标']);
@@ -419,7 +937,7 @@ export function parseSimOutput(text: string): { chat: string; blocks: SimBlock[]
 export const EDITOR_MODULE_CAPS: Record<string, { blockKinds: string[]; writeFields: WriteField[] }> = {
   全文目标: { blockKinds: [], writeFields: ['mainGoal'] },
   全文规则: { blockKinds: [], writeFields: ['rules'] },
-  人物生成: { blockKinds: ['character'], writeFields: ['charGenRules'] },
+  人物生成: { blockKinds: ['character', 'characterState'], writeFields: ['charGenRules'] },
   环境生成: { blockKinds: ['environment'], writeFields: [] },
   章节大纲规则: { blockKinds: [], writeFields: ['outlineRules', 'chapterOutline'] },
   章节需求: { blockKinds: [], writeFields: ['chapterRequirement'] },
@@ -521,10 +1039,7 @@ const READ_TRIGGERS: Array<{ re: RegExp; build: () => string }> = [
     re: /章节|大纲|正文|需求|第[一二三四五六七八九十\d]+章/,
     build: chaptersBlock,
   },
-  {
-    re: /画布|地图|舞台|已有(人物|环境)|现有(人物|环境)/,
-    build: MATERIAL_BUILDERS.canvas,
-  },
+  // 画布不再整张注入：归属/成员由 canvasLookupBlock 按用户提到的名字检索（全局问题才回退完整树）
 ];
 
 /** 【章节】列表块（v2.19e 从 READ_TRIGGERS 提取共用）：编辑室按需读取与章节大纲编辑单独对话共用 */
@@ -542,7 +1057,8 @@ export function chaptersBlock(): string {
 
 /** 本轮读取块：仅匹配到的模块才附上；未提到则返回空串 */
 export function buildReadBlock(userMsg: string): string {
-  const parts = READ_TRIGGERS.filter((t) => t.re.test(userMsg)).map((t) => t.build());
+  const matched = READ_TRIGGERS.filter((t) => t.re.test(userMsg));
+  const parts = matched.map((t) => t.build());
   if (!parts.length) return '';
   return `\n【本轮读取的系统内容】（用户本轮明确提到，仅本轮参考）\n${parts.join('\n\n').slice(0, READ_CAP)}\n`;
 }
@@ -558,10 +1074,32 @@ export interface SimChatMsg {
 /** 编辑室系统消息：舞台搭建助手 + 系统说明 + 本轮读取 + 设定块/写入协议 + 画布状态 + 摘要。
  *  系统说明块始终注入（字段含义与读写规则）；模块正文默认不注入——仅本轮明确提到时附读取块（buildReadBlock），
  *  ⚙「📜 附带规则与目标」开启时才常驻【项目资料】（projectDataBlock）。 */
-function buildSimSystem(summary: string, readBlock: string): string {
+/** R6：用户本轮问本章/名单/在场时，附当前章只读摘要（不自动采集、不改快照） */
+export function chapterAgentBlockIfRelevant(userMsg: string): string {
+  if (!/本章|这一章|当前章|第[0-9一二三四五六七八九十百千]+章|在场|提及|名单|快照|切章/.test(userMsg)) return '';
+  const st = useStudioStore.getState();
+  const activeId = useUiStore.getState().activeChapterId;
+  const chapter = st.chapters.find((c) => c.id === activeId) ?? st.chapters[0];
+  if (!chapter) return '';
+  const preferred = chapterBoardOf(chapter.volumeId, st.volumes, st.boards);
+  const hit = findChapterRegion(st.boards, chapter.id, preferred);
+  return `\n${buildChapterAgentBrief(chapter, st.boards, st.volumes, hit?.region)}\n`;
+}
+
+function buildSimSystem(summary: string, readBlock: string, userMsg: string, history: ReadonlyArray<SimChatMsg> = []): string {
   const summaryBlock = summary.trim() ? `\n【早期对话摘要】（更早轮次的要点备忘，回答时遵守其中已定事项）\n${summary.trim()}\n` : '';
+  // R5：用户本轮涉及状态/引用/章节时才附引用摘要，避免每轮注入大列表
+  const refBlock = /状态|引用|快照|名单|章节|本章|历史/.test(userMsg)
+    ? (() => {
+        const st = useStudioStore.getState();
+        return `\n${stateReferenceAgentContext(st.chapters, st.boards, st.volumes, { boardId: st.activeBoardId })}\n`;
+      })()
+    : '';
+  const chapterBlock = chapterAgentBlockIfRelevant(userMsg);
   return `你是创作台的「🎭 编辑室」：帮用户在画布（地图）上搭建故事舞台——设计环境（可嵌套成 镇＞建筑＞房间 的地图层级）与人物，产出可直接落到画布的设定。
-${summaryBlock}${systemGuideBlock()}${readBlock}${projectDataBlock()}
+${summaryBlock}${systemGuideBlock()}
+${simCanvasIndex()}${canvasLookupBlock(userMsg, history)}
+${readBlock}${projectDataBlock()}${chapterBlock}${refBlock}
 
 【写入协议】（仅当用户明确要求写入、修改或填入某项设定时才输出；默认不要输出）
 先在对话中给出草稿与简短说明，用户确认要写入时，在回复最末输出（段名一字不差）：
@@ -573,28 +1111,64 @@ ${summaryBlock}${systemGuideBlock()}${readBlock}${projectDataBlock()}
 - 全文目标/全文规则/章节大纲规则/人物生成规则：一次回复只写入一项
 - 章节需求：要写几章就每章输出一个【写入】块，同一回复全部输出；需求必须简短扼要，一两句话（80 字内）说清本章要发生什么，不写大纲、不写分段事件链；章节标题取自【章节】列表
 - 本章大纲：一次写一章、每章一个【写入】块；写该章大纲的完整正文（结构遵循章节大纲规则如有）；章节标题取自【章节】列表
-- 章节的正文、归卷不支持写入，只能读取；画布不支持通过写入修改，需要改动时告诉用户在对应界面操作，或用设定块落画布；卷的新建用【卷设定】
+- 章节的正文、归卷不支持写入，只能读取；卷的新建用【卷设定】
+- 修改画布上已有的人物/环境用【人物设定】/【环境设定】块：「名字」写节点当前名字即自动识别为修改，用户点「✏️ 更新…」确认后生效；不要为修改另建重复节点。只有要改名时才加「更新：（旧名）」行
+- 人物有多个状态时，【人物设定】的年龄/基础信息/身份信息/关系信息只作用于**当前状态**；要新建、切换、重命名、删除状态或修改**非当前状态**，必须用【人物状态】块，不能拿【人物设定】代替
 
 【工作方式】
 - 用中文自然对话；开放讨论自由发挥，创意具体、少空话
 - 用户要你创建/设计人物、环境、设定时，严格按下方协议输出结构块；纯讨论/闲聊/修改建议不要输出结构块
-- 一次创建多个时连续输出多个对应块；用户点回复下方的「📎 落为人物/环境」按钮落到画布（落点在某环境内会自动归入嵌套层级）
-- 需要说明层级安排时，在块外用一句话建议「谁放进谁里面」（嵌套由用户在画布拖拽完成）
+- 用户要求修改画布上已有的人物/环境时：输出对应设定块，「名字」写该节点当前名字（与【画布索引】/【画布检索】一字不差），系统按名字自动识别为修改；只写要改的字段，未写的字段保留原值；要改名时另加「更新：（当前名字，一字不差）」行，再把「名字」写成新名字
+- 一次创建多个时连续输出多个对应块；用户点回复下方的「📎 落为人物/环境」按钮落到画布
+- 用户要求统一修改某个环境里的全部人物（如「给医院里所有人加统一的服装要求」）：以【画布检索】的「人物名单」为准确认目标，为名单里**每一个人**输出一个【人物设定】块（「名字」逐字抄名单里的名字），每块只写要统一修改的字段；这改的是各人的当前状态，不要回答「无法确定人物名字」——名单就是系统从画布查出的实际名字，用户点「全部更新」一次生效
+- 检索里提示「未命名人物」的节点没有名字，无法按名更新：在对话里说明这些节点需要先在属性面板命名，其余有名人物照常输出更新块
+- 用户要求在指定环境里创建（如「给铁匠铺增加两个房间」「在铁匠铺里建三个人」「清风镇的村民」）：每个块都加「所在：（父环境名）」行，系统会把节点创建为该环境的子节点并自动排好位置；名称从【画布索引】/【画布检索】一字不差抄写，同名环境用层级路径区分（如「清风镇＞铁匠铺」，用 ＞ 连接）
+- 新建房间/建筑时，其父环境必须是容器类型（房间/建筑/社区/城镇/区域/床）；「物品」不是容器，不能作为所在环境
+- 用户没说放进哪里时省略「所在」行，节点落到视口中心（落点在某环境内会自动归入）
+- 🗂 用户明确要求写到其它卷画布时，每个块加「卷：（卷名）」行；卷名从【画布索引】的「全部画布」一字不差抄写，省略=当前画布。目标卷里的查找（同名人物/所在环境）只在目标画布内进行；找不到或重名时说明并请用户确认，绝不改落到当前画布
+- 跨卷复制/移动由用户在画布顶栏用「复制到卷」手动执行；不要声称已经复制，也不要为复制而输出设定块。目标卷还不存在时，先用【卷设定】建卷（新建卷与空白画布），用户在后续回复再用「卷：」写内容
+- 章节快照、章节名单与区域是用户手动采集的只读资料：你只能修改工作画布上的人物/状态/环境；不得声称已修改某章快照、名单或区域，也不得把快照说成会自动同步。修改被引用状态会影响历史章节表现，必要时提醒用户手动刷新快照
 
 【人物产出协议】（段名一字不差）
 【人物设定】
-名字：（人名，12 字以内）
-性别：（男/女 二选一）
-年龄：（必填，数字年龄，如 32；人物的基础属性，不可省略）
-基础信息：（长相/身材/习惯穿搭/性格，一段话——人物本身的样子与性情）
-身份信息：（职业/身份/与故事相关的特殊设计，一段话——人物在世界中的位置与故事钩子）
+更新：（仅改画布上已有名称时填写：目标人物的当前名字，一字不差；同名直接修改、新建人物都省略本行）
+所在：（可选：新建人物所在的环境名或层级路径，从【画布索引】/【画布检索】一字不差抄写；用户要求在某建筑/房间/城镇里创建人物时填写；省略=不归属环境；修改已有节点的普通更新不要写本行，只有用户明确要求移动归属时才写）
+卷：（可选：目标卷画布名，从【画布索引】的「全部画布」一字不差抄写；省略=当前画布；用户要求写到其它卷时必填；找不到/重名时不要猜，先请用户确认）
+名字：（人名，12 字以内；修改已有节点时写该节点当前名字；要改名则本行写新名字并加「更新：」行）
+性别：（男/女 二选一；修改已有节点时可省略，省略则保留原值）
+年龄：（新建必填，数字年龄，如 32；修改已有节点时可省略，省略则保留原值）
+基础信息：（长相/身材/习惯穿搭/性格，一段话——人物本身的样子与性情；修改时写改动后的完整段落，省略则保留原值）
+身份信息：（职业/身份/与故事相关的特殊设计，一段话——人物在世界中的位置与故事钩子；修改时写改动后的完整段落，省略则保留原值）
 关系信息：（此人物与其他人物之间的关系，如「李刚之父；与王明有旧怨」，一段话；用户没提到人物关系、或当前没有其他人物可关联时，省略整段）
+- 新建人物自动带默认状态「状态0」；更新已有人的年龄/基础信息/身份信息/关系信息只改当前状态。人名、性别跨状态稳定，任何状态切换都不改变
+
+【人物状态产出协议】（段名一字不差；只操作画布上**已有**人物的状态，不创建人物，也不改人名/性别/所在环境/形象/写真）
+【人物状态】
+人物：（已有人的当前名字，必须从【画布索引】/【画布检索】一字不差抄写，不得编造）
+卷：（可选：目标卷画布名，从【画布索引】的「全部画布」一字不差抄写；省略=当前画布；找不到/重名时不要猜，先请用户确认）
+动作：（新建 / 修改 / 切换 / 重命名 / 删除 五选一）
+状态：（新建=新状态名，人物内必须唯一，如「重伤后」；修改/切换/重命名/删除=已有状态名，一字不差；修改省略=当前状态）
+新状态名：（仅「重命名」填写：改后的状态名，人物内必须唯一）
+基于：（仅「新建」可选：复制哪个已有状态，省略=当前状态）
+年龄：（可选：当前状态年龄）
+基础信息：（可选：只写要改成的完整段落）
+身份信息：（可选：只写要改成的完整段落）
+关系信息：（可选：只写要改成的完整段落）
+- 新建：复制「基于」状态的全部属性与写真引用，再覆盖写出的字段，创建后设为当前状态
+- 修改：只改「状态」指定状态的年龄/基础信息/身份信息/关系信息，未写的属性保留
+- 切换：把指定状态设为当前状态（画布展示与后续章节生成使用它）
+- 重命名：只改状态标签，状态 ID 与属性不变；默认状态也可以重命名
+- 删除：删除指定的非默认状态；默认状态（首个）不能删除，人物至少保留一个状态
+- 找不到人物/状态、状态名重复或动作不合法时，在对话里如实说明并请用户确认；不要猜测，不要改用【人物设定】冒充，也不要自动创建人物
 
 【环境产出协议】（段名一字不差）
 【环境设定】
-名字：（环境名，16 字以内）
-类型：（房间/建筑/社区/城镇/区域/床/物品 七选一；床=容纳人物休息睡觉的容器，如床/炕/通铺；物品=非容器的物件标记——告知此处存在一个东西，如一桌美味的饭菜/一头野兽/一堆火把）
-描述：（外观/功能/氛围，一段话）
+更新：（仅改画布上已有名称时填写：目标环境的当前名字，一字不差；同名直接修改、新建环境都省略本行）
+所在：（可选：新建环境所属的父环境名或层级路径；用户说「在XX里建」「给XX增加两个房间」时填写；省略=独立环境；修改已有节点时只有用户明确要求移动归属才写）
+卷：（可选：目标卷画布名，从【画布索引】的「全部画布」一字不差抄写；省略=当前画布；用户要求写到其它卷时必填；找不到/重名时不要猜，先请用户确认）
+名字：（环境名，16 字以内；修改已有节点时写该节点当前名字；要改名则本行写新名字并加「更新：」行）
+类型：（房间/建筑/社区/城镇/区域/床/物品 七选一；床=容纳人物休息睡觉的容器，如床/炕/通铺；物品=非容器的物件标记——告知此处存在一个东西，如一桌美味的饭菜/一头野兽/一堆火把；修改已有节点时可省略，省略则保留原值）
+描述：（外观/功能/氛围，一段话；修改时写改动后的完整段落，省略则保留原值）
 
 【区域规划产出协议】当用户要求一次规划一个成组区域（村落/庄园/街区/营地等，多座建筑一起排布）时，输出段名【区域规划】（一字不差）：
 【区域规划】
@@ -623,10 +1197,7 @@ ${summaryBlock}${systemGuideBlock()}${readBlock}${projectDataBlock()}
 尺寸：（画面比例，1:1 / 4:3 / 16:9 三选一，默认 1:1；无特殊要求可省略此行）
 描述：（画面提示词，写清主体、外观、动作、场景、构图、风格与光线，具体不空泛，一段话）
 - 用户要几张就输出几个【生图】块；图片不自动生成，用户点回复下方的「🎨 生成图片」才调用生图 API
-- 只在用户明确要图时输出本块；普通讨论/设定文字不要输出
-
-【当前画布状态】
-${simCanvasSummary()}`;
+- 只在用户明确要图时输出本块；普通讨论/设定文字不要输出`;
 }
 
 export interface SimTurnResult {
@@ -715,7 +1286,7 @@ export async function genSimTurn(opts: {
     {
       role: 'system',
       content:
-        buildSimSystem(opts.summary ?? '', buildReadBlock(opts.userMsg)) +
+        buildSimSystem(opts.summary ?? '', buildReadBlock(opts.userMsg), opts.userMsg, opts.history) +
         mentorBlocks(opts.userMsg, opts.mentors),
     },
     ...opts.history.map((m) => ({ role: m.role === 'agent' ? ('assistant' as const) : ('user' as const), content: m.text })),
@@ -822,10 +1393,13 @@ ${simCanvasSummary()}
  *  ⚠ 返回的 url 是服务器临时文件（media GC 10 分钟后回收）——调用方必须立即 localImgSaveFromUrl 转存浏览器本地。 */
 export async function genCharacterPortrait(opts: {
   id: string;
+  /** 写真针对的状态；缺省=当前状态（v2.30 每个状态独立写真） */
+  stateId?: string;
   engine: 'private' | 'public';
   onStage?: (stage: 'prompt' | 'image') => void;
 }): Promise<{ ok: boolean; url?: string; prompt?: string; error?: string }> {
-  const n = useStudioStore.getState().nodes.find((x) => x.id === opts.id);
+  const st0 = useStudioStore.getState();
+  const n = (st0.boards[st0.activeBoardId]?.nodes ?? []).find((x) => x.id === opts.id);
   if (!n || n.data.kind !== 'character') return { ok: false, error: '人物节点不存在' };
   const ui = useUiStore.getState();
   if (ui.generating) return { ok: false, error: '已有生成任务进行中' };
@@ -838,14 +1412,16 @@ export async function genCharacterPortrait(opts: {
   try {
     opts.onStage?.('prompt');
     const d = n.data;
-    const age = typeof d.age === 'number' && Number.isFinite(d.age) && d.age > 0 ? `${d.age}岁` : '年龄未设定';
+    const state = characterStateOf(d, opts.stateId);
+    const age = typeof state.age === 'number' && Number.isFinite(state.age) && state.age > 0 ? `${state.age}岁` : '年龄未设定';
     const brief = [
       `人物名：${d.name || '未命名'}`,
       `性别：${GENDER_LABELS[genderOf(d.gender)]}`,
       `年龄：${age}`,
-      d.basicInfo.trim() ? `基础信息：${d.basicInfo.trim()}` : '',
-      d.identityInfo.trim() ? `身份信息：${d.identityInfo.trim()}` : '',
-      d.relations?.trim() ? `关系：${d.relations.trim()}` : '',
+      `状态：${state.label}${d.states.length > 1 ? '（同一人物的当前状态；只按这个状态的外貌与身份作画，不要混用其它状态）' : ''}`,
+      state.basicInfo.trim() ? `基础信息：${state.basicInfo.trim()}` : '',
+      state.identityInfo.trim() ? `身份信息：${state.identityInfo.trim()}` : '',
+      state.relations?.trim() ? `关系：${state.relations.trim()}` : '',
     ]
       .filter(Boolean)
       .join('\n');
@@ -888,7 +1464,65 @@ ${brief}
 /** 大纲设计 system：章节大纲规则 + 全文目标 + 本章所属卷 + 画布舞台 + 前情大纲（取前 3 章、各截 500 字控预算）。
  *  ⚠ 只带【章节大纲规则】不带【全文规则】（v2.14c 用户拍板：大纲生成不夹杂全文规则，全文规则只管正文）；
  *  【全文目标】是整部小说的统一方向（v2.16）；【本章所属卷】卷介绍控制整卷各章方向（v2.17 用户拍板：防止卷内各章偏离/彼此割裂）。 */
-function buildChapterSystem(graphName: string, prev: SimChapter[], volume?: SimVolume): string {
+/** 章节 volumeId → 画布 id：未分卷/卷已删除走默认主画布；卷存在则用其固定画布。 */
+function chapterBoardId(volumeId: string | undefined): string {
+  const st = useStudioStore.getState();
+  return chapterBoardOf(volumeId, st.volumes, st.boards);
+}
+
+export interface ChapterStageResult {
+  mode: StageMode;
+  warnings: string[];
+  /** 本次生成是否刚自动采集了快照 */
+  capturedNow: boolean;
+}
+
+/** R4：本章生成舞台上下文。已有快照 → 只注入名单；无快照且已画区域 → 自动采集一次；
+ *  无区域/无章节 id → 回退工作画布并警告。绝不自动刷新已有快照。 */
+function chapterStageFor(opts: {
+  chapterId?: string;
+  volumeId?: string;
+  source: 'auto-outline' | 'auto-content';
+}): { stage: ChapterStageContext; capturedNow: boolean; chapter?: SimChapter } {
+  const st = useStudioStore.getState();
+  const chapter = opts.chapterId ? st.chapters.find((c) => c.id === opts.chapterId) : undefined;
+  const volumeId = chapter?.volumeId ?? opts.volumeId;
+  const boardId = chapterBoardId(volumeId);
+  let snapshot = chapter?.snapshot;
+  let capturedNow = false;
+  if (chapter && !snapshot) {
+    const board = st.boards[boardId];
+    const hasRegion = !!board?.regions.some((r) => r.chapterId === chapter.id);
+    if (hasRegion) {
+      const r = useStudioStore.getState().captureChapterSnapshot(chapter.id, { source: opts.source });
+      if (r.ok) {
+        snapshot = r.snapshot;
+        capturedNow = true;
+      }
+    }
+  }
+  if (snapshot) {
+    const boards = useStudioStore.getState().boards;
+    const sourceBoard = boards[snapshot.boardId];
+    const stage = buildChapterStageBlock(snapshot, boards, {
+      ...(sourceBoard ? { sourceLabel: boardLabel(sourceBoard, st.volumes) } : {}),
+    });
+    return { stage, capturedNow, ...(chapter ? { chapter } : {}) };
+  }
+  const board = st.boards[boardId];
+  const stage = buildLegacyStageBlock(
+    simCanvasSummary({ boardId }),
+    board ? boardLabel(board, st.volumes) : '画布不存在',
+  );
+  return { stage, capturedNow, ...(chapter ? { chapter } : {}) };
+}
+
+function buildChapterSystem(
+  graphName: string,
+  prev: SimChapter[],
+  stage: ChapterStageContext,
+  volume?: SimVolume,
+): string {
   const st = useStudioStore.getState();
   const outline = st.outlineRules.trim();
   const prevBlock = prev.length
@@ -902,14 +1536,13 @@ function buildChapterSystem(graphName: string, prev: SimChapter[], volume?: SimV
   const volBlock = volume
     ? `\n【本章所属卷（整卷背景）】《${volume.title || '未命名卷'}》：${volume.intro.trim() || '（卷介绍未填写）'}\n（卷通常跨多章，这里只是整卷的背景方向；本章只写本章承担的那一段，卷内其他章的情节不写入本章）\n`
     : '';
-  return `你是小说《${graphName || '未命名'}》的章节大纲设计师：根据章节大纲规则、全文目标、本章所属卷的介绍（如有）、画布上的舞台设定与本章需求，产出一个章节的章节大纲（供后续按章生成正文使用）。
+  return `你是小说《${graphName || '未命名'}》的章节大纲设计师：根据章节大纲规则、全文目标、本章所属卷的介绍（如有）、本章舞台设定与本章需求，产出一个章节的章节大纲（供后续按章生成正文使用）。
 ${rulesBlock}${mainGoalBlock()}${volBlock}
-【画布舞台】（当前地图上的环境与人物设定，供大纲取用）
-${simCanvasSummary()}${prevBlock}
+${stage.block}${prevBlock}
 【输出要求】
 - 直接输出大纲正文，不要寒暄和解释
 - 结构遵循【章节大纲规则】的段落与顺序，不增删标题；可用「- 」列条目、**加粗**关键信息
-- 事件与人物行为必须符合画布中已有的人物/环境设定
+- 事件与人物行为必须符合本章舞台设定（有快照名单时，严格按名单的在场/仅提及规则）
 - 大纲只写【本章需求】所指的本章内容：不把卷介绍或全文目标里的整体进程展开成本章事件，不预支后续章节的情节；需求未写到的部分，只做本章内的自然过渡
 - 【前情大纲】中已写过的事件不得在本章重复${volume ? '\n- 【本章所属卷】只作背景，用来保持方向一致，不是本章的内容清单' : ''}`;
 }
@@ -917,6 +1550,8 @@ ${simCanvasSummary()}${prevBlock}
 /** 大纲管理器单章生成：agentGate 预检 → 全局生成互斥 → 流式 onDelta（组件节流写 store）。
  *  中止返回 ok:false（部分文本已随流写入，保留）；输入超预算做预截断（需求 2000/前情 3×500）。 */
 export async function genChapterOutline(opts: {
+  /** 章节 id（R4）：生成前从 store 读取最新章节/快照，不依赖调用方传入的旧副本 */
+  chapterId?: string;
   chapter: { title: string; requirement: string; volumeId?: string };
   prevChapters: SimChapter[];
   engine: 'private' | 'public';
@@ -925,27 +1560,37 @@ export async function genChapterOutline(opts: {
   /** 🏛 章节大纲责任编辑（注入其职责与记忆，v2.19d） */
   responsible?: ResponsibleEditor;
   onDelta?: (acc: string) => void;
-}): Promise<{ ok: boolean; error?: string; outline?: string }> {
+  /** 推理耗尽后自动关闭推理重试时回调（UI 提示本次结果来自降级重试） */
+  onFallback?: (reason: string) => void;
+}): Promise<{ ok: boolean; error?: string; outline?: string; stage?: ChapterStageResult }> {
   const ui = useUiStore.getState();
   if (ui.generating) return { ok: false, error: '已有生成任务进行中' };
   const gate = await agentGate(opts.engine);
   if (gate) return { ok: false, error: gate };
   const st = useStudioStore.getState();
   const { graphName } = st;
-  const req = opts.chapter.requirement.trim().slice(0, 2000);
+  const latest = opts.chapterId ? st.chapters.find((c) => c.id === opts.chapterId) : undefined;
+  const chapter = latest ?? opts.chapter;
+  const req = chapter.requirement.trim().slice(0, 2000);
   // 📚 本章所属卷（v2.17）：卷 id 有效才注入卷介绍（统一整卷方向）
-  const volume = opts.chapter.volumeId ? st.volumes.find((v) => v.id === opts.chapter.volumeId) : undefined;
+  const volume = chapter.volumeId ? st.volumes.find((v) => v.id === chapter.volumeId) : undefined;
+  const { stage, capturedNow } = chapterStageFor({
+    ...(opts.chapterId ? { chapterId: opts.chapterId } : {}),
+    ...(chapter.volumeId ? { volumeId: chapter.volumeId } : {}),
+    source: 'auto-outline',
+  });
   const msgs: QwenChatMessage[] = [
     {
       role: 'system',
       content:
-        buildChapterSystem(graphName, opts.prevChapters.slice(-3), volume) + responsibleBlock(opts.responsible, '章节大纲规则'),
+        buildChapterSystem(graphName, opts.prevChapters.slice(-3), stage, volume) +
+        responsibleBlock(opts.responsible, '章节大纲规则'),
     },
     {
       role: 'user',
       content: [
         `【本章需求】（本章的唯一章节专属依据，只写这一章）\n${req || '（未填写具体需求：按章节大纲规则与前情自然推进本章）'}`,
-        `请生成《${opts.chapter.title || '本章'}》的章节大纲。`,
+        `请生成《${chapter.title || '本章'}》的章节大纲。`,
       ]
         .filter(Boolean)
         .join('\n\n'),
@@ -962,8 +1607,13 @@ export async function genChapterOutline(opts: {
       engine: opts.engine,
       signal,
       onDelta: opts.onDelta,
+      onFallback: opts.onFallback,
     });
-    return { ok: true, outline: text.trim() };
+    return {
+      ok: true,
+      outline: text.trim(),
+      stage: { mode: stage.mode, warnings: stage.warnings, capturedNow },
+    };
   } catch (e) {
     if (e instanceof GenerationAborted) return { ok: false, error: '已停止' };
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -981,7 +1631,7 @@ const CH_CONTENT_BUDGET = {
 };
 
 /** 文本双模型写正文的 system */
-function buildContentSystem(graphName: string): string {
+function buildContentSystem(graphName: string, stage: ChapterStageContext): string {
   const st = useStudioStore.getState();
   const full = st.rules.trim();
   const rulesBlock = full
@@ -989,25 +1639,29 @@ function buildContentSystem(graphName: string): string {
     : '';
   return `你是小说《${graphName || '未命名'}》的正文写手：根据本章大纲把剧情展开成小说正文。
 ${rulesBlock}${mainGoalBlock()}
-【画布舞台】（当前地图上的环境与人物设定，供正文取用场景与人物细节）
-${simCanvasSummary()}
+${stage.block}
 【输出要求】
 - 直接输出正文本身：不要输出章节名、标题、序号、解释或任何元话语，不要用 Markdown 标记
 - 严格按本章大纲的事件顺序完整展开，写足场景、对话与细节；直接从场景写起
-- 剧情走向遵循大纲，不得自行改写关键事件与结局；人物言行符合画布设定`;
+- 剧情走向遵循大纲，不得自行改写关键事件与结局；人物言行符合本章舞台设定（有快照名单时严格按在场/仅提及规则）`;
 }
 
 /** 正文管理器单章生成：大纲硬门槛 → 互斥/预检（Qwen 才预检）→ 预算守卫（超限报错）→ 按引擎流式 onDelta。
  *  前情 = 前几章已生成正文的结尾（缺正文退回其大纲要点），保剧情衔接。中止返回 ok:false（部分文本已随流写入，保留）。 */
 export async function genChapterContent(opts: {
-  chapter: { title: string; requirement: string; outline: string };
+  /** 章节 id（R4）：生成前从 store 读取最新章节/快照 */
+  chapterId?: string;
+  chapter: { title: string; requirement: string; outline: string; volumeId?: string };
   prevChapters: SimChapter[];
   engine: 'private' | 'public';
   /** 🏛 正文生成责编（注入其职责与记忆） */
   responsible?: ResponsibleEditor;
   onDelta?: (acc: string) => void;
-}): Promise<{ ok: boolean; error?: string; content?: string }> {
-  if (!opts.chapter.outline.trim()) return { ok: false, error: '本章还没有大纲：请先在「📋 大纲」中生成本章大纲' };
+}): Promise<{ ok: boolean; error?: string; content?: string; stage?: ChapterStageResult }> {
+  const st0 = useStudioStore.getState();
+  const latest = opts.chapterId ? st0.chapters.find((c) => c.id === opts.chapterId) : undefined;
+  const chapter = latest ?? opts.chapter;
+  if (!chapter.outline.trim()) return { ok: false, error: '本章还没有大纲：请先在「📋 大纲」中生成本章大纲' };
   const ui = useUiStore.getState();
   if (ui.generating) return { ok: false, error: '已有生成任务进行中' };
   if (opts.engine === 'private') {
@@ -1015,6 +1669,12 @@ export async function genChapterContent(opts: {
     if (gate) return { ok: false, error: gate };
   } // fallback（备用中转常在线）不预检
   const { graphName } = useStudioStore.getState();
+  // 画布取本章所属卷，而不是用户当前打开的标签——切章生成也能读到正确舞台
+  const { stage, capturedNow } = chapterStageFor({
+    ...(opts.chapterId ? { chapterId: opts.chapterId } : {}),
+    ...(chapter.volumeId ? { volumeId: chapter.volumeId } : {}),
+    source: 'auto-content',
+  });
   const b = CH_CONTENT_BUDGET.qwen;
   // 前情：前几章——有正文取结尾，无正文退回大纲要点
   const prevBlock = opts.prevChapters
@@ -1026,8 +1686,8 @@ export async function genChapterContent(opts: {
     })
     .join('\n');
   const sections = [
-    `【本章大纲】（本章剧情依据，严格按此展开）\n${opts.chapter.outline.trim().slice(0, b.outline)}`,
-    opts.chapter.requirement.trim() ? `【本章需求补充】\n${opts.chapter.requirement.trim().slice(0, b.requirement)}` : '',
+    `【本章大纲】（本章剧情依据，严格按此展开）\n${chapter.outline.trim().slice(0, b.outline)}`,
+    chapter.requirement.trim() ? `【本章需求补充】\n${chapter.requirement.trim().slice(0, b.requirement)}` : '',
     prevBlock ? `【前情】（已写章节的衔接，保持剧情连贯）\n${prevBlock}` : '',
   ]
     .filter(Boolean)
@@ -1040,7 +1700,7 @@ export async function genChapterContent(opts: {
   try {
     const text = await qwGenerate({
       messages: [
-        { role: 'system', content: buildContentSystem(graphName) + responsibleBlock(opts.responsible, '正文生成') },
+        { role: 'system', content: buildContentSystem(graphName, stage) + responsibleBlock(opts.responsible, '正文生成') },
         { role: 'user', content: sections },
       ],
       maxTokens: 8192,
@@ -1049,7 +1709,11 @@ export async function genChapterContent(opts: {
       signal,
       onDelta: opts.onDelta,
     });
-    return { ok: true, content: text.trim() };
+    return {
+      ok: true,
+      content: text.trim(),
+      stage: { mode: stage.mode, warnings: stage.warnings, capturedNow },
+    };
   } catch (e) {
     if (e instanceof GenerationAborted) return { ok: false, error: '已停止' };
     return { ok: false, error: e instanceof Error ? e.message : String(e) };

@@ -8,10 +8,25 @@
  *  RF 外受控输入没问题（约定 7）。 */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { BookOpen, Image as ImageIcon, Landmark, Mars, Plus, SlidersHorizontal, Trash2, Upload, UserRound, Venus, X } from 'lucide-react';
-import { useStudioStore } from '../../stores/studioStore';
-import { genderOf, ENV_TYPE_LABELS, type CharacterGender, type EnvironmentType, type SimNodeType } from '../../types/sim';
+import { BookOpen, Image as ImageIcon, Landmark, Layers, Mars, Pencil, Plus, SlidersHorizontal, Trash2, Upload, UserRound, Venus, X } from 'lucide-react';
+import { useStudioStore, useActiveNodes, type CharacterStateError } from '../../stores/studioStore';
+import {
+  genderOf,
+  ENV_TYPE_LABELS,
+  type CharacterData,
+  type CharacterGender,
+  type CharacterState,
+  type EnvironmentType,
+  type SimNodeType,
+} from '../../types/sim';
+import {
+  activeCharacterState,
+  characterStateIndex,
+  nextStateLabel,
+  portraitKeyForState,
+} from '../../stores/characterStates';
 import { GENDER_STYLE } from './SimNodes';
+import { referenceChapterText, stateReferenceSummary, type StateReferenceSummary } from '../../stores/snapshotRefs';
 import {
   CHARASSET_NAME_RE,
   DEFAULT_CHARASSET,
@@ -27,6 +42,7 @@ import {
 import { fileToDataUrl } from '../../services/imgApi';
 import { bookHue, makeBookCover } from '../../services/bookCover';
 import { localImgDel, localImgGet, localImgSaveFromUrl } from '../../services/localImages';
+
 import { genCharacterPortrait } from '../../engines/studioEngine';
 import { useEditorRoomStore } from '../../stores/editorRoomStore';
 import { Button } from '../ui/Button';
@@ -35,7 +51,8 @@ import { Field, Input, Select, Textarea } from '../ui/Field';
 import { Dialog } from '../ui/Dialog';
 
 export function SimInspector({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const nodes = useStudioStore((s) => s.nodes);
+  const nodes = useActiveNodes();
+  const activeBoardId = useStudioStore((s) => s.activeBoardId);
   const selectedNodes = useMemo(() => nodes.filter((n) => n.selected), [nodes]);
   // 单选才显示节点属性；未选中=本书属性；多选只提示
   const selected: SimNodeType | null = selectedNodes.length === 1 ? selectedNodes[0] : null;
@@ -58,6 +75,7 @@ export function SimInspector({ open, onClose }: { open: boolean; onClose: () => 
     body = <BookProperties />;
   } else if (selected?.data.kind === 'character') {
     const d = selected.data;
+    const state = activeCharacterState(d);
     title = '人物属性';
     icon = <UserRound />;
     const id = selected.id;
@@ -72,81 +90,85 @@ export function SimInspector({ open, onClose }: { open: boolean; onClose: () => 
             placeholder="人名"
           />
         </Field>
-        <div className="mt-2 flex items-end gap-2">
-          <div className="min-w-0 flex-1">
-            <div className="mb-1 text-[12px] font-medium text-slate-500">性别</div>
-            <div className="flex gap-1.5">
-              {(['male', 'female'] as CharacterGender[]).map((g) => {
-                const gs = GENDER_STYLE[g];
-                const active = genderOf(d.gender) === g;
-                return (
-                  <button
-                    key={g}
-                    onClick={() => st.updateCharacter(id, { gender: g })}
-                    title={`性别：${gs.label}（决定节点配色）`}
-                    className={`flex flex-1 items-center justify-center gap-1 rounded-[10px] border py-2 text-[13px] transition ${
-                      active
-                        ? `${gs.capsule} border-transparent font-medium text-white`
-                        : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-                    }`}
-                  >
-                    {g === 'male' ? <Mars className="h-3.5 w-3.5" /> : <Venus className="h-3.5 w-3.5" />}
-                    {gs.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-          <div className="w-20 shrink-0">
-            <Field label="年龄">
-              <Input
-                type="number"
-                min={0}
-                max={999}
-                value={typeof d.age === 'number' && Number.isFinite(d.age) ? d.age : ''}
-                onChange={(e) => {
-                  const v = e.target.value.trim();
-                  const n = Math.round(Number(v));
-                  st.updateCharacter(id, { age: v === '' || !Number.isFinite(n) ? undefined : Math.max(0, Math.min(999, n)) });
-                }}
-                placeholder="岁"
-              />
-            </Field>
+        <div className="mt-2 flex items-center gap-2">
+          <span className="shrink-0 text-[12px] font-medium text-slate-500">性别</span>
+          <div className="flex gap-1">
+            {(['male', 'female'] as CharacterGender[]).map((g) => {
+              const gs = GENDER_STYLE[g];
+              const active = genderOf(d.gender) === g;
+              return (
+                <button
+                  key={g}
+                  onClick={() => st.updateCharacter(id, { gender: g })}
+                  title={`性别：${gs.label}（跨状态稳定，决定节点配色）`}
+                  className={`flex items-center gap-1 rounded-[8px] border px-3 py-1.5 text-[12px] transition ${
+                    active
+                      ? `${gs.capsule} border-transparent font-medium text-white`
+                      : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                  }`}
+                >
+                  {g === 'male' ? <Mars className="h-3.5 w-3.5" /> : <Venus className="h-3.5 w-3.5" />}
+                  {gs.label}
+                </button>
+              );
+            })}
           </div>
         </div>
-        <Label>形象</Label>
-        <CharAvatarPicker
-          value={d.avatar}
-          gender={genderOf(d.gender) === 'female' ? '女' : '男'}
-          stage={charStageOf(d.age)}
-          onChange={(v) => st.updateCharacter(id, { avatar: v })}
-        />
+        <CharacterStateBar nodeId={id} data={d} boardId={activeBoardId} />
+        <div className="mt-2 flex items-start gap-3">
+          <div className="min-w-0 flex-1">
+            <Label>年龄</Label>
+            <Input
+              type="number"
+              min={0}
+              max={999}
+              value={typeof state.age === 'number' && Number.isFinite(state.age) ? state.age : ''}
+              onChange={(e) => {
+                const v = e.target.value.trim();
+                const n = Math.round(Number(v));
+                st.updateActiveCharacterState(id, {
+                  age: v === '' || !Number.isFinite(n) ? undefined : Math.max(0, Math.min(999, n)),
+                });
+              }}
+              placeholder="岁"
+            />
+          </div>
+          <div className="shrink-0">
+            <Label>形象</Label>
+            <CharAvatarPicker
+              value={state.avatar}
+              gender={genderOf(d.gender) === 'female' ? '女' : '男'}
+              stage={charStageOf(state.age)}
+              onChange={(v) => st.updateActiveCharacterState(id, { avatar: v })}
+            />
+          </div>
+        </div>
         <Label>基础信息</Label>
         <Textarea
-          value={d.basicInfo}
-          onChange={(e) => st.updateCharacter(id, { basicInfo: e.target.value })}
+          value={state.basicInfo}
+          onChange={(e) => st.updateActiveCharacterState(id, { basicInfo: e.target.value })}
           placeholder="长相、身材、习惯穿搭与性格，如：身形清瘦高挑，常穿洗旧的靛蓝长衫；寡言，遇事先观察再开口…"
           rows={4}
           className="resize-none"
         />
         <Label>身份信息</Label>
         <Textarea
-          value={d.identityInfo}
-          onChange={(e) => st.updateCharacter(id, { identityInfo: e.target.value })}
+          value={state.identityInfo}
+          onChange={(e) => st.updateActiveCharacterState(id, { identityInfo: e.target.value })}
           placeholder="职业、身份、与故事相关的特殊设计，如：药铺学徒，实为前朝医官后人；随身药箱里藏着半张城防图…"
           rows={4}
           className="resize-none"
         />
         <Label>关系信息</Label>
         <Textarea
-          value={d.relations ?? ''}
-          onChange={(e) => st.updateCharacter(id, { relations: e.target.value })}
+          value={state.relations ?? ''}
+          onChange={(e) => st.updateActiveCharacterState(id, { relations: e.target.value })}
           placeholder="与其他人物的关系，如：李刚之父；与王明有旧怨（可留空，编辑室可填充）"
           rows={3}
           className="resize-none"
         />
         <Label>写真</Label>
-        <PortraitBox nodeId={id} />
+        <PortraitBox nodeId={id} state={state} />
       </>
     );
   } else if (selected) {
@@ -213,7 +235,7 @@ function Label({ children }: { children: ReactNode }) {
 function BookProperties() {
   const graphName = useStudioStore((s) => s.graphName);
   const cover = useStudioStore((s) => s.cover);
-  const nodeCount = useStudioStore((s) => s.nodes.length);
+  const nodeCount = useStudioStore((s) => Object.values(s.boards).reduce((n, b) => n + b.nodes.length, 0));
   const chapterCount = useStudioStore((s) => s.chapters.length);
   const volumeCount = useStudioStore((s) => s.volumes.length);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -274,7 +296,7 @@ function BookProperties() {
       <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={(e) => void pick(e.target.files?.[0])} />
       <Label>作品概览</Label>
       <p className="text-[13px] text-slate-600">
-        {nodeCount} 节点 · {chapterCount} 章 · {volumeCount} 卷
+        {nodeCount} 节点（全部画布） · {chapterCount} 章 · {volumeCount} 卷
       </p>
       <p className="mt-2 text-[11px] leading-relaxed text-slate-400">封面随作品保存，书架显示最近保存的封面。</p>
     </>
@@ -285,30 +307,160 @@ const MAX_CHARASSET_BYTES = 5 * 1024 * 1024;
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-/** 🎨 写真区（v2.19b）：点「生成写真」→ 先驱动文本双模型按人物设定写生图提示词，再调生图 API 出单人立绘。
- *  图片只保留在浏览器本地（IndexedDB，key=portrait:<nodeId>，services/localImages.ts）——不进节点数据/存档，
- *  服务器临时文件由 media GC 自动回收；点图放大看原图。 */
-function PortraitBox({ nodeId }: { nodeId: string }) {
+const STATE_ERR_TEXT: Record<CharacterStateError, string> = {
+  'not-found': '人物或状态不存在',
+  'base-not-found': '要复制的基准状态不存在',
+  'empty-label': '状态名不能为空',
+  'duplicate-label': '同一人物内已有同名状态',
+  protected: '默认状态（首项）不可删除，可重命名',
+  'last-state': '人物至少保留一个状态',
+};
+
+/** 状态引用是否仍被任何画布上的任何人物状态使用（跨卷镜像会共享同一写真 key） */
+function portraitKeyReferenced(key: string): boolean {
+  return Object.values(useStudioStore.getState().boards).some((b) =>
+    b.nodes.some((n) => n.data.kind === 'character' && n.data.states.some((st) => st.portraitKey === key)),
+  );
+}
+
+/** 清掉最后一个引用后才删除 IndexedDB 图片，避免误删其它状态/镜像仍在用的共享写真 */
+function releasePortraitKey(key: string | undefined): void {
+  if (!key || portraitKeyReferenced(key)) return;
+  void localImgDel(key).catch(() => {});
+}
+
+/** 🧬 状态条（v2.30）：切换/新建（复制当前）/重命名/删除。状态属性由下方表单写当前状态。 */
+function CharacterStateBar({ nodeId, data, boardId }: { nodeId: string; data: CharacterData; boardId: string }) {
+  const state = activeCharacterState(data);
+  const index = characterStateIndex(data, state.id);
+  const chapters = useStudioStore((s) => s.chapters);
+  const st = useStudioStore.getState();
+  const refs: StateReferenceSummary = useMemo(
+    () => stateReferenceSummary(chapters, boardId, nodeId, state.id),
+    [chapters, boardId, nodeId, state.id],
+  );
+
+  const add = () => {
+    const label = window.prompt(
+      `新状态名称（将复制「${state.label}」的属性与写真，创建后切到新状态）`,
+      nextStateLabel(data.states),
+    );
+    if (label === null) return;
+    const r = st.addCharacterState(nodeId, { label, baseStateId: state.id, activate: true });
+    if (!r.ok) window.alert(`⚠ ${STATE_ERR_TEXT[r.error]}`);
+  };
+
+  const rename = () => {
+    const label = window.prompt('状态名称（同一人物内唯一，如「重伤后」）', state.label);
+    if (label === null) return;
+    const r = st.renameCharacterState(nodeId, state.id, label);
+    if (!r.ok) window.alert(`⚠ ${STATE_ERR_TEXT[r.error]}`);
+  };
+
+  const remove = () => {
+    if (index === 0) return;
+    const impact = refs.count
+      ? `\n\n该状态被 ${refs.count} 章引用：${referenceChapterText(refs, 6)}。删除后这些章节继续引用原状态 ID，将显示「资料缺失」，快照不会自动更新。`
+      : '';
+    if (!window.confirm(`删除状态「${state.label}」？切到该状态的人物设定与写真引用会一并移除（其它状态仍在用的图片不会被删）。${impact}`)) return;
+    const r = st.deleteCharacterState(nodeId, state.id);
+    if (!r.ok) {
+      window.alert(`⚠ ${STATE_ERR_TEXT[r.error]}`);
+      return;
+    }
+    releasePortraitKey(r.removed?.portraitKey);
+  };
+
+  const defaultLabel = `状态${index}`;
+  return (
+    <div className="mt-2" title="点击数字切换状态；画布、属性表单、写真与章节生成都使用当前状态">
+      <div className="flex items-center gap-1.5">
+        <Layers className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
+          {data.states.map((s, i) => {
+            const active = s.id === state.id;
+            return (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => st.switchCharacterState(nodeId, s.id)}
+                title={`切换到状态 ${i}：${s.label}${i === 0 ? '（默认）' : ''}`}
+                aria-label={`切换到状态 ${i}：${s.label}`}
+                aria-pressed={active}
+                className={`h-7 min-w-7 rounded-[8px] border px-1.5 text-[12px] font-medium tabular-nums transition ${
+                  active
+                    ? 'border-brand-500 bg-brand-50 text-brand-700 ring-2 ring-brand-100'
+                    : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300 hover:bg-slate-50'
+                }`}
+              >
+                {i}
+              </button>
+            );
+          })}
+          <IconButton
+            icon={<Plus />}
+            title="新建状态：复制当前状态的全部属性与写真引用，并切换到新状态"
+            onClick={add}
+          />
+        </div>
+        {state.label !== defaultLabel && (
+          <span className="max-w-[72px] shrink-0 truncate text-[11px] text-slate-400" title={`当前状态：${state.label}`}>
+            {state.label}
+          </span>
+        )}
+        <IconButton icon={<Pencil />} title="重命名当前状态（状态 ID 不变）" onClick={rename} />
+        <IconButton
+          icon={<Trash2 />}
+          title={index === 0 ? STATE_ERR_TEXT.protected : '删除当前状态（默认状态不可删）'}
+          onClick={remove}
+          disabled={index === 0}
+          danger={index !== 0}
+        />
+      </div>
+      {refs.count > 0 && (
+        <p
+          className="mt-1 pl-5 text-[10px] leading-relaxed text-amber-600"
+          title={`被 ${refs.count} 章引用：${refs.chapters.map((c) => c.title).join('、')}\n修改当前状态属性会改变这些历史章节的画布表现；快照不会自动更新。`}
+          data-state-refs={refs.count}
+        >
+          被 {refs.count} 章引用 · 修改会影响历史章
+        </p>
+      )}
+      <p className="mt-1 truncate pl-5 text-[10px] leading-relaxed text-slate-400">
+        点击数字切换 · ＋ 复制当前状态并新建
+      </p>
+    </div>
+  );
+}
+
+/** 🎨 写真区（v2.19b / v2.30 按状态）：点「生成写真」→ 先驱动文本双模型按**当前状态**写生图提示词，再调生图 API。
+ *  图片只保留在浏览器本地（IndexedDB）：规范 key=portrait:<nodeId>:<stateId>，旧写真 key=portrait:<nodeId>。
+ *  生成总是 copy-on-write 写当前状态的规范 key，不覆盖从基准状态继承来的图片；点图放大看原图。 */
+function PortraitBox({ nodeId, state }: { nodeId: string; state: CharacterState }) {
   const [url, setUrl] = useState<string | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [stage, setStage] = useState<'prompt' | 'image' | null>(null);
   const [err, setErr] = useState('');
   const [zoom, setZoom] = useState(false);
+  const stateIdRef = useRef(state.id);
+  stateIdRef.current = state.id;
 
-  // 本地读写真：同一节点再次打开面板/刷新页面都能拿到（IndexedDB 读取失败静默回「暂无写真」）
+  // 本地读写真：引用可能来自基准状态（继承），所以按 state.portraitKey 读，而不是按规范 key 推导
   useEffect(() => {
     let alive = true;
     setUrl(undefined);
     setErr('');
-    void localImgGet(`portrait:${nodeId}`)
-      .then((v) => {
-        if (alive && v) setUrl(v);
-      })
-      .catch(() => {});
+    if (state.portraitKey) {
+      void localImgGet(state.portraitKey)
+        .then((v) => {
+          if (alive && v) setUrl(v);
+        })
+        .catch(() => {});
+    }
     return () => {
       alive = false;
     };
-  }, [nodeId]);
+  }, [nodeId, state.id, state.portraitKey]);
 
   const gen = async () => {
     if (busy) return;
@@ -317,13 +469,15 @@ function PortraitBox({ nodeId }: { nodeId: string }) {
     setStage('prompt');
     try {
       const engine = useEditorRoomStore.getState().settings.engine;
-      const r = await genCharacterPortrait({ id: nodeId, engine, onStage: setStage });
+      const r = await genCharacterPortrait({ id: nodeId, stateId: state.id, engine, onStage: setStage });
       if (r.ok && r.url) {
-        const data = await localImgSaveFromUrl(`portrait:${nodeId}`, r.url); // 抢在服务器 GC 前转存本地
-        setUrl(data);
-      } else setErr(r.error || '生成失败');
+        const key = portraitKeyForState(nodeId, state.id);
+        const data = await localImgSaveFromUrl(key, r.url); // 抢在服务器 GC 前转存本地
+        useStudioStore.getState().updateCharacterState(nodeId, { portraitKey: key }, state.id);
+        if (stateIdRef.current === state.id) setUrl(data);
+      } else if (stateIdRef.current === state.id) setErr(r.error || '生成失败');
     } catch (e) {
-      setErr(errMsg(e));
+      if (stateIdRef.current === state.id) setErr(errMsg(e));
     } finally {
       setBusy(false);
       setStage(null);
@@ -331,8 +485,10 @@ function PortraitBox({ nodeId }: { nodeId: string }) {
   };
 
   const remove = () => {
-    void localImgDel(`portrait:${nodeId}`).catch(() => {});
+    const oldKey = state.portraitKey;
+    useStudioStore.getState().updateCharacterState(nodeId, { portraitKey: undefined }, state.id);
     setUrl(undefined);
+    releasePortraitKey(oldKey);
   };
 
   return (
@@ -341,14 +497,14 @@ function PortraitBox({ nodeId }: { nodeId: string }) {
         <button
           type="button"
           onClick={() => setZoom(true)}
-          title="点击放大查看原图"
+          title={`点击放大查看「${state.label}」写真原图`}
           className="block w-full overflow-hidden rounded-[10px] border border-slate-200 bg-slate-50"
         >
-          <img src={url} alt="人物写真" draggable={false} className="h-36 w-full object-cover" />
+          <img src={url} alt={`${state.label}人物写真`} draggable={false} className="h-36 w-full object-cover" />
         </button>
       ) : (
         <div className="flex h-36 w-full items-center justify-center rounded-[10px] border border-dashed border-slate-300 bg-slate-50 px-3 text-center text-[12px] leading-relaxed text-slate-400">
-          {busy ? (stage === 'prompt' ? '正在生成提示词…' : '正在生成图片…（约 1-2 分钟）') : '暂无写真——点下方按钮由 AI 生成'}
+          {busy ? (stage === 'prompt' ? '正在生成提示词…' : '正在生成图片…（约 1-2 分钟）') : `「${state.label}」暂无写真——点下方按钮由 AI 生成`}
         </div>
       )}
       <div className="mt-2 flex items-center gap-1.5">
@@ -365,14 +521,20 @@ function PortraitBox({ nodeId }: { nodeId: string }) {
                 ? '正在生成提示词'
                 : '正在调用生图 API'
               : url
-                ? '重新生成写真（覆盖本地旧图）'
-                : 'AI 先按人物基础信息与身份信息写生图提示词，再调用生图 API 出立绘（图片保存在浏览器本地）'
+                ? `重新生成「${state.label}」写真（只覆盖当前状态）`
+                : 'AI 先按当前状态的基础信息与身份信息写生图提示词，再调用生图 API 出立绘（图片保存在浏览器本地）'
           }
         >
           {busy ? (stage === 'prompt' ? '提示词中…' : '生成图片中…') : url ? '重新生成' : '生成写真'}
         </Button>
         {url && !busy && (
-          <Button type="button" size="sm" icon={<Trash2 />} onClick={remove} title="删除本地写真（浏览器 IndexedDB 中移除）">
+          <Button
+            type="button"
+            size="sm"
+            icon={<Trash2 />}
+            onClick={remove}
+            title="移除当前状态的写真引用；若图片仍被其它状态/镜像使用则保留本地图片"
+          >
             移除
           </Button>
         )}
@@ -395,7 +557,7 @@ function PortraitBox({ nodeId }: { nodeId: string }) {
             >
               <X className="h-5 w-5" />
             </button>
-            <img src={url} alt="人物写真原图" draggable={false} className="max-h-[92vh] max-w-[94vw] rounded-[16px] shadow-2xl" />
+            <img src={url} alt={`${state.label}人物写真原图`} draggable={false} className="max-h-[92vh] max-w-[94vw] rounded-[16px] shadow-2xl" />
           </div>,
           document.body,
         )}
@@ -486,13 +648,13 @@ function CharAvatarPicker({
         type="button"
         onClick={() => setOpen(true)}
         title={`形象：${curLabel}（点击打开素材库）`}
-        className="flex h-16 w-16 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 transition hover:bg-slate-100"
+        className="flex h-14 w-14 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 transition hover:bg-slate-100"
       >
         <img
           src={charAssetUrl(current)}
           alt=""
           draggable={false}
-          className="h-14 w-14 object-contain"
+          className="h-12 w-12 object-contain"
           style={{ imageRendering: 'pixelated' }}
         />
       </button>

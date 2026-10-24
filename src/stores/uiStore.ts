@@ -18,6 +18,16 @@ interface UiState {
   modelCenterOpen: boolean;
   saveStatus: 'idle' | 'saving' | 'saved' | 'error';
   saveMsg: string;
+  /** 📐 当前章节：大纲/正文面板与画布区域高亮共用（不持久化，重开页面回落到首章） */
+  activeChapterId: string | null;
+  /** 当前选中的章节区域（画布注释，不是节点） */
+  selectedRegionId: string | null;
+  /** 正在绘制的章节区域所属章节；null=未处于绘制模式 */
+  regionDrawChapterId: string | null;
+  /** 是否显示章节区域覆盖层 */
+  regionsVisible: boolean;
+  /** 请求把某区域滚到视野中心；nonce 递增保证重复点击也触发 */
+  regionFocus: { regionId: string; nonce: number } | null;
 
   openDialog: (d: DialogState) => void;
   closeDialog: () => void;
@@ -29,6 +39,12 @@ interface UiState {
   setGraphListOpen: (v: boolean) => void;
   setModelCenterOpen: (v: boolean) => void;
   setSaveStatus: (s: UiState['saveStatus'], msg?: string) => void;
+  setActiveChapterId: (id: string | null) => void;
+  setSelectedRegionId: (id: string | null) => void;
+  startRegionDraw: (chapterId: string) => void;
+  cancelRegionDraw: () => void;
+  setRegionsVisible: (v: boolean) => void;
+  requestRegionFocus: (regionId: string) => void;
 }
 
 export const useUiStore = create<UiState>((set) => ({
@@ -42,6 +58,11 @@ export const useUiStore = create<UiState>((set) => ({
   modelCenterOpen: false,
   saveStatus: 'idle',
   saveMsg: '',
+  activeChapterId: null,
+  selectedRegionId: null,
+  regionDrawChapterId: null,
+  regionsVisible: true,
+  regionFocus: null,
 
   openDialog: (d) => set({ dialog: d }),
   closeDialog: () => set({ dialog: null }),
@@ -53,4 +74,12 @@ export const useUiStore = create<UiState>((set) => ({
   setGraphListOpen: (v) => set({ graphListOpen: v }),
   setModelCenterOpen: (v) => set({ modelCenterOpen: v }),
   setSaveStatus: (s, msg) => set({ saveStatus: s, saveMsg: msg ?? '' }),
+  setActiveChapterId: (id) => set({ activeChapterId: id }),
+  setSelectedRegionId: (id) => set({ selectedRegionId: id }),
+  startRegionDraw: (chapterId) =>
+    set({ regionDrawChapterId: chapterId, selectedRegionId: null, regionsVisible: true }),
+  cancelRegionDraw: () => set({ regionDrawChapterId: null }),
+  setRegionsVisible: (v) => set({ regionsVisible: v }),
+  requestRegionFocus: (regionId) =>
+    set((s) => ({ regionFocus: { regionId, nonce: (s.regionFocus?.nonce ?? 0) + 1 } })),
 }));

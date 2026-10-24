@@ -15,7 +15,9 @@ export type TextEngine = 'private' | 'public';
 export const REASONING_EFFORTS = ['off', 'low', 'medium', 'high'] as const;
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
-/** 推理越强，补全预算预留越多（思考 token 计入 max_tokens） */
+/** 推理越强，补全预算预留越多（思考 token 计入 max_tokens）。
+ *  注意：服务端代理有 600 秒整轮超时，预算不能无脑拉大（27B 私有模型约 25 tok/s，12288 已接近上限）；
+ *  超过预算或超时不会让用户重来——qwGenerate 会关闭推理自动重试一次（正文预算完整留给结果）。 */
 export const REASONING_EFFORT_MAX_TOKENS: Record<ReasoningEffort, number> = {
   off: 4096,
   low: 6144,
@@ -133,6 +135,16 @@ export interface QwenStreamOptions {
   signal?: AbortSignal;
   maxTokens?: number;
   temperature?: number;
+  /** 发生「只思考没正文」后自动降级重试时回调（UI 可提示这次是在关闭推理后得到的） */
+  onFallback?: (reason: string) => void;
+}
+
+/** 思考耗尽补全预算（正文为空）——可自动关推理重试的内部错误 */
+class ReasoningExhausted extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReasoningExhausted';
+  }
 }
 
 /** 剥离可能内联进 content 的思考段：<think>…</think> 整段移除；未闭合时丢弃开启点之后全部 */
@@ -147,8 +159,9 @@ function stripThinking(text: string): string {
   return out.trim();
 }
 
-/** 流式生成，resolve 最终净文本；中止时 reject GenerationAborted */
-export async function qwGenerate(opts: QwenStreamOptions): Promise<string> {
+/** 单次流式生成，resolve 最终净文本；中止时 reject GenerationAborted。
+ *  思考耗尽（只有 thinking、正文为空）抛 ReasoningExhausted，由 qwGenerate 决定是否降级重试。 */
+async function qwGenerateOnce(opts: QwenStreamOptions): Promise<string> {
   const engineLabel = opts.engine === 'public' ? '🌐 公共模型' : '🏠 私有模型';
   const messages = opts.messages ?? [{ role: 'user' as const, content: opts.plot ?? '' }];
   const effort = opts.reasoningEffort ?? 'off';
@@ -224,17 +237,47 @@ export async function qwGenerate(opts: QwenStreamOptions): Promise<string> {
     throw e;
   }
   // 代理两条引擎路径结尾都发 data: [DONE]；连接提前关闭（没收到）= 回复被掐断，
-  // 必须报错而不是把半截文本当成功返回（否则长回复静默缺失尾部，用户无从察觉）
-  if (!streamDone && !opts.signal?.aborted) throw new Error(`${engineLabel}连接中断，回复不完整，请重试`);
+  // 必须报错而不是把半截文本当成功返回（否则长回复静默缺失尾部，用户无从察觉）。
+  // 例外：正文一个字都还没有、却已经思考了很久 → 多半是服务端 600 秒超时把思考掐断，
+  // 当作「思考耗尽」交给 qwGenerate 关闭推理重试，而不是让用户白等一场再手动重来。
+  if (!streamDone && !opts.signal?.aborted) {
+    const hadThinking = !!think.trim() || /<think>/.test(content);
+    if (!stripThinking(content) && hadThinking) {
+      throw new ReasoningExhausted(
+        `${engineLabel}思考超时/被截断（正文为空，思考 token 与正文共用预算）——已自动关闭推理重试`,
+      );
+    }
+    throw new Error(`${engineLabel}连接中断，回复不完整，请重试`);
+  }
   if (usage) opts.onUsage?.(usage);
   const final = stripThinking(content);
   if (!final) {
-    // 只有思考没有正文：多为思考耗尽 completion 预算（reasoning_content 计入 max_tokens）
-    throw new Error(
-      think.trim()
-        ? `${engineLabel}只输出了思考过程（思考耗尽输出预算，正文为空）——可直接重试，或调低/关闭「推理强度」`
-        : `${engineLabel}返回空内容`,
-    );
+    // 只有思考没有正文：多为思考耗尽 completion 预算（reasoning_content 计入 max_tokens）。
+    // 兼容把思考内联进 content 的上游：未闭合的 <think> 也算思考耗尽，而不是「空回复」。
+    const hadThinking = !!think.trim() || /<think>/.test(content);
+    throw hadThinking
+      ? new ReasoningExhausted(
+          `${engineLabel}只输出了思考过程（思考耗尽输出预算，正文为空）——可直接重试，或调低/关闭「推理强度」`,
+        )
+      : new Error(`${engineLabel}返回空内容`);
   }
   return final;
+}
+
+/** 对外生成入口：思考耗尽时自动关闭推理重试一次。
+ *  架构原因：推理 token 与正文共用 max_tokens，且私有轨只能开关思考、无法限制思考长度——
+ *  一旦模型在思考里用尽预算，整轮就只剩 think、正文为空。与其把失败抛给用户重来，
+ *  这里在确认「本轮尚无任何正文」后降级重试：预算不变、关闭思考，保证结构化任务（大纲/正文/设定）拿到结果。
+ *  用户指定的高推理首次仍然完整执行；只有确实耗尽时才降级，并可通过 onFallback 告知 UI。 */
+export async function qwGenerate(opts: QwenStreamOptions): Promise<string> {
+  const effort = opts.reasoningEffort ?? 'off';
+  try {
+    return await qwGenerateOnce(opts);
+  } catch (e) {
+    if (e instanceof GenerationAborted || !(e instanceof ReasoningExhausted) || effort === 'off') throw e;
+    if (opts.signal?.aborted) throw new GenerationAborted();
+    opts.onFallback?.('思考已耗尽输出预算，已自动关闭推理重试一次');
+    opts.onThinkDelta?.(''); // 清掉上一次的思考流，避免重试时仍显示旧思考
+    return await qwGenerateOnce({ ...opts, reasoningEffort: 'off' });
+  }
 }

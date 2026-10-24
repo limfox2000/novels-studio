@@ -18,6 +18,8 @@ import {
   type EnvironmentData,
   type EnvironmentType,
 } from '../../types/sim';
+import { activeCharacterState } from '../../stores/characterStates';
+import { characterReferenceSummary, referenceChapterText } from '../../stores/snapshotRefs';
 
 /** 环境类型 → 线性图标（节点标题条用；ENV_TYPE_META.icon 的 emoji 仍供提示词/生成内容使用） */
 const ENV_ICON: Record<EnvironmentType, ComponentType<{ className?: string }>> = {
@@ -41,11 +43,12 @@ export const GENDER_STYLE: Record<CharacterGender, { avatar: string; label: stri
 export function SimCharacterNode({ id, data }: NodeProps) {
   const d = data as CharacterData;
   const g = GENDER_STYLE[genderOf(d.gender)];
-  const ageTxt = typeof d.age === 'number' && Number.isFinite(d.age) && d.age > 0 ? ` ${d.age}` : '';
+  const state = activeCharacterState(d);
+  const ageTxt = typeof state.age === 'number' && Number.isFinite(state.age) && state.age > 0 ? ` ${state.age}` : '';
   return (
     <div className="group relative flex min-w-[84px] flex-col items-center rounded-xl px-2 pb-1.5 pt-1.5">
       <img
-        src={charAssetUrl(d.avatar || DEFAULT_CHARASSET)}
+        src={charAssetUrl(state.avatar || DEFAULT_CHARASSET)}
         alt=""
         width={64}
         height={64}
@@ -64,8 +67,23 @@ export function SimCharacterNode({ id, data }: NodeProps) {
         {d.name || '未命名'}
         {ageTxt && <span className="font-normal opacity-80">{ageTxt}</span>}
       </span>
+      {d.states.length > 1 && (
+        <span
+          className="mt-0.5 max-w-[128px] truncate rounded-full bg-white/85 px-1.5 text-[10px] leading-4 text-slate-500 shadow-sm ring-1 ring-slate-200/70"
+          title={`当前状态：${state.label}（共 ${d.states.length} 个状态）`}
+        >
+          {state.label}
+        </span>
+      )}
       <button
-        onClick={() => { if (window.confirm(`删除人物「${d.name || '未命名'}」？`)) useStudioStore.getState().deleteNode(id); }}
+        onClick={() => {
+          const s = useStudioStore.getState();
+          const ref = characterReferenceSummary(s.chapters, s.activeBoardId, id);
+          const impact = ref.count
+            ? `\n\n该人物被 ${ref.count} 章引用：${referenceChapterText(ref, 6)}。删除后这些章节的名单会显示「资料缺失」，快照不会自动更新。`
+            : '';
+          if (window.confirm(`删除人物「${d.name || '未命名'}」？${impact}`)) s.deleteNode(id);
+        }}
         className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-slate-600 text-white opacity-0 shadow transition hover:bg-rose-500 group-hover:opacity-100"
         title="删除本人物"
         aria-label="删除本人物"
@@ -110,10 +128,8 @@ export function SimEnvironmentNode({ id, data, selected }: NodeProps) {
             <X className="h-3 w-3" />
           </button>
         </div>
-        {/* 描述区：只展示（在属性面板编辑；长文截断，完整内容看面板） */}
-        <div className="min-h-0 flex-1 overflow-hidden whitespace-pre-wrap px-2 py-1.5 text-[12px] leading-[1.7] text-slate-600">
-          {d.desc || <span className="text-slate-400/70">（选中后在左侧「属性」面板填写描述）</span>}
-        </div>
+        {/* 描述不在画布上展示（避免小节点里文字拥挤凌乱）：只在属性面板查看/编辑 */}
+        <div className="min-h-0 flex-1" />
       </div>
     </>
   );

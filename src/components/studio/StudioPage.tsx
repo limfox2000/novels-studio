@@ -12,20 +12,43 @@ import {
   useReactFlow,
   type Edge,
 } from '@xyflow/react';
-import { useStudioStore, findContainerAt, absPositionOf } from '../../stores/studioStore';
+import {
+  useStudioStore,
+  useActiveBoard,
+  useActiveNodes,
+  useActiveEdges,
+  selectActiveNodes,
+  findContainerAt,
+  findViewportDropPosition,
+  absPositionOf,
+  boardLabel,
+  volumeBoardId,
+  DEFAULT_BOARD_ID,
+  DEFAULT_BOARD_LABEL,
+  ENV_DEFAULT_W,
+  ENV_DEFAULT_H,
+} from '../../stores/studioStore';
 import { useEditorRoomStore } from '../../stores/editorRoomStore';
 import { useEditorialStore } from '../../stores/editorialStore';
 import { useUiStore } from '../../stores/uiStore';
+import { chapterBoardOf } from '../../stores/chapterRegions';
+import { characterReferenceSummary, referenceChapterText } from '../../stores/snapshotRefs';
 import type { SimData, SimNodeType } from '../../types/sim';
 import { ENV_TYPE_META, genderOf } from '../../types/sim';
+import { DEFAULT_STATE_ID } from '../../stores/characterStates';
 import { genRandomCharacter } from '../../engines/studioEngine';
 import { pickRandomCharAsset } from '../../services/charAssetApi';
 import { GENDER_STYLE, simNodeTypes } from './SimNodes';
 import { SimInspector } from './SimInspector';
 import { EditorRoomPanel } from './EditorRoomPanel';
-import { OutlineManager } from './OutlineManager';
+import { OutlineManager, VolumesDialog } from './OutlineManager';
 import { ContentManager } from './ContentManager';
 import { Bookshelf } from './Bookshelf';
+import { CopyToVolumeDialog } from './CopyToVolumeDialog';
+import { CharacterSearchDialog } from './CharacterSearchDialog';
+import { ChapterRegionsOverlay } from './ChapterRegionsOverlay';
+import { useActiveChapterId } from './useActiveChapter';
+import { beginChapterRegion } from './chapterRegionActions';
 import {
   saveLocal,
 } from '../../services/studioSync';
@@ -37,33 +60,48 @@ import { Field, Textarea } from '../ui/Field';
 import { Badge, StatusDot } from '../ui/Badge';
 import {
   ArrowLeft,
+  Copy,
   Cpu,
   Dna,
+  Eye,
+  EyeOff,
   FileText,
+  FolderPlus,
   Landmark,
   LibraryBig,
   ListTree,
   MessagesSquare,
   Save,
   ScrollText,
+  Search,
   SlidersHorizontal,
+  SquareDashed,
   Target,
   UserCheck,
   UserPlus,
 } from 'lucide-react';
 
+// 人物节点渲染前没有实测尺寸：落点居中/避让按经验尺寸估算（宽取人名最大宽，高取头像+人名）
+const CHAR_NOMINAL_SIZE = { w: 144, h: 104 };
+
 function StudioCanvas() {
-  const nodes = useStudioStore((s) => s.nodes);
-  const edges = useStudioStore((s) => s.edges);
+  const nodes = useActiveNodes();
+  const edges = useActiveEdges();
+  const activeBoard = useActiveBoard();
+  const activeBoardId = useStudioStore((s) => s.activeBoardId);
   const onNodesChange = useStudioStore((s) => s.onNodesChange);
   const onEdgesChange = useStudioStore((s) => s.onEdgesChange);
+  const setBoardViewport = useStudioStore((s) => s.setBoardViewport);
+  const regionDrawing = useUiStore((s) => s.regionDrawChapterId !== null);
+  useActiveChapterId();
   // 属性面板开关：用户拍板不随节点点击自动弹出，由顶栏「⚙ 属性」开/关（v2.4）
   const [inspectorOpen, setInspectorOpen] = useState(false);
   // 作品书架：每次进入先见书架（着陆视图）；「打开 / 返回首页」也回到这里
   const [shelfOpen, setShelfOpen] = useState(true);
 
-  // 节点点击：Ctrl+点人物节点=插入人名到大纲管理器「本章需求」
+  // 节点点击：Ctrl+点人物节点=插入人名到大纲管理器「本章需求」；点节点时退出区域选中
   const onNodeClick = useCallback((e: ReactMouseEvent, node: SimNodeType) => {
+    useUiStore.getState().setSelectedRegionId(null);
     // ✎ Ctrl/Cmd+点人物节点：把人名插进「本章需求」光标处（OutlineManager 挂载时才监听，未开面板静默）
     if ((e.ctrlKey || e.metaKey) && node.data.kind === 'character') {
       const name = (node.data as { name?: string }).name?.trim();
@@ -74,8 +112,20 @@ function StudioCanvas() {
   // Del/Backspace 删除：自行 confirm + deleteNode，返回 false 阻止 RF 默认变更流
   const onBeforeDelete = useCallback(async ({ nodes: doomed }: { nodes: SimNodeType[]; edges: Edge[] }) => {
     if (!doomed.length) return true; // 仅选中边：走 RF 默认（直接删边）
-    if (!window.confirm(`删除选中的 ${doomed.length} 个节点？（父环境的内部节点将提升回根层）`)) return false;
     const st = useStudioStore.getState();
+    const refLines = doomed
+      .filter((n) => n.data.kind === 'character')
+      .map((n) => {
+        const ref = characterReferenceSummary(st.chapters, st.activeBoardId, n.id);
+        if (!ref.count) return '';
+        const name = ((n.data as { name?: string }).name || '未命名').trim();
+        return `${name}：被 ${ref.count} 章引用（${referenceChapterText(ref, 4)}）`;
+      })
+      .filter(Boolean);
+    const impact = refLines.length
+      ? `\n\n章节名单引用：\n${refLines.join('\n')}\n删除后相关章节会显示「资料缺失」，快照不会自动更新。`
+      : '';
+    if (!window.confirm(`删除选中的 ${doomed.length} 个节点？（父环境的内部节点将提升回根层）${impact}`)) return false;
     doomed.forEach((n) => st.deleteNode(n.id));
     return false; // 已自行删除，阻止 RF 默认变更
   }, []);
@@ -89,9 +139,10 @@ function StudioCanvas() {
   const onNodeDragStop = useCallback(
     (_e: unknown, node: SimNodeType, nodes: SimNodeType[]) => {
       const st = useStudioStore.getState();
+      const boardNodes = selectActiveNodes(st);
       const draggedSet = new Set((nodes?.length ? nodes : [node]).map((n) => n.id));
-      const byId = new Map(st.nodes.map((n) => [n.id, n]));
-      for (const dragged of st.nodes) {
+      const byId = new Map(boardNodes.map((n) => [n.id, n]));
+      for (const dragged of boardNodes) {
         if (!draggedSet.has(dragged.id)) continue;
         // 祖先也在拖拽集中 → 随祖先整体走，只判拖拽集顶层
         const guard = new Set<string>([dragged.id]);
@@ -109,7 +160,7 @@ function StudioCanvas() {
         const abs = absPositionOf(dragged, byId);
         const w = dragged.width ?? dragged.measured?.width ?? 0;
         const h = dragged.height ?? dragged.measured?.height ?? 0;
-        const container = findContainerAt(st.nodes, abs.x + w / 2, abs.y + h / 2, dragged.id, {
+        const container = findContainerAt(boardNodes, abs.x + w / 2, abs.y + h / 2, dragged.id, {
           x: abs.x,
           y: abs.y,
           w,
@@ -124,6 +175,7 @@ function StudioCanvas() {
   return (
     <div className="w-screen h-screen overflow-hidden bg-slate-50">
       <ReactFlow
+        key={activeBoardId}
         nodes={nodes}
         edges={edges}
         onNodesChange={onNodesChange}
@@ -131,11 +183,21 @@ function StudioCanvas() {
         onNodeDragStop={onNodeDragStop}
         onBeforeDelete={onBeforeDelete}
         onNodeClick={onNodeClick}
+        onPaneClick={() => useUiStore.getState().setSelectedRegionId(null)}
         nodeTypes={simNodeTypes}
-        deleteKeyCode={['Delete', 'Backspace']}
+        deleteKeyCode={regionDrawing ? null : ['Delete', 'Backspace']}
+        nodesDraggable={!regionDrawing}
+        nodesConnectable={!regionDrawing}
+        elementsSelectable={!regionDrawing}
+        panOnDrag={!regionDrawing}
+        zoomOnScroll={!regionDrawing}
+        zoomOnPinch={!regionDrawing}
         zoomOnDoubleClick={false}
-        fitView
+        // 每张画布独立视口：有保存值就恢复，没有则首次进入自动 fitView；切换时按 key 重挂载避免旧实例回写
+        defaultViewport={activeBoard?.viewport}
+        fitView={!activeBoard?.viewport}
         fitViewOptions={{ padding: 0.3, maxZoom: 0.9 }}
+        onMoveEnd={(_, vp) => setBoardViewport(activeBoardId, vp)}
         minZoom={0.15}
         maxZoom={1.6}
         className="bg-slate-50"
@@ -154,6 +216,7 @@ function StudioCanvas() {
           }}
         />
       </ReactFlow>
+      <ChapterRegionsOverlay enabled={!shelfOpen} />
       {!shelfOpen && nodes.length === 0 && (
         // 空画布引导（不挡交互；书架打开期间不显示）
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-6">
@@ -304,6 +367,35 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
   const [goalOpen, setGoalOpen] = useState(false);
   const [outlineOpen, setOutlineOpen] = useState(false);
   const [contentOpen, setContentOpen] = useState(false);
+  const [volumesOpen, setVolumesOpen] = useState(false);
+  const [copyOpen, setCopyOpen] = useState(false);
+  const [charSearchOpen, setCharSearchOpen] = useState(false);
+  // 🗂 多卷画布：标签 = 默认主画布 + 各卷画布（异常数据里的未关联画布也保留显示）
+  const boards = useStudioStore((s) => s.boards);
+  const volumes = useStudioStore((s) => s.volumes);
+  const activeBoardId = useStudioStore((s) => s.activeBoardId);
+  const activeBoardNodes = useStudioStore((s) => s.boards[s.activeBoardId]?.nodes);
+  const selectedCount = activeBoardNodes?.filter((n) => n.selected).length ?? 0;
+  const volumeTabs = volumes.map((v) => {
+    const id = volumeBoardId(v.id);
+    return { id, label: v.title || '未命名卷', count: boards[id]?.nodes.length ?? 0 };
+  });
+  const knownBoardIds = new Set<string>([DEFAULT_BOARD_ID, ...volumeTabs.map((t) => t.id)]);
+  const orphanBoards = Object.values(boards)
+    .filter((b) => !knownBoardIds.has(b.id))
+    .map((b) => ({ id: b.id, label: boardLabel(b, volumes), count: b.nodes.length }));
+  const switchToBoard = (boardId: string) => {
+    if (boardId === activeBoardId) return;
+    const st = useStudioStore.getState();
+    // 切标签前保存当前视口；新画布由 keyed ReactFlow 用保存的 viewport 恢复/自动 fitView
+    if (st.boards[activeBoardId]) st.saveActiveViewport(reactFlow.getViewport());
+    st.switchBoard(boardId);
+  };
+  const addVolumeBoard = () => {
+    const st = useStudioStore.getState();
+    if (st.boards[activeBoardId]) st.saveActiveViewport(reactFlow.getViewport());
+    st.addVolume();
+  };
   // 📜 已设全文规则徽标：非空即亮（amber）；章节大纲规则徽标在大纲管理器内
   const hasRules = useStudioStore((s) => !!s.rules.trim());
   // 🧬 已设人物生成规则徽标：非空即亮（amber）——＋人物会自动随机生成
@@ -316,9 +408,22 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
   const serverEditors = useEditorialStore((s) => s.serverEditors);
   const editorOptions = useMemo(() => [...localEditors, ...serverEditors].filter((e) => e.enabled), [localEditors, serverEditors]);
   // 📋 章节数（大纲管理器入口徽标）
-  const chapterCount = useStudioStore((s) => s.chapters.length);
+  const chapters = useStudioStore((s) => s.chapters);
+  const chapterCount = chapters.length;
   // 📝 已成文章节数（正文管理器入口徽标）
-  const contentCount = useStudioStore((s) => s.chapters.reduce((a, c) => a + (c.content.trim() ? 1 : 0), 0));
+  const contentCount = chapters.reduce((a, c) => a + (c.content.trim() ? 1 : 0), 0);
+  // 📐 当前章节区域：顶栏按钮直接绑定当前章，自动切到所属卷画布
+  const activeChapterId = useActiveChapterId();
+  const activeChapter = chapters.find((c) => c.id === activeChapterId);
+  const chapterRegionBoardId = activeChapterId
+    ? chapterBoardOf(activeChapter?.volumeId, volumes, boards)
+    : '';
+  const chapterHasRegion =
+    !!chapterRegionBoardId &&
+    !!boards[chapterRegionBoardId]?.regions.some((r) => r.chapterId === activeChapterId);
+  const regionDrawing = useUiStore((s) => s.regionDrawChapterId !== null);
+  const regionsVisible = useUiStore((s) => s.regionsVisible);
+  const totalRegions = Object.values(boards).reduce((a, b) => a + b.regions.length, 0);
   // Qwen 引擎可达性（全站共用 qwenStore；两个独立 selector，避免整对象重渲染）
   const qwenStatus = useQwenStore((s) => s.status);
   const qwenMsg = useQwenStore((s) => s.msg);
@@ -331,21 +436,22 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
     void useEditorialStore.getState().loadServerEditors();
   }, []);
 
-  // 地图落点：视口中心（连续创建按节点数级进错开，避免叠死）
-  const dropPos = () => {
-    const c = reactFlow.screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
-    const n = useStudioStore.getState().nodes.length;
-    return { x: c.x + n * 24, y: c.y + n * 24 };
+  // 地图落点：当前可视区域中心（按节点尺寸居中；附近小范围错开避免叠死，且始终在可视区内）
+  const dropPos = (size: { w: number; h: number }) => {
+    const tl = reactFlow.screenToFlowPosition({ x: 0, y: 0 });
+    const br = reactFlow.screenToFlowPosition({ x: window.innerWidth, y: window.innerHeight });
+    return findViewportDropPosition(selectActiveNodes(useStudioStore.getState()), { x: tl.x, y: tl.y, w: br.x - tl.x, h: br.y - tl.y }, size);
   };
 
   // 创建节点：落点在某个环境容器内 → 创建即归入（与拖放嵌套语义一致）
   const addNode = (kind: 'character' | 'environment') => {
     const st = useStudioStore.getState();
-    const pos = dropPos();
+    const size = kind === 'environment' ? { w: ENV_DEFAULT_W, h: ENV_DEFAULT_H } : CHAR_NOMINAL_SIZE;
+    const pos = dropPos(size);
     const id = kind === 'character' ? st.createCharacter(pos) : st.createEnvironment(pos);
-    // ⚠ excludeId=新节点自身：判定点 pos 正是新节点左上角，不排除会「创建即挂到自己」
+    // ⚠ excludeId=新节点自身：判定点取新节点中心，不排除会「创建即挂到自己」
     // （self-parent + 相对坐标 {0,0}，RF12 定位坏掉 → 节点凭空消失，v2.1 踩坑）
-    const container = findContainerAt(useStudioStore.getState().nodes, pos.x, pos.y, id);
+    const container = findContainerAt(selectActiveNodes(useStudioStore.getState()), pos.x + size.w / 2, pos.y + size.h / 2, id);
     if (container) st.reparentNode(id, container.id);
     // 🧬 人物生成规则存在 → ＋人物自动按规则随机生成（v2.15）：先落空节点（位置/嵌套照旧），生成完填属性
     if (kind === 'character') void autoFillCharacter(id);
@@ -364,15 +470,19 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
     if (r.ok && r.block) {
       const gender = genderOf(r.block.gender);
       const avatar = await pickRandomCharAsset(gender === 'female' ? '女' : '男', r.block.age).catch(() => undefined);
-      s2.updateCharacter(id, {
-        name: r.block.name,
-        gender,
-        age: r.block.age,
-        basicInfo: r.block.basicInfo ?? '',
-        identityInfo: r.block.identityInfo ?? '',
-        relations: r.block.relations,
-        avatar,
-      });
+      s2.updateCharacter(id, { name: r.block.name, gender });
+      // 显式写状态0：生成期间用户若新建/切换了状态，也不会把随机属性写进别的状态
+      s2.updateCharacterState(
+        id,
+        {
+          age: r.block.age,
+          basicInfo: r.block.basicInfo ?? '',
+          identityInfo: r.block.identityInfo ?? '',
+          relations: r.block.relations,
+          avatar,
+        },
+        DEFAULT_STATE_ID,
+      );
     } else {
       s2.updateCharacter(id, { name: '' });
       if (r.error && r.error !== '已有生成任务进行中') window.alert(`⚠ 人物自动生成失败：${r.error}（已保留空白人物节点，可手动填写）`);
@@ -537,6 +647,54 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
             >
               环境
             </Button>
+            <Button
+              size="sm"
+              variant={regionDrawing ? 'primary' : chapterHasRegion ? 'soft' : 'ghost'}
+              icon={<SquareDashed />}
+              disabled={!activeChapterId}
+              onClick={() => {
+                if (regionDrawing) {
+                  useUiStore.getState().cancelRegionDraw();
+                  return;
+                }
+                const r = beginChapterRegion(activeChapterId, { viewport: reactFlow.getViewport() });
+                if (!r.ok) window.alert(r.message);
+              }}
+              title={
+                !activeChapterId
+                  ? '还没有章节：先到「大纲」添加章节'
+                  : regionDrawing
+                    ? '取消绘制章节区域'
+                    : chapterHasRegion
+                      ? `定位《${activeChapter?.title.trim() || '未命名章节'}》的区域`
+                      : `为《${activeChapter?.title.trim() || '未命名章节'}》画区域（自动切到章节所属卷画布）`
+              }
+            >
+              区域
+            </Button>
+            <Button
+              size="icon"
+              variant={regionsVisible ? 'ghost' : 'soft'}
+              icon={regionsVisible ? <Eye /> : <EyeOff />}
+              disabled={totalRegions === 0}
+              onClick={() => useUiStore.getState().setRegionsVisible(!regionsVisible)}
+              title={regionsVisible ? '隐藏所有章节区域' : '显示所有章节区域'}
+              aria-label={regionsVisible ? '隐藏章节区域' : '显示章节区域'}
+            />
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<Copy />}
+              disabled={selectedCount === 0}
+              onClick={() => setCopyOpen(true)}
+              title={
+                selectedCount
+                  ? `把当前画布选中的 ${selectedCount} 个节点复制到其它卷画布`
+                  : '先在画布上选中要复制的节点'
+              }
+            >
+              复制到卷
+            </Button>
             <label
               className="flex h-8 shrink-0 items-center gap-1 rounded-[10px] border border-slate-200 bg-white px-2 text-slate-600"
               title="作品责任编辑：把关本作品——其职责与对应能力的技能记忆会注入大纲/正文/人物等生成与总编辑对话（随作品存档）"
@@ -557,6 +715,78 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
             </label>
             <span className="w-1 shrink-0" />
           </div>
+          {/* 第三行：卷画布标签——默认主画布 | 各卷（节点数） | ＋卷 | 管理卷 */}
+          <div className="flex h-9 items-center gap-1 overflow-x-auto border-t border-slate-100 bg-white/70 px-2 [scrollbar-width:none] sm:gap-1.5 sm:px-3 [&::-webkit-scrollbar]:hidden">
+            <span className="shrink-0 text-[11px] text-slate-400">画布</span>
+            <button
+              data-cross-board-search
+              onClick={() => setCharSearchOpen(true)}
+              title="跨卷查人：按人名搜索全部画布人物，定位或查看人物时间轴"
+              className="flex h-6 shrink-0 items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 text-[12px] text-slate-500 transition hover:border-brand-300 hover:bg-brand-50/50 hover:text-brand-700"
+            >
+              <Search className="h-3 w-3" strokeWidth={1.75} />
+              查人
+            </button>
+            <button
+              onClick={() => switchToBoard(DEFAULT_BOARD_ID)}
+              title="默认主画布：未分卷章节与旧单画布内容（所有画布节点合计会显示在属性面板）"
+              className={`flex h-6 shrink-0 items-center gap-1 rounded-full border px-2.5 text-[12px] transition ${
+                activeBoardId === DEFAULT_BOARD_ID
+                  ? 'border-brand-500/40 bg-brand-50 font-medium text-brand-700'
+                  : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'
+              }`}
+            >
+              {DEFAULT_BOARD_LABEL}
+              {boards[DEFAULT_BOARD_ID] && (
+                <span className="text-[10px] tabular-nums opacity-70">{boards[DEFAULT_BOARD_ID].nodes.length}</span>
+              )}
+            </button>
+            {volumeTabs.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => switchToBoard(t.id)}
+                title={`${t.label}（${t.count} 个节点）`}
+                className={`flex h-6 max-w-[180px] shrink-0 items-center gap-1 rounded-full border px-2.5 text-[12px] transition ${
+                  activeBoardId === t.id
+                    ? 'border-brand-500/40 bg-brand-50 font-medium text-brand-700'
+                    : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'
+                }`}
+              >
+                <span className="truncate">{t.label}</span>
+                <span className="text-[10px] tabular-nums opacity-70">{t.count}</span>
+              </button>
+            ))}
+            {orphanBoards.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => switchToBoard(t.id)}
+                title="未关联卷的异常画布（数据仍保留，可复制节点后自行清理）"
+                className={`flex h-6 max-w-[180px] shrink-0 items-center gap-1 rounded-full border border-dashed px-2.5 text-[12px] transition ${
+                  activeBoardId === t.id
+                    ? 'border-amber-400 bg-amber-50 font-medium text-amber-700'
+                    : 'border-slate-300 bg-white text-slate-400 hover:bg-slate-50'
+                }`}
+              >
+                <span className="truncate">{t.label}</span>
+                <span className="text-[10px] tabular-nums opacity-70">{t.count}</span>
+              </button>
+            ))}
+            <button
+              onClick={addVolumeBoard}
+              title="新建一卷并创建空白卷画布（自动切到新画布）"
+              className="flex h-6 shrink-0 items-center gap-0.5 rounded-full border border-dashed border-slate-300 px-2 text-[12px] text-slate-500 transition hover:border-brand-400 hover:bg-brand-50/50 hover:text-brand-700"
+            >
+              <FolderPlus className="h-3 w-3" strokeWidth={1.75} />卷
+            </button>
+            <button
+              onClick={() => setVolumesOpen(true)}
+              title="管理卷：改名/介绍/删除（删除会一并删除该卷画布与节点）"
+              className="flex h-6 shrink-0 items-center rounded-full px-2 text-[12px] text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+            >
+              管理卷
+            </button>
+            <span className="w-1 shrink-0" />
+          </div>
         </div>
       </div>
       {rulesOpen && <RulesDialog onClose={() => setRulesOpen(false)} />}
@@ -564,6 +794,9 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
       {goalOpen && <GoalDialog onClose={() => setGoalOpen(false)} />}
       {outlineOpen && <OutlineManager onClose={() => setOutlineOpen(false)} />}
       {contentOpen && <ContentManager onClose={() => setContentOpen(false)} />}
+      {volumesOpen && <VolumesDialog onClose={() => setVolumesOpen(false)} />}
+      {copyOpen && <CopyToVolumeDialog onClose={() => setCopyOpen(false)} />}
+      {charSearchOpen && <CharacterSearchDialog onClose={() => setCharSearchOpen(false)} />}
       {agentOpen && <EditorRoomPanel onClose={() => setAgentOpen(false)} />}
       {modelCenterOpen && (
         <ModelCenterPanel
