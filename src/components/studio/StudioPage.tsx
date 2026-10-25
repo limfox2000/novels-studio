@@ -49,6 +49,7 @@ import { CharacterSearchDialog } from './CharacterSearchDialog';
 import { ChapterRegionsOverlay } from './ChapterRegionsOverlay';
 import { useActiveChapterId } from './useActiveChapter';
 import { beginChapterRegion } from './chapterRegionActions';
+import { startChapterSceneSync } from '../../stores/chapterSceneSync';
 import {
   saveLocal,
 } from '../../services/studioSync';
@@ -85,7 +86,12 @@ import {
 const CHAR_NOMINAL_SIZE = { w: 144, h: 104 };
 
 function StudioCanvas() {
-  const nodes = useActiveNodes();
+  const storeNodes = useActiveNodes();
+  // 锁定的环境节点在 React Flow 层禁用拖动（属性编辑不受影响）
+  const nodes = useMemo(
+    () => storeNodes.map((n) => (n.data.kind === 'environment' && n.data.locked ? { ...n, draggable: false } : n)),
+    [storeNodes],
+  );
   const edges = useActiveEdges();
   const activeBoard = useActiveBoard();
   const activeBoardId = useStudioStore((s) => s.activeBoardId);
@@ -98,6 +104,10 @@ function StudioCanvas() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   // 作品书架：每次进入先见书架（着陆视图）；「打开 / 返回首页」也回到这里
   const [shelfOpen, setShelfOpen] = useState(true);
+  // 🎬 当前章节场景自动跟随画布（名单/位置/父环境/状态），去抖写入内存，手动保存才落盘
+  useEffect(() => {
+    startChapterSceneSync();
+  }, []);
 
   // 节点点击：Ctrl+点人物节点=插入人名到大纲管理器「本章需求」；点节点时退出区域选中
   const onNodeClick = useCallback((e: ReactMouseEvent, node: SimNodeType) => {
@@ -123,7 +133,7 @@ function StudioCanvas() {
       })
       .filter(Boolean);
     const impact = refLines.length
-      ? `\n\n章节名单引用：\n${refLines.join('\n')}\n删除后相关章节会显示「资料缺失」，快照不会自动更新。`
+      ? `\n\n章节名单引用：\n${refLines.join('\n')}\n删除后相关章节在切回同步前会显示「资料缺失」；章节场景会随画布自动同步。`
       : '';
     if (!window.confirm(`删除选中的 ${doomed.length} 个节点？（父环境的内部节点将提升回根层）${impact}`)) return false;
     doomed.forEach((n) => st.deleteNode(n.id));
@@ -436,6 +446,29 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
     void useEditorialStore.getState().loadServerEditors();
   }, []);
 
+  // 手动保存快捷键：Ctrl/Cmd+S
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        saveLocal();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  // 手动保存：有未保存改动或上次保存失败时，刷新/关闭前让浏览器弹出离开确认（只提示，不自动保存）
+  useEffect(() => {
+    if (saveStatus !== 'unsaved' && saveStatus !== 'error') return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [saveStatus]);
+
   // 地图落点：当前可视区域中心（按节点尺寸居中；附近小范围错开避免叠死，且始终在可视区内）
   const dropPos = (size: { w: number; h: number }) => {
     const tl = reactFlow.screenToFlowPosition({ x: 0, y: 0 });
@@ -489,7 +522,7 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
     }
   };
 
-  const saveTone: 'ok' | 'warn' | 'down' = saveStatus === 'error' ? 'down' : saveStatus === 'saving' ? 'warn' : 'ok';
+  const saveTone: 'ok' | 'warn' | 'down' = saveStatus === 'error' ? 'down' : saveStatus === 'unsaved' ? 'warn' : 'ok';
   const qwenTone = qwenStatus === 'ok' ? 'ok' : qwenStatus === 'down' ? 'down' : qwenStatus === 'checking' ? 'warn' : 'idle';
   const qwenLabel =
     qwenStatus === 'checking' ? '检测中' : qwenStatus === 'ok' ? `在线 ${qwenMsg}` : qwenStatus === 'down' ? '离线' : '检测';
@@ -497,7 +530,7 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
   return (
     <>
       {/* 两级顶栏：第一行作品身份与主操作，第二行写作/画布工具（窄屏横向滚动） */}
-      <div className="fixed left-2 right-2 top-2 z-40 sm:left-1/2 sm:right-auto sm:top-4 sm:w-[min(calc(100vw-2rem),1000px)] sm:-translate-x-1/2">
+      <div className="fixed left-2 right-2 top-2 z-40 sm:left-1/2 sm:right-auto sm:top-4 sm:w-[min(calc(100vw-2rem),1180px)] sm:-translate-x-1/2">
         <div className="overflow-hidden rounded-[16px] border border-slate-200/80 bg-white/95 shadow-float backdrop-blur">
           {/* 第一行：返回 / 作品名 / 保存状态 / 保存 + 属性、模型、编辑室 */}
           <div className="flex h-12 items-center gap-1.5 px-2 sm:gap-2 sm:px-3">
@@ -517,10 +550,10 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
             />
             <span
               className={`flex shrink-0 items-center gap-1 whitespace-nowrap text-[12px] ${
-                saveStatus === 'error' ? 'text-rose-500' : saveStatus === 'saving' ? 'text-amber-600' : 'text-slate-400'
+                saveStatus === 'error' ? 'text-rose-500' : saveStatus === 'unsaved' ? 'text-amber-600' : 'text-slate-400'
               }`}
             >
-              <StatusDot tone={saveTone} pulse={saveStatus === 'saving'} />
+              <StatusDot tone={saveTone} pulse={false} />
               <span className="max-sm:hidden">{saveMsg}</span>
             </span>
             <Button
@@ -528,7 +561,7 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
               variant="secondary"
               icon={<Save />}
               onClick={() => saveLocal()}
-              title="保存到本地存档（本机浏览器，不上传服务器）"
+              title="保存当前作品到本机（同时更新作品进度与命名存档；Ctrl/Cmd+S）"
               className="max-sm:px-2"
             >
               <span className="max-sm:hidden">保存</span>

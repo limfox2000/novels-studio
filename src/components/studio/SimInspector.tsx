@@ -360,7 +360,7 @@ function CharacterStateBar({ nodeId, data, boardId }: { nodeId: string; data: Ch
   const remove = () => {
     if (index === 0) return;
     const impact = refs.count
-      ? `\n\n该状态被 ${refs.count} 章引用：${referenceChapterText(refs, 6)}。删除后这些章节继续引用原状态 ID，将显示「资料缺失」，快照不会自动更新。`
+      ? `\n\n该状态被 ${refs.count} 章引用：${referenceChapterText(refs, 6)}。删除后这些章节在切回同步前会显示「资料缺失」；章节场景会随画布自动同步。`
       : '';
     if (!window.confirm(`删除状态「${state.label}」？切到该状态的人物设定与写真引用会一并移除（其它状态仍在用的图片不会被删）。${impact}`)) return;
     const r = st.deleteCharacterState(nodeId, state.id);
@@ -420,7 +420,7 @@ function CharacterStateBar({ nodeId, data, boardId }: { nodeId: string; data: Ch
       {refs.count > 0 && (
         <p
           className="mt-1 pl-5 text-[10px] leading-relaxed text-amber-600"
-          title={`被 ${refs.count} 章引用：${refs.chapters.map((c) => c.title).join('、')}\n修改当前状态属性会改变这些历史章节的画布表现；快照不会自动更新。`}
+          title={`被 ${refs.count} 章引用：${refs.chapters.map((c) => c.title).join('、')}\n修改当前状态属性会改变这些历史章节的生成内容；章节场景会随画布自动同步。`}
           data-state-refs={refs.count}
         >
           被 {refs.count} 章引用 · 修改会影响历史章

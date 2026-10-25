@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { readSavedActiveChapterId } from './activeChapter';
 
 export type DialogState =
   | { type: 'advance' | 'focus'; cardId: string }
@@ -16,7 +17,7 @@ interface UiState {
   graphListOpen: boolean;
   /** 模型中心（文本/推理/生图统一配置）面板开关；不持久化，重开页面默认关闭 */
   modelCenterOpen: boolean;
-  saveStatus: 'idle' | 'saving' | 'saved' | 'error';
+  saveStatus: 'idle' | 'unsaved' | 'saved' | 'error';
   saveMsg: string;
   /** 📐 当前章节：大纲/正文面板与画布区域高亮共用（不持久化，重开页面回落到首章） */
   activeChapterId: string | null;
@@ -58,7 +59,7 @@ export const useUiStore = create<UiState>((set) => ({
   modelCenterOpen: false,
   saveStatus: 'idle',
   saveMsg: '',
-  activeChapterId: null,
+  activeChapterId: readSavedActiveChapterId(),
   selectedRegionId: null,
   regionDrawChapterId: null,
   regionsVisible: true,

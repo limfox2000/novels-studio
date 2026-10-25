@@ -6,7 +6,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent, MouseEvent } from 'react';
 import { BookOpen, ChevronLeft, ChevronRight, Download, LibraryBig, Plus, Upload, X } from 'lucide-react';
-import { useStudioStore, DEFAULT_BOARD_ID, emptyBoard } from '../../stores/studioStore';
+import {
+  useStudioStore,
+  DEFAULT_BOARD_ID,
+  emptyBoard,
+  hasUnsavedStudioChanges,
+  saveStudioWorkspace,
+} from '../../stores/studioStore';
 import {
   archiveResultSummary,
   deleteLocalArchive,
@@ -16,6 +22,8 @@ import {
   loadLocalArchive,
 } from '../../services/studioSync';
 import { bookHue } from '../../services/bookCover';
+import { useUiStore } from '../../stores/uiStore';
+import { persistActiveChapterId } from '../../stores/activeChapter';
 import { IconButton } from '../ui/IconButton';
 
 function BookCard({
@@ -135,7 +143,11 @@ export function Bookshelf({ onClose }: { onClose: () => void }) {
 
   // 行为镜像原「打开/新建」按钮：确认文案一致；载入失败（快照损坏）不关书架
   const openArchive = (name: string) => {
-    if (nodeCount > 1 && !window.confirm('载入将替换当前画布内容（当前内容已在本机留存），确定？')) return;
+    const dirty = hasUnsavedStudioChanges();
+    const tip = dirty
+      ? '载入将替换当前画布内容，当前未保存的改动会丢失，确定？'
+      : '载入将替换当前画布内容（当前内容已在本机留存），确定？';
+    if ((nodeCount > 1 || dirty) && !window.confirm(tip)) return;
     const r = loadLocalArchive(name);
     if (!r.ok) {
       window.alert(r.error || `❌ 载入「${name}」失败。`);
@@ -151,6 +163,7 @@ export function Bookshelf({ onClose }: { onClose: () => void }) {
       window.alert('当前作品还没有命名存档。先点顶栏「保存」再导出。');
       return;
     }
+    if (hasUnsavedStudioChanges() && !window.confirm('当前有未保存改动，导出的将是上次保存的存档。仍要导出？')) return;
     const r = exportLocalArchive(graphName);
     if (!r.ok) {
       window.alert(`导出失败：${r.error}`);
@@ -182,7 +195,11 @@ export function Bookshelf({ onClose }: { onClose: () => void }) {
   };
   const startNewWork = () => {
     // replaceState 是合并语义：全字段显式清空（同顶栏「新建」）
-    if (nodeCount > 0 && !window.confirm('清空当前创作台画布，重新开始？（当前内容已在本机留存）')) return;
+    const dirty = hasUnsavedStudioChanges();
+    const tip = dirty
+      ? '清空当前创作台画布，重新开始？当前未保存的改动会丢失。'
+      : '清空当前创作台画布，重新开始？（当前内容已在本机留存）';
+    if ((nodeCount > 0 || dirty) && !window.confirm(tip)) return;
     useStudioStore.getState().replaceState({
       boards: { [DEFAULT_BOARD_ID]: emptyBoard(DEFAULT_BOARD_ID) },
       activeBoardId: DEFAULT_BOARD_ID,
@@ -196,6 +213,10 @@ export function Bookshelf({ onClose }: { onClose: () => void }) {
       cover: '',
     });
     useStudioStore.getState().setGraphName('未命名');
+    useUiStore.getState().setActiveChapterId(null);
+    persistActiveChapterId(null);
+    // 新建是显式操作：立即把空白作品写为本机当前进度，避免刷新后回到旧作品
+    if (!saveStudioWorkspace()) window.alert('⚠ 空白作品暂未写入本机，请检查浏览器存储空间后手动保存。');
     onClose();
   };
   const removeArchive = (e: MouseEvent, name: string) => {
@@ -214,7 +235,7 @@ export function Bookshelf({ onClose }: { onClose: () => void }) {
         </span>
         <div>
           <h1 className="text-[15px] font-semibold text-slate-800">作品书架</h1>
-          <p className="text-[12px] text-slate-500">创作内容只保存在本机浏览器、不上传服务器</p>
+          <p className="text-[12px] text-slate-500">创作内容只保存在本机浏览器、不上传服务器；关闭前请点顶栏「保存」</p>
         </div>
         <span className="flex-1" />
         <button

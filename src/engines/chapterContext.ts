@@ -164,7 +164,7 @@ export function buildLegacyStageBlock(summary: string, boardLabel: string): Chap
 画布：${boardLabel}
 ${summary}
 
-【注意】本章没有快照名单：人物出场不受名单约束。若需要严格限制本章人物与状态，请在大纲面板记录本章名单。`,
+【注意】本章没有快照名单：人物出场不受名单约束。若需要严格限制本章人物与状态，请在画布上为本章绘制区域（区域内人物会自动成为名单）。`,
     mode: 'legacy',
     warnings: ['本章未记录快照，本次生成使用工作画布全部资料'],
     missing: 0,
@@ -186,9 +186,9 @@ export function buildChapterAgentBrief(
   const head = `【本章上下文（只读）】\n章节：${chapter.title.trim() || '未命名章节'}${vol ? `（${vol.title || '未命名卷'}）` : ''}`;
   const snap = chapter.snapshot;
   if (!snap) {
-    return `${head}\n快照：未记录${currentRegion ? '（已有区域，可在「大纲」管理器采集本章名单）' : '（尚未绘制本章区域）'}。
-- 回答本章人物/在场问题时，只能说明本章尚未采集名单；可从工作画布检索，但不得把工作画布人物说成本章已定名单。
-- 你不得修改或声称已修改章节快照、名单、区域；这些由用户在界面手动操作。`;
+    return `${head}\n快照：尚未记录${currentRegion ? '（已有区域；把人物移入区域后会自动记录）' : '（尚未绘制本章区域）'}。
+- 回答本章人物/在场问题时，只能说明本章尚未记录场景；可从工作画布检索，但不得把工作画布人物说成本章已定名单。
+- 你不得直接修改或声称已修改章节快照、名单、区域；当前章场景由系统随工作画布自动同步。`;
   }
   const board = boards[snap.boardId];
   const source = board ? boardLabel(board, volumes) : `已删除的画布（${snap.boardId}）`;
@@ -214,7 +214,7 @@ export function buildChapterAgentBrief(
     '【在场】' + (present.length ? `\n- ${present.join('\n- ')}` : '（无）'),
     '【仅提及】' + (mentioned.length ? `\n- ${mentioned.join('\n- ')}` : '（无）'),
     ...(missing.length ? ['【资料缺失】\n- ' + missing.join('\n- ')] : []),
-    '【只读规则】\n- 只有在场人物可行动/说话；仅提及人物只能被提到，不得写成在场。\n- 不得新增具名人物；可以有无名群演，但不得给姓名、独立台词或推动剧情。\n- 快照与名单只读：你只能改工作画布，不得声称已修改快照/名单/区域；快照不会自动同步。',
+    '【只读规则】\n- 只有在场人物可行动/说话；仅提及人物只能被提到，不得写成在场。\n- 不得新增具名人物；可以有无名群演，但不得给姓名、独立台词或推动剧情。\n- 当前章场景随工作画布自动同步：你可以说明改画布会更新本章场景，但不得声称已修改快照/名单/区域，也不得把其他章节的历史场景说成已同步。',
   ];
   let text = lines.join('\n');
   if (text.length > cap) text = `${text.slice(0, cap)}\n…（本章摘要已截断）`;

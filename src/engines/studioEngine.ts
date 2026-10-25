@@ -1127,7 +1127,7 @@ ${readBlock}${projectDataBlock()}${chapterBlock}${refBlock}
 - 用户没说放进哪里时省略「所在」行，节点落到视口中心（落点在某环境内会自动归入）
 - 🗂 用户明确要求写到其它卷画布时，每个块加「卷：（卷名）」行；卷名从【画布索引】的「全部画布」一字不差抄写，省略=当前画布。目标卷里的查找（同名人物/所在环境）只在目标画布内进行；找不到或重名时说明并请用户确认，绝不改落到当前画布
 - 跨卷复制/移动由用户在画布顶栏用「复制到卷」手动执行；不要声称已经复制，也不要为复制而输出设定块。目标卷还不存在时，先用【卷设定】建卷（新建卷与空白画布），用户在后续回复再用「卷：」写内容
-- 章节快照、章节名单与区域是用户手动采集的只读资料：你只能修改工作画布上的人物/状态/环境；不得声称已修改某章快照、名单或区域，也不得把快照说成会自动同步。修改被引用状态会影响历史章节表现，必要时提醒用户手动刷新快照
+- 章节场景由系统按「章节区域」自动记录：当前章的名单/位置/父环境/状态随工作画布自动同步，切换到其他章节时会恢复该章记录。你只能修改工作画布上的人物/状态/环境；不得声称已直接修改某章快照、名单或区域，也不得把其他章节的历史场景说成已同步。修改被引用状态会影响历史章节的生成内容
 
 【人物产出协议】（段名一字不差）
 【人物设定】
@@ -1477,12 +1477,11 @@ export interface ChapterStageResult {
   capturedNow: boolean;
 }
 
-/** R4：本章生成舞台上下文。已有快照 → 只注入名单；无快照且已画区域 → 自动采集一次；
- *  无区域/无章节 id → 回退工作画布并警告。绝不自动刷新已有快照。 */
+/** R4：本章生成舞台上下文。有区域时先按画布自动同步本章场景（名单/位置/状态），
+ *  再只注入名单；无区域但有旧快照 → 用旧快照；无快照 → 回退工作画布并警告。 */
 function chapterStageFor(opts: {
   chapterId?: string;
   volumeId?: string;
-  source: 'auto-outline' | 'auto-content';
 }): { stage: ChapterStageContext; capturedNow: boolean; chapter?: SimChapter } {
   const st = useStudioStore.getState();
   const chapter = opts.chapterId ? st.chapters.find((c) => c.id === opts.chapterId) : undefined;
@@ -1490,14 +1489,14 @@ function chapterStageFor(opts: {
   const boardId = chapterBoardId(volumeId);
   let snapshot = chapter?.snapshot;
   let capturedNow = false;
-  if (chapter && !snapshot) {
+  if (chapter) {
     const board = st.boards[boardId];
     const hasRegion = !!board?.regions.some((r) => r.chapterId === chapter.id);
     if (hasRegion) {
-      const r = useStudioStore.getState().captureChapterSnapshot(chapter.id, { source: opts.source });
-      if (r.ok) {
+      const r = useStudioStore.getState().syncChapterScene(chapter.id);
+      if (r.ok && r.snapshot) {
         snapshot = r.snapshot;
-        capturedNow = true;
+        capturedNow = r.created;
       }
     }
   }
@@ -1577,7 +1576,6 @@ export async function genChapterOutline(opts: {
   const { stage, capturedNow } = chapterStageFor({
     ...(opts.chapterId ? { chapterId: opts.chapterId } : {}),
     ...(chapter.volumeId ? { volumeId: chapter.volumeId } : {}),
-    source: 'auto-outline',
   });
   const msgs: QwenChatMessage[] = [
     {
@@ -1673,7 +1671,6 @@ export async function genChapterContent(opts: {
   const { stage, capturedNow } = chapterStageFor({
     ...(opts.chapterId ? { chapterId: opts.chapterId } : {}),
     ...(chapter.volumeId ? { volumeId: chapter.volumeId } : {}),
-    source: 'auto-content',
   });
   const b = CH_CONTENT_BUDGET.qwen;
   // 前情：前几章——有正文取结尾，无正文退回大纲要点

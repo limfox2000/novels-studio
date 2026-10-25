@@ -1,4 +1,4 @@
-/** 📸 章节快照纯逻辑（R2/R3）：区域命中采集、环境引用冻结、刷新、过期检测、存档清洗。
+/** 📸 章节场景纯逻辑（R2/R3）：区域命中采集、环境引用冻结、场景写回/回放、差异检测、存档清洗。
  *  只依赖类型 + 几何/状态纯工具，不引入 store；UI、store、引擎与临时脚本可共用。
  *
  *  几何约定：
@@ -6,8 +6,8 @@
  *  - 区域边缘带（默认较小的 15%，24–80px）内 → mentioned（仅提及）；内侧 → present（在场）。
  *  - 区域坐标/尺寸本身存绝对画布坐标。
  *
- *  快照只引用人物/状态 id，并冻结采集时标签、环境路径与环境描述；人物属性仍从画布解析，
- *  因此原地修改状态会反映到历史章，UI 用指纹对比提示“未同步”。 */
+ *  场景随工作画布自动同步：快照记录人物位置/父环境/状态 id 并冻结采集时标签、环境路径与环境描述；
+ *  不保存状态内容历史版本，原地修改状态会反映到历史章，UI 用指纹对比提示“有变化”。 */
 import type {
   CastRole,
   ChapterRegion,
@@ -22,7 +22,7 @@ import type {
   SnapshotSource,
 } from '../types/sim';
 import { ENV_TYPES } from '../types/sim';
-import { absPositionOf } from './graphGeom';
+import { absPositionOf, sortParentsFirst } from './graphGeom';
 import { activeCharacterState } from './characterStates';
 import { sanitizeRegionRect, sanitizeRegions } from './chapterRegions';
 
@@ -351,6 +351,143 @@ export function refreshChapterSnapshot(
   };
 }
 
+export interface ApplyChapterSceneResult {
+  nodes: SimNodeType[];
+  changed: boolean;
+  /** 位置发生变化的条目数 */
+  moved: number;
+  /** 父环境发生变化的条目数 */
+  reparented: number;
+  /** 恢复了快照状态的条目数 */
+  stateRestored: number;
+  /** 快照里已不存在于画布的人物 id */
+  missingCharacters: string[];
+  /** 人物已不存在、无法恢复的状态条目 */
+  missingStates: string[];
+  /** 父环境已不存在、退回根层的条目 */
+  missingParents: string[];
+}
+
+/** 🎬 把章节场景应用到画布：只移动快照内人物，恢复父环境、绝对位置与当前状态 id。
+ *  - 绝对坐标 × 当前父环境绝对坐标 → 相对坐标（环境布局不进入快照，按当前布局换算）；
+ *  - 父环境缺失 → 退回根层并记录，不猜测替代容器；
+ *  - 状态 id 缺失 → 保留人物当前状态并记录，不猜测；
+ *  - 快照外人物一律不动。 */
+export function applyChapterScene(board: SimBoard, snapshot: ChapterSnapshot): ApplyChapterSceneResult {
+  const byId = new Map(board.nodes.map((n) => [n.id, n]));
+  const replaced = new Map<string, SimNodeType>();
+  const missingCharacters: string[] = [];
+  const missingStates: string[] = [];
+  const missingParents: string[] = [];
+  let moved = 0;
+  let reparented = 0;
+  let stateRestored = 0;
+
+  for (const entry of snapshot.entries) {
+    const node = byId.get(entry.characterId);
+    if (!node || node.data.kind !== 'character') {
+      missingCharacters.push(entry.characterId);
+      continue;
+    }
+    const parent = entry.parentEnvId ? byId.get(entry.parentEnvId) : undefined;
+    const parentValid = !!parent && parent.data.kind === 'environment';
+    if (entry.parentEnvId && !parentValid) missingParents.push(entry.characterId);
+    const parentId = parentValid ? entry.parentEnvId : undefined;
+    const parentAbs = parentValid ? absPositionOf(parent!, byId) : { x: 0, y: 0 };
+    const position = { x: Math.round(entry.x - parentAbs.x), y: Math.round(entry.y - parentAbs.y) };
+
+    let activeStateId = node.data.activeStateId;
+    const hasState = node.data.states.some((s) => s.id === entry.stateId);
+    if (!hasState) missingStates.push(entry.characterId);
+    else activeStateId = entry.stateId;
+
+    const parentChanged = (node.parentId ?? null) !== (parentId ?? null);
+    const positionChanged = node.position.x !== position.x || node.position.y !== position.y;
+    const stateChanged = hasState && node.data.activeStateId !== activeStateId;
+    if (!parentChanged && !positionChanged && !stateChanged) continue;
+
+    if (positionChanged) moved++;
+    if (parentChanged) reparented++;
+    if (stateChanged) stateRestored++;
+    replaced.set(entry.characterId, {
+      ...node,
+      ...(parentChanged ? { parentId } : {}),
+      position,
+      ...(stateChanged ? { data: { ...node.data, activeStateId } } : {}),
+      zIndex: node.zIndex ?? 100,
+    });
+  }
+
+  if (!replaced.size) {
+    return { nodes: board.nodes, changed: false, moved, reparented, stateRestored, missingCharacters, missingStates, missingParents };
+  }
+  return {
+    nodes: sortParentsFirst(board.nodes.map((n) => replaced.get(n.id) ?? n)),
+    changed: true,
+    moved,
+    reparented,
+    stateRestored,
+    missingCharacters,
+    missingStates,
+    missingParents,
+  };
+}
+
+function sameRect(a: Rect, b: Rect): boolean {
+  return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
+}
+
+function sameEntry(a: ChapterSnapshotEntry, b: ChapterSnapshotEntry): boolean {
+  return (
+    a.characterId === b.characterId &&
+    a.stateId === b.stateId &&
+    a.role === b.role &&
+    a.x === b.x &&
+    a.y === b.y &&
+    (a.parentEnvId ?? '') === (b.parentEnvId ?? '') &&
+    a.envPathAtCapture === b.envPathAtCapture &&
+    a.nameAtCapture === b.nameAtCapture &&
+    a.stateLabelAtCapture === b.stateLabelAtCapture &&
+    a.stateFingerprintAtCapture === b.stateFingerprintAtCapture &&
+    a.origin === b.origin &&
+    (a.roleLocked === true) === (b.roleLocked === true) &&
+    (a.stateLocked === true) === (b.stateLocked === true)
+  );
+}
+
+/** 两份快照是否记录同一个章节场景（忽略采集/更新时间与来源）。
+ *  自动同步用它跳过无变化的重复写入，避免每次拖动都刷新 updatedAt。 */
+export function sameSnapshotScene(a: ChapterSnapshot, b: ChapterSnapshot): boolean {
+  if (a.boardId !== b.boardId) return false;
+  if (a.regions.length !== b.regions.length) return false;
+  for (let i = 0; i < a.regions.length; i++) {
+    const ra = a.regions[i];
+    const rb = b.regions[i];
+    if (!ra || !rb || ra.id !== rb.id || ra.chapterId !== rb.chapterId || !sameRect(ra, rb)) return false;
+  }
+  if (a.entries.length !== b.entries.length) return false;
+  const byChar = new Map(b.entries.map((e) => [e.characterId, e]));
+  for (const e of a.entries) {
+    const other = byChar.get(e.characterId);
+    if (!other || !sameEntry(e, other)) return false;
+  }
+  if (a.envRefs.length !== b.envRefs.length) return false;
+  const byEnv = new Map(b.envRefs.map((e) => [e.id, e]));
+  for (const e of a.envRefs) {
+    const other = byEnv.get(e.id);
+    if (
+      !other ||
+      e.name !== other.name ||
+      e.etype !== other.etype ||
+      e.path !== other.path ||
+      e.desc !== other.desc
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** 手动添加条目：默认仅提及 + 当前状态；已存在则原样返回 */
 export function manualSnapshotEntry(
   board: SimBoard,
@@ -390,11 +527,7 @@ export interface SnapshotStaleness {
   rosterDelta: number;
 }
 
-function sameRect(a: Rect, b: Rect): boolean {
-  return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
-}
-
-/** 快照与源画布/当前区域的差异：用于“未同步”提示（不自动刷新）。
+/** 快照与源画布/当前区域的差异：用于名单面板“有变化”提示与生成前警告。
  *  源画布缺失时仍检查条目（无法解析），返回 source-board-missing。 */
 export function snapshotStaleness(
   snapshot: ChapterSnapshot,
@@ -491,7 +624,7 @@ function sanitizeRole(v: unknown): CastRole {
 }
 
 function sanitizeSource(v: unknown): SnapshotSource {
-  return v === 'auto-outline' || v === 'auto-content' || v === 'manual' ? v : 'manual';
+  return v === 'auto-outline' || v === 'auto-content' || v === 'auto-scene' || v === 'manual' ? v : 'manual';
 }
 
 function sanitizeEnvType(v: unknown): EnvironmentType {

@@ -72,13 +72,16 @@ import {
   stateLabelTaken,
 } from './characterStates';
 import {
+  applyChapterScene as applyChapterScenePure,
   captureChapterSnapshot as captureSnapshotPure,
   collectSnapshotEnvRefs,
   manualSnapshotEntry,
   refreshChapterSnapshot as refreshSnapshotPure,
+  sameSnapshotScene,
   sanitizeChapterSnapshot,
+  type ApplyChapterSceneResult,
 } from './chapterSnapshots';
-import { createDebouncedPersistStorage } from './debouncedPersistStorage';
+import { createManualPersistStorage } from './manualPersistStorage';
 
 export { absPositionOf, isDescendantOf, sortParentsFirst } from './graphGeom';
 export {
@@ -321,6 +324,7 @@ export function sanitizeSimNodes(
     // environment：etype 不在集合内归位 building；尺寸缺失/过小回默认（旧档案/损坏缓存兜底）
     const etype = (ENV_TYPES as readonly string[]).includes(pickStr(d.etype)) ? (pickStr(d.etype) as EnvironmentType) : 'building';
     const data: EnvironmentData = { kind: 'environment', name: pickStr(d.name), etype, desc: pickStr(d.desc) };
+    if (d.locked === true) data.locked = true;
     const w = typeof clean.width === 'number' && clean.width >= ENV_MIN_W ? clean.width : ENV_DEFAULT_W;
     const h = typeof clean.height === 'number' && clean.height >= ENV_MIN_H ? clean.height : ENV_DEFAULT_H;
     return { ...clean, data, width: w, height: h, zIndex: undefined };
@@ -484,6 +488,28 @@ export interface WorkspaceSnapshot {
 /** 人物顶层身份补丁：人名/性别跨状态稳定，不写状态 */
 export type CharacterIdentityPatch = Partial<Pick<CharacterData, 'name' | 'gender'>>;
 /** 状态属性补丁：只含随状态变化的字段（id/label 只能走专用动作） */
+export interface ChapterSceneSyncResult {
+  ok: boolean;
+  /** 快照内容是否发生变化（时间戳/来源变化不算） */
+  changed: boolean;
+  /** 是否首次创建快照 */
+  created: boolean;
+  snapshot?: ChapterSnapshot;
+  error?: string;
+}
+
+export type ChapterSceneApplyResult = {
+  ok: boolean;
+  changed: boolean;
+  moved: number;
+  reparented: number;
+  stateRestored: number;
+  missingCharacters: string[];
+  missingStates: string[];
+  missingParents: string[];
+  error?: string;
+};
+
 export type CharacterStatePatch = Partial<Omit<CharacterState, 'id' | 'label'>>;
 export type CharacterStateError =
   | 'not-found'
@@ -600,6 +626,10 @@ interface SimState {
     patch: { role?: CastRole; stateId?: string },
   ) => SnapshotMutationResult;
   clearChapterSnapshot: (chapterId: string) => SnapshotMutationResult;
+  /** 🎬 自动跟随：按当前区域重采本章场景快照（名单/位置/父环境/当前状态）；内容未变不写 */
+  syncChapterScene: (chapterId: string) => ChapterSceneSyncResult;
+  /** 🎬 切章回放：只移动快照内人物，恢复父环境、绝对位置与当前状态 id */
+  applyChapterScene: (chapterId: string) => ChapterSceneApplyResult;
 
   // ── 节点（当前画布） ──
   /** 新建人物节点（pos=地图落点；缺省人物列堆叠） */
@@ -649,14 +679,80 @@ interface SimState {
   onEdgesChange: (changes: EdgeChange[]) => void;
 }
 
-/** P1：流式生成/拖拽等高频写入只登记最新状态，停止更新后落盘 */
-const studioPersistStorage = createDebouncedPersistStorage<SimState>({
-  debounceMs: 500,
-  maxWaitMs: 2000,
+/** 节点/连线上属于 React Flow 交互瞬态的字段：不参与“内容是否改动”的判断，也不会影响保存结果 */
+const TRANSIENT_NODE_KEYS = new Set(['selected', 'dragging', 'resizing', 'measured', 'positionAbsolute', 'internals']);
+
+function sameNodeContent(a: SimNodeType, b: SimNodeType): boolean {
+  if (a === b) return true;
+  const ra = a as unknown as Record<string, unknown>;
+  const rb = b as unknown as Record<string, unknown>;
+  const keys = new Set([...Object.keys(ra), ...Object.keys(rb)]);
+  for (const k of keys) {
+    if (TRANSIENT_NODE_KEYS.has(k)) continue;
+    if (k === 'position') {
+      const pa = ra.position as { x?: number; y?: number } | undefined;
+      const pb = rb.position as { x?: number; y?: number } | undefined;
+      if ((pa?.x ?? 0) !== (pb?.x ?? 0) || (pa?.y ?? 0) !== (pb?.y ?? 0)) return false;
+      continue;
+    }
+    if (ra[k] !== rb[k]) return false;
+  }
+  return true;
+}
+
+function sameEdgeContent(a: Edge, b: Edge): boolean {
+  if (a === b) return true;
+  const ra = a as unknown as Record<string, unknown>;
+  const rb = b as unknown as Record<string, unknown>;
+  for (const k of new Set([...Object.keys(ra), ...Object.keys(rb)])) {
+    if (k === 'selected') continue;
+    if (ra[k] !== rb[k]) return false;
+  }
+  return true;
+}
+
+/** 仅比较会写进作品存档的内容：平移视口、切换画布标签、React Flow 选中/测量不算未保存改动 */
+function sameStudioContent(a: SimState, b: SimState): boolean {
+  if (a === b) return true;
+  if (
+    a.graphName !== b.graphName ||
+    a.cover !== b.cover ||
+    a.responsibleId !== b.responsibleId ||
+    a.rules !== b.rules ||
+    a.outlineRules !== b.outlineRules ||
+    a.charGenRules !== b.charGenRules ||
+    a.mainGoal !== b.mainGoal ||
+    a.volumes !== b.volumes ||
+    a.chapters !== b.chapters
+  ) {
+    return false;
+  }
+  const ids = Object.keys(a.boards);
+  if (ids.length !== Object.keys(b.boards).length) return false;
+  for (const id of ids) {
+    const ba = a.boards[id];
+    const bb = b.boards[id];
+    if (!ba || !bb) return false;
+    if (ba.volumeId !== bb.volumeId) return false;
+    if (ba.regions !== bb.regions) return false;
+    if (ba.nodes.length !== bb.nodes.length || ba.edges.length !== bb.edges.length) return false;
+    for (let i = 0; i < ba.nodes.length; i++) if (!sameNodeContent(ba.nodes[i], bb.nodes[i])) return false;
+    for (let i = 0; i < ba.edges.length; i++) if (!sameEdgeContent(ba.edges[i], bb.edges[i])) return false;
+  }
+  return true;
+}
+
+/** 手动保存：所有变更只留在内存并标记未保存，用户点「保存」或 Ctrl/Cmd+S 时才写 localStorage */
+const studioPersistStorage = createManualPersistStorage<SimState>({
+  contentEqual: sameStudioContent,
+  defaultVersion: 2,
 });
 
-/** 生成结束/页面隐藏时立即落盘最新工作区 */
-export const flushStudioPersist = (): void => studioPersistStorage.flush();
+/** 立即保存当前工作区到 localStorage（返回是否成功） */
+export const saveStudioWorkspace = (): boolean => studioPersistStorage.save();
+
+/** 是否有尚未保存的工作区改动 */
+export const hasUnsavedStudioChanges = (): boolean => studioPersistStorage.hasPending();
 
 const EMPTY_NODES: SimNodeType[] = [];
 const EMPTY_EDGES: Edge[] = [];
@@ -1059,6 +1155,89 @@ export const useStudioStore = create<SimState>()(
           }),
         });
         return { ok: true };
+      },
+      syncChapterScene: (chapterId) => {
+        const s = get();
+        const chapter = s.chapters.find((c) => c.id === chapterId);
+        if (!chapter) return { ok: false, changed: false, created: false, error: 'chapter-not-found' };
+        const boardId = chapterBoardOf(chapter.volumeId, s.volumes, s.boards);
+        const board = s.boards[boardId];
+        if (!board) return { ok: false, changed: false, created: false, error: 'board-not-found' };
+        const region = board.regions.find((r) => r.chapterId === chapterId);
+        if (!region) return { ok: false, changed: false, created: false, error: 'region-not-found' };
+        const now = Date.now();
+        const fresh = captureSnapshotPure(board, region, { source: 'auto-scene', now });
+        const prev = chapter.snapshot;
+        if (prev && prev.boardId === boardId && sameSnapshotScene(prev, fresh)) {
+          return { ok: true, changed: false, created: false, snapshot: prev };
+        }
+        const snapshot: ChapterSnapshot = {
+          ...fresh,
+          // 场景自动跟随：首次采集时间保留，内容变化只刷新 updatedAt
+          capturedAt: prev?.boardId === boardId ? prev.capturedAt : now,
+          updatedAt: now,
+        };
+        set({
+          chapters: s.chapters.map((c) => (c.id === chapterId ? { ...c, snapshot } : c)),
+        });
+        return { ok: true, changed: true, created: !prev, snapshot };
+      },
+      applyChapterScene: (chapterId) => {
+        const s = get();
+        const chapter = s.chapters.find((c) => c.id === chapterId);
+        if (!chapter) {
+          return {
+            ok: false,
+            changed: false,
+            moved: 0,
+            reparented: 0,
+            stateRestored: 0,
+            missingCharacters: [],
+            missingStates: [],
+            missingParents: [],
+            error: 'chapter-not-found',
+          };
+        }
+        const snapshot = chapter.snapshot;
+        if (!snapshot) {
+          return {
+            ok: false,
+            changed: false,
+            moved: 0,
+            reparented: 0,
+            stateRestored: 0,
+            missingCharacters: [],
+            missingStates: [],
+            missingParents: [],
+            error: 'snapshot-not-found',
+          };
+        }
+        const board = s.boards[snapshot.boardId];
+        if (!board) {
+          return {
+            ok: false,
+            changed: false,
+            moved: 0,
+            reparented: 0,
+            stateRestored: 0,
+            missingCharacters: [],
+            missingStates: [],
+            missingParents: [],
+            error: 'board-not-found',
+          };
+        }
+        const r: ApplyChapterSceneResult = applyChapterScenePure(board, snapshot);
+        if (r.changed) set(setBoardNodes(s, snapshot.boardId, r.nodes));
+        return {
+          ok: true,
+          changed: r.changed,
+          moved: r.moved,
+          reparented: r.reparented,
+          stateRestored: r.stateRestored,
+          missingCharacters: r.missingCharacters,
+          missingStates: r.missingStates,
+          missingParents: r.missingParents,
+        };
       },
 
       createCharacter: (pos) => get().createCharacterOnBoard(get().activeBoardId, pos) ?? '',
@@ -1525,6 +1704,9 @@ export const useStudioStore = create<SimState>()(
     },
   ),
 );
+
+// 初始化/恢复完成：把内存状态视为已保存基线；之后的选中、测量、平移不会误报“未保存”
+studioPersistStorage.markClean(useStudioStore.getState());
 
 export function useActiveBoard(): SimBoard | undefined {
   return useStudioStore(selectActiveBoard);

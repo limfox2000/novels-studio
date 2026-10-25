@@ -88,6 +88,8 @@ export interface EnvironmentData extends Record<string, unknown> {
   name: string;
   etype: EnvironmentType;
   desc: string;
+  /** 🔒 移动锁定：只禁止拖动/缩放，不影响改名、描述、父子归属与删除 */
+  locked?: boolean;
 }
 
 export type SimData = CharacterData | EnvironmentData;
@@ -128,8 +130,8 @@ export interface SimChapter {
 /** 🎭 名单角色：在场（可行动/说话/被直接描写）/ 仅提及（只能被提到，不在现场行动） */
 export type CastRole = 'present' | 'mentioned';
 
-/** 快照来源：手动记录 / 首次生成大纲自动采集 / 首次生成正文自动采集 */
-export type SnapshotSource = 'manual' | 'auto-outline' | 'auto-content';
+/** 快照来源：旧手动记录 / 旧生成时自动采集 / 自动跟随当前章节场景（v2.32） */
+export type SnapshotSource = 'manual' | 'auto-outline' | 'auto-content' | 'auto-scene';
 
 /** 📸 本章名单条目：只存人物/状态引用与采集时标签，不复制完整属性（属性仍从画布解析） */
 export interface ChapterSnapshotEntry {

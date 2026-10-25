@@ -17,6 +17,7 @@ import {
   type RegionRect,
 } from '../../stores/chapterRegions';
 import { useActiveChapterId } from './useActiveChapter';
+import { activateChapter } from './chapterSceneActions';
 import type { ChapterRegion } from '../../types/sim';
 
 type Point = { x: number; y: number };
@@ -134,7 +135,7 @@ export function ChapterRegionsOverlay({ enabled }: { enabled: boolean }) {
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
     useUiStore.getState().setSelectedRegionId(region.id);
-    useUiStore.getState().setActiveChapterId(region.chapterId);
+    activateChapter(region.chapterId);
     const start = flowPoint(e);
     const orig = { x: region.x, y: region.y, width: region.width, height: region.height };
     dragRef.current =

@@ -6,10 +6,9 @@
  *  配色沿用阅读器四档主题（与大纲管理器/正文阅读器共用 nc2-reader-v1 偏好互通）；
  *  与全局生成互斥共用，关面板不中断生成。 */
 import { useEffect, useState, type CSSProperties } from 'react';
-import { flushStudioPersist, useStudioStore } from '../../stores/studioStore';
+import { useStudioStore } from '../../stores/studioStore';
 import { findChapterRegion } from '../../stores/chapterRegions';
 import { snapshotIssueText } from '../../stores/chapterSnapshots';
-import { ChapterRosterPanel } from './ChapterRosterPanel';
 import { useEditorRoomStore } from '../../stores/editorRoomStore';
 import { useUiStore } from '../../stores/uiStore';
 import { genChapterContent } from '../../engines/studioEngine';
@@ -17,6 +16,7 @@ import { stopGeneration } from '../../shared/generation';
 import { useEditorialStore } from '../../stores/editorialStore';
 import { READER_PREF_KEY, READER_THEMES } from './readerThemes';
 import { useActiveChapterId } from './useActiveChapter';
+import { activateChapter } from './chapterSceneActions';
 import type { SimChapter } from '../../types/sim';
 import { BookOpen, ChevronDown, ChevronRight, Cpu, FileText, Loader2, Minus, Plus, RotateCcw, Sparkles, Square, SquareDashed, X } from 'lucide-react';
 
@@ -112,7 +112,6 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
   const contentEngine = useEditorRoomStore((s) => s.settings.contentEngine);
   // 📐 当前章节与大纲管理器/画布区域高亮共用
   const selId = useActiveChapterId();
-  const setActiveChapterId = useUiStore((s) => s.setActiveChapterId);
   const [peekOpen, setPeekOpen] = useState(false);
   const [stageNotice, setStageNotice] = useState('');
   // 阅读系统配色/字号：与正文阅读器/大纲管理器共用偏好（nc2-reader-v1），默认米黄 + 18px
@@ -174,14 +173,13 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
     if (r.ok && r.content !== undefined) s2.updateChapter(sel.id, { content: r.content });
     else if (r.error && r.error !== '已停止') window.alert(`❌ 生成失败：${r.error}`);
     const notes: string[] = [];
-    if (staleText) notes.push(`本章快照未同步（${staleText}）；本次仍按快照生成，请到「大纲 → 本章名单」手动刷新`);
+    if (staleText) notes.push(`本章场景有变化（${staleText}）；本次仍按快照生成，缺失处不会猜测补全`);
     if (r.ok && r.stage) {
-      if (r.stage.capturedNow) notes.push('已自动记录本章名单，后续生成将按名单约束');
+      if (r.stage.capturedNow) notes.push('已自动记录本章场景，后续生成将按区域名单约束');
       else if (r.stage.mode === 'legacy') notes.push('本章未记录快照，本次使用工作画布全部资料');
       for (const w of r.stage.warnings) if (!notes.some((n) => n.includes(w))) notes.push(w);
     }
     if (notes.length) setStageNotice(notes.join('；'));
-    flushStudioPersist();
   };
 
   // 阅读主题 → CSS 变量（子元素 Tailwind 任意值类取色）
@@ -289,7 +287,7 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
             {chapters.map((c, i) => (
               <button
                 key={c.id}
-                onClick={() => setActiveChapterId(c.id)}
+                onClick={() => activateChapter(c.id)}
                 className={`flex w-full items-center gap-1.5 rounded-[8px] px-2 py-1.5 text-left text-[12.5px] transition ${
                   c.id === selId ? 'font-semibold' : 'hover:bg-[var(--rd-btn-hover)]'
                 }`}
@@ -359,8 +357,7 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
                   本章还没有大纲——正文生成的依据是大纲，请先到「大纲」为本章生成大纲。
                 </div>
               )}
-              {/* 🎭 本章名单 / 📸 快照（只读摘要；编辑在大纲管理器） */}
-              <ChapterRosterPanel chapter={sel} readonly />
+              {/* 本章名单不在正文生成面板展示：场景仍随画布自动同步，生成时按快照约束 */}
               {/* 生成行 */}
               <div className="mt-3 flex flex-wrap items-center gap-2">
                 {isBusy ? (

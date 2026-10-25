@@ -7,7 +7,7 @@
  *  章节大纲规则的编辑入口在本管理器内（📜 大纲规则，与全文规则分开各自编辑）；📚 卷的创建/编辑也在本管理器（📚 卷）。
  *  引擎/思考开关复用编辑室 ⚙ 设置；与编辑室共用全局生成互斥，关面板不中断生成。 */
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import { flushStudioPersist, useStudioStore, volumeBoardId } from '../../stores/studioStore';
+import { useStudioStore, volumeBoardId } from '../../stores/studioStore';
 import { chapterBoardOf, findChapterRegion } from '../../stores/chapterRegions';
 import { snapshotIssueText } from '../../stores/chapterSnapshots';
 import { useEditorRoomStore } from '../../stores/editorRoomStore';
@@ -18,6 +18,7 @@ import { stopGeneration } from '../../shared/generation';
 import { READER_PREF_KEY, READER_THEMES } from './readerThemes';
 import { useActiveChapterId } from './useActiveChapter';
 import { beginChapterRegion } from './chapterRegionActions';
+import { activateChapter } from './chapterSceneActions';
 import { ChapterRosterPanel } from './ChapterRosterPanel';
 import type { SimChapter } from '../../types/sim';
 import {
@@ -215,12 +216,11 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
   const hasOutlineRules = useStudioStore((s) => !!s.outlineRules.trim());
   // 📐 当前章节与正文管理器/画布区域高亮共用
   const selId = useActiveChapterId();
-  const setActiveChapterId = useUiStore((s) => s.setActiveChapterId);
   const [rulesOpen, setRulesOpen] = useState(false);
   const [volumesOpen, setVolumesOpen] = useState(false);
   // 推理耗尽 → 自动关闭推理重试的提示（仅本次生成有效）
   const [fallbackNotice, setFallbackNotice] = useState('');
-  // 本次生成使用的舞台（快照/工作画布）与快照未同步提示
+  // 本次生成使用的舞台（快照/工作画布）与场景变化提示
   const [stageNotice, setStageNotice] = useState('');
   // 阅读系统配色：偏好存 nc2-reader-v1，默认米黄
   const [themeKey, setThemeKey] = useState('sepia');
@@ -285,7 +285,7 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
 
   const addChapter = () => {
     const id = useStudioStore.getState().addChapter();
-    setActiveChapterId(id);
+    activateChapter(id);
   };
 
   const removeChapter = (c: SimChapter) => {
@@ -293,7 +293,7 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
     const i = chapters.findIndex((x) => x.id === c.id);
     const next = chapters[i + 1] ?? chapters[i - 1] ?? null;
     useStudioStore.getState().deleteChapter(c.id);
-    setActiveChapterId(next?.id ?? null);
+    activateChapter(next?.id ?? null);
   };
 
   const changeVolume = (nextVolumeId: string) => {
@@ -306,6 +306,8 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
       if (!ok) return;
     }
     st.updateChapter(sel.id, { volumeId: nextVolumeId });
+    // 换卷后章节画布变了：跟到新画布（同一章不回放，避免覆盖当前摆放）
+    activateChapter(sel.id);
   };
 
   const openRegion = () => {
@@ -357,14 +359,13 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
     if (r.ok && r.outline !== undefined) s2.updateChapter(sel.id, { outline: r.outline });
     else if (r.error && r.error !== '已停止') window.alert(`❌ 生成失败：${r.error}`);
     const notes: string[] = [];
-    if (staleText) notes.push(`本章快照未同步（${staleText}）；本次仍按快照生成，请到「本章名单」手动刷新`);
+    if (staleText) notes.push(`本章场景有变化（${staleText}）；本次仍按快照生成，缺失处不会猜测补全`);
     if (r.ok && r.stage) {
-      if (r.stage.capturedNow) notes.push('已自动记录本章名单，后续生成将按名单约束');
+      if (r.stage.capturedNow) notes.push('已自动记录本章场景，后续生成将按区域名单约束');
       else if (r.stage.mode === 'legacy') notes.push('本章未记录快照，本次使用工作画布全部资料');
       for (const w of r.stage.warnings) if (!notes.some((n) => n.includes(w))) notes.push(w);
     }
     if (notes.length) setStageNotice(notes.join('；'));
-    flushStudioPersist();
   };
 
   // 阅读主题 → CSS 变量（子元素用任意值类取 --rd-card / --rd-btn / --rd-border / --rd-sub）
@@ -465,7 +466,7 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
             {chapters.map((c, i) => (
               <button
                 key={c.id}
-                onClick={() => setActiveChapterId(c.id)}
+                onClick={() => activateChapter(c.id)}
                 className={`flex w-full items-center gap-1.5 rounded-[8px] px-2 py-1.5 text-left text-[12.5px] transition ${
                   c.id === selId ? 'font-semibold' : 'hover:bg-[var(--rd-btn-hover)]'
                 }`}

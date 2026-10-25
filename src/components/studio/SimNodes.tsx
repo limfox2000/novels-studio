@@ -6,7 +6,7 @@
  *  当前阶段仅创建/摆位/嵌套；连线语义随规则系统需求定义（暂无 Handle）。 */
 import type { ComponentType } from 'react';
 import { NodeResizer, type NodeProps } from '@xyflow/react';
-import { BedDouble, Blocks, Building2, DoorOpen, Landmark, Map, Package, X } from 'lucide-react';
+import { BedDouble, Blocks, Building2, DoorOpen, Landmark, Lock, LockOpen, Map, Package, X } from 'lucide-react';
 import { useStudioStore, ENV_MIN_W, ENV_MIN_H } from '../../stores/studioStore';
 import { charAssetUrl, DEFAULT_CHARASSET } from '../../services/charAssetApi';
 import {
@@ -80,7 +80,7 @@ export function SimCharacterNode({ id, data }: NodeProps) {
           const s = useStudioStore.getState();
           const ref = characterReferenceSummary(s.chapters, s.activeBoardId, id);
           const impact = ref.count
-            ? `\n\n该人物被 ${ref.count} 章引用：${referenceChapterText(ref, 6)}。删除后这些章节的名单会显示「资料缺失」，快照不会自动更新。`
+            ? `\n\n该人物被 ${ref.count} 章引用：${referenceChapterText(ref, 6)}。删除后这些章节在切回同步前会显示「资料缺失」；章节场景会随画布自动同步。`
             : '';
           if (window.confirm(`删除人物「${d.name || '未命名'}」？${impact}`)) s.deleteNode(id);
         }}
@@ -100,12 +100,13 @@ export function SimEnvironmentNode({ id, data, selected }: NodeProps) {
   const d = data as EnvironmentData;
   const meta = ENV_TYPE_META[d.etype];
   const EnvIcon = ENV_ICON[d.etype];
+  const locked = d.locked === true;
   return (
     <>
-      {/* 选中后显示缩放柄（写 node.width/height，经 dimensions change 进 store 持久化）；柄色随类型 */}
-      <NodeResizer isVisible={selected} minWidth={ENV_MIN_W} minHeight={ENV_MIN_H} color={meta.dot} />
+      {/* 选中后显示缩放柄（写 node.width/height，经 dimensions change 进 store 持久化）；锁定后隐藏；柄色随类型 */}
+      <NodeResizer isVisible={selected && !locked} minWidth={ENV_MIN_W} minHeight={ENV_MIN_H} color={meta.dot} />
       <div className={`group flex h-full w-full flex-col overflow-hidden rounded-xl border-2 shadow-md ${meta.border} ${meta.body}`}>
-        {/* 标题条：图标 + 名称 + 类型徽章 + 删除（悬停出现）——均只展示，编辑走属性面板；配色随类型（清淡） */}
+        {/* 标题条：图标 + 名称 + 类型徽章 + 锁定 + 删除（悬停出现）——均只展示，编辑走属性面板；配色随类型（清淡） */}
         <div className={`flex shrink-0 items-center gap-1 px-1.5 py-1 ${meta.bar}`}>
           <EnvIcon className="h-3.5 w-3.5 shrink-0 text-white/90" />
           <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-white">{d.name || '未命名'}</span>
@@ -120,8 +121,27 @@ export function SimEnvironmentNode({ id, data, selected }: NodeProps) {
             {ENV_TYPE_LABELS[d.etype]}
           </span>
           <button
-            onClick={() => { if (window.confirm(`删除环境「${d.name || '未命名'}」？（其内部节点将提升回画布根层）`)) useStudioStore.getState().deleteNode(id); }}
-            className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-white/60 opacity-0 transition hover:bg-black/20 hover:text-white group-hover:opacity-100"
+            onClick={(e) => {
+              e.stopPropagation();
+              useStudioStore.getState().updateEnvironment(id, { locked: !locked });
+            }}
+            onPointerDown={(e) => e.stopPropagation()}
+            className={`nodrag nopan flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition hover:bg-black/20 hover:text-white ${
+              locked ? 'bg-black/25 text-white' : 'text-white/60'
+            }`}
+            title={locked ? '解锁环境（当前已锁定：不能拖动/缩放）' : '锁定环境（防止误拖动画布时移动环境）'}
+            aria-label={locked ? '解锁环境' : '锁定环境'}
+            aria-pressed={locked}
+            data-env-lock={locked ? '1' : '0'}
+          >
+            {locked ? <Lock className="h-3 w-3" /> : <LockOpen className="h-3 w-3" />}
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              if (window.confirm(`删除环境「${d.name || '未命名'}」？（其内部节点将提升回画布根层）`)) useStudioStore.getState().deleteNode(id);
+            }}
+            className="nodrag nopan flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-white/60 opacity-0 transition hover:bg-black/20 hover:text-white group-hover:opacity-100"
             title="删除本环境（内部节点提升回根层）"
             aria-label="删除本环境"
           >

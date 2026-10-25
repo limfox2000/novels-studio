@@ -501,7 +501,7 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
       : undefined;
     const impact = impactTarget ? stateReferenceSummary(st.chapters, board.id, node.id, impactTarget.id) : null;
     const impactText = impact?.count
-      ? `\n\n该状态被 ${impact.count} 章引用：${referenceChapterText(impact, 6)}。${b.action === 'delete' ? '删除后这些章节会显示「资料缺失」' : '原地修改会改变这些历史章节的表现'}；快照不会自动更新。`
+      ? `\n\n该状态被 ${impact.count} 章引用：${referenceChapterText(impact, 6)}。${b.action === 'delete' ? '删除后这些章节在切回同步前会显示「资料缺失」' : '原地修改会改变这些历史章节的生成内容'}；章节场景会随画布自动同步。`
       : '';
     if (impactText && (b.action === 'update' || b.action === 'rename')) {
       const verb = b.action === 'update' ? '修改' : '重命名';
@@ -603,8 +603,8 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
     }
     if (ok && impactText) {
       msg += b.action === 'delete'
-        ? '；历史章节快照未变，相关名单将显示「资料缺失」'
-        : '；历史章节引用未变，快照不会自动更新';
+        ? '；其他章节在切回同步前会显示「资料缺失」'
+        : '；当前章场景会自动跟随画布同步';
     }
     if (ok) setDropped((prev) => new Set(prev).add(i));
     setDoneMsg(msg + (ok ? boardSuffix(board, rb.label) : ''));

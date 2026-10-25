@@ -1,7 +1,7 @@
 /**
  * 创作台本地存档（v2.12 用户拍板：创作台内容一律保存在本机，不再上传服务器）。
- * 两层本地保存：
- *  ① 当前图实时持久化 localStorage（zustand persist nc2-sim-v1，每次 set 自动写，刷新/关浏览器不丢）；
+ * 两层本地保存（手动）：所有编辑先留在内存并标记未保存；
+ *  ① 当前作品手动保存到 localStorage（zustand persist nc2-sim-v1；点「保存」/Ctrl+S 或载入存档时写入）；
  *  ② 命名存档列表（localStorage nc2-sim-archives-v1）：💾 保存按图名快照（同名覆盖），📂 打开列出/载入/删除。
  * 快照结构 v3（P2）：graph: {boards, activeBoardId, rules, outlineRules, chapters, volumes, snapshots 随 chapters}；
  * 旧快照 {nodes,edges,...} 载入时迁进默认主画布，并为旧卷补空画布；未来版本拒绝载入且不改数据。
@@ -15,8 +15,11 @@ import {
   sanitizeVolumes,
   rulesText,
   DEFAULT_BOARD_ID,
+  saveStudioWorkspace,
 } from '../stores/studioStore';
 import { useUiStore } from '../stores/uiStore';
+import { persistActiveChapterId } from '../stores/activeChapter';
+import { syncActiveChapterScene, withChapterSceneSyncSuppressed } from '../stores/chapterSceneSync';
 import type { Edge } from '@xyflow/react';
 import type { SimBoard, SimChapter, SimNodeType, SimVolume } from '../types/sim';
 
@@ -26,6 +29,8 @@ export const ARCHIVE_VERSION = 3;
 export interface ArchiveGraph {
   boards?: Record<string, SimBoard>;
   activeBoardId?: string;
+  /** 保存时的当前章节（v2.32，可选；旧档无此字段 → 载入后回落到首章） */
+  activeChapterId?: string;
   /** 旧格式（无 boards）：单画布节点/连线 */
   nodes?: SimNodeType[];
   edges?: unknown[];
@@ -68,6 +73,7 @@ export interface ImportArchiveResult extends LoadArchiveResult {
 interface NormalizedGraph {
   boards: Record<string, SimBoard>;
   activeBoardId: string;
+  activeChapterId: string;
   rules: string;
   outlineRules: string;
   charGenRules: string;
@@ -166,6 +172,10 @@ function normalizeArchive(raw: unknown, fallbackName: string, extraSteps: Archiv
   }
   const activeBoardId =
     typeof graph.activeBoardId === 'string' && boards[graph.activeBoardId] ? graph.activeBoardId : DEFAULT_BOARD_ID;
+  const activeChapterId =
+    typeof graph.activeChapterId === 'string' && chapters.some((c) => c.id === graph.activeChapterId)
+      ? graph.activeChapterId
+      : (chapters[0]?.id ?? '');
 
   return {
     result: { ok: true, fromVersion, steps, warnings },
@@ -174,6 +184,7 @@ function normalizeArchive(raw: unknown, fallbackName: string, extraSteps: Archiv
     graph: {
       boards,
       activeBoardId,
+      activeChapterId,
       rules,
       outlineRules,
       charGenRules,
@@ -194,18 +205,25 @@ export function archiveResultSummary(r: LoadArchiveResult): string {
   return lines.join('\n');
 }
 
-/** 💾 保存：当前图快照进本地命名存档（同名覆盖；当前状态本身已由 persist 实时保存，这里提供多存档位） */
+/** 💾 手动保存：先写当前作品进度（nc2-sim-v1），再更新本地命名存档（同名覆盖） */
 export function saveLocal(): void {
-  const s = useStudioStore.getState();
   const ui = useUiStore.getState();
+  // 先同步当前章场景，保证正在摆放的人物位置/状态一起落盘
+  syncActiveChapterScene();
+  // 作品进度最关键：写失败时保留待保存数据，不再写命名存档
+  if (!saveStudioWorkspace()) return;
+  const s = useStudioStore.getState();
+  // UI 章节定位只在保存成功后记下；刷新时用它让高亮与画布场景一致
+  persistActiveChapterId(useUiStore.getState().activeChapterId);
+  const activeChapterId = useUiStore.getState().activeChapterId ?? '';
   try {
-    const graph = { boards: s.boards, activeBoardId: s.activeBoardId, rules: s.rules, outlineRules: s.outlineRules, charGenRules: s.charGenRules, mainGoal: s.mainGoal, volumes: s.volumes, chapters: s.chapters, responsibleId: s.responsibleId, cover: s.cover };
+    const graph = { boards: s.boards, activeBoardId: s.activeBoardId, activeChapterId, rules: s.rules, outlineRules: s.outlineRules, charGenRules: s.charGenRules, mainGoal: s.mainGoal, volumes: s.volumes, chapters: s.chapters, responsibleId: s.responsibleId, cover: s.cover };
     const list = loadArchives().filter((a) => a.name !== s.graphName);
     list.push({ name: s.graphName, savedAt: new Date().toISOString(), version: ARCHIVE_VERSION, graph });
     writeArchives(list);
-    ui.setSaveStatus('saved', '✓ 已存本机 ' + new Date().toLocaleTimeString());
+    ui.setSaveStatus('saved', '✓ 已保存 ' + new Date().toLocaleTimeString());
   } catch (e) {
-    ui.setSaveStatus('error', '⚠ 本地保存失败：' + (e as Error).message);
+    ui.setSaveStatus('error', '⚠ 作品进度已保存，但命名存档失败：' + (e as Error).message);
   }
 }
 
@@ -233,9 +251,17 @@ export function loadLocalArchive(name: string, extraSteps: ArchiveMigrationStep[
   }
   const prep = normalizeArchive(a, name, extraSteps);
   if (!prep.result.ok || !prep.graph) return prep.result;
-  const s = useStudioStore.getState();
-  s.replaceState(prep.graph);
-  s.setGraphName(name);
+  withChapterSceneSyncSuppressed(() => {
+    const s = useStudioStore.getState();
+    s.replaceState(prep.graph!);
+    s.setGraphName(name);
+    useUiStore.getState().setActiveChapterId(prep.graph!.activeChapterId || null);
+    persistActiveChapterId(prep.graph!.activeChapterId || null);
+  });
+  // 载入是显式操作：立即把载入结果写为当前作品，避免刷新后回到载入前的图
+  if (saveStudioWorkspace()) {
+    useUiStore.getState().setSaveStatus('saved', '✓ 已载入并保存 ' + new Date().toLocaleTimeString());
+  }
   return prep.result;
 }
 
