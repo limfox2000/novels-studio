@@ -104,9 +104,32 @@ export async function qwListModels(engine: TextEngine): Promise<string[]> {
   return d.models ?? [];
 }
 
+/** 视觉输入：OpenAI 兼容 content parts（私有 llama.cpp 原样转发 image_url data URL） */
+export type QwenContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
 export interface QwenChatMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: string | QwenContentPart[];
+}
+
+/** 单张图片按约 2500 字符折算提示词预算（1568px 图片约 3000 视觉 token，中文 0.8 字符/token） */
+const IMAGE_CHAR_COST = 2500;
+
+/** 构建带图片的用户消息；无图片时保持纯字符串，旧路径零变化。 */
+export function qwenUserContent(text: string, images?: string[]): string | QwenContentPart[] {
+  if (!images?.length) return text;
+  return [
+    { type: 'text', text },
+    ...images.map((url): QwenContentPart => ({ type: 'image_url', image_url: { url } })),
+  ];
+}
+
+/** 提示词预算用字符数：文本按原长，图片按固定成本折算。 */
+export function qwenMessageChars(content: QwenChatMessage['content']): number {
+  if (typeof content === 'string') return content.length;
+  return content.reduce((n, p) => n + (p.type === 'text' ? p.text.length : IMAGE_CHAR_COST), 0);
 }
 
 export interface QwenUsage {

@@ -21,9 +21,9 @@ import {
 import { useEditorRoomStore } from '../stores/editorRoomStore';
 import { useUiStore } from '../stores/uiStore';
 import { GenerationAborted } from '../shared/generation';
-import { qwGenerate, REASONING_EFFORT_MAX_TOKENS, type QwenChatMessage, type QwenUsage, type ReasoningEffort } from '../shared/qwenClient';
+import { qwGenerate, qwenUserContent, qwenMessageChars, REASONING_EFFORT_MAX_TOKENS, type QwenChatMessage, type QwenUsage, type ReasoningEffort } from '../shared/qwenClient';
 import { startGeneration, stopGeneration } from '../shared/generation';
-import { agentGate, promptCharBudget, QWEN_SAFE_LIMIT } from '../shared/agentShared';
+import { agentGate, imageInputHint, promptCharBudget, QWEN_SAFE_LIMIT } from '../shared/agentShared';
 import { ENV_TYPE_LABELS, ENV_TYPE_META, GENDER_LABELS, genderOf, type CharacterData, type CharacterGender, type CharacterState, type EnvironmentType, type SimChapter, type SimNodeType, type SimVolume } from '../types/sim';
 import type { WritingSkill } from '../types/writingSkill';
 import { buildWritingSkillsBlock } from './writingSkills';
@@ -1071,6 +1071,8 @@ export function buildReadBlock(userMsg: string): string {
 export interface SimChatMsg {
   role: 'user' | 'agent';
   text: string;
+  /** 该条用户消息附带的图片 data URL（仅视觉模型发送时由 IndexedDB 读回；agent 消息不带） */
+  images?: string[];
 }
 
 /** 编辑室系统消息：舞台搭建助手 + 系统说明 + 本轮读取 + 设定块/写入协议 + 画布状态 + 摘要。
@@ -1269,6 +1271,8 @@ export function mentorBlocks(userMsg: string, mentors?: Partial<Record<string, R
 export async function genSimTurn(opts: {
   history: SimChatMsg[];
   userMsg: string;
+  /** 本轮用户附带的图片 data URL（仅 🏠 私有视觉模型支持） */
+  userImages?: string[];
   summary?: string;
   /** 推理强度（off=直接答；越高补全预算越大） */
   reasoningEffort?: ReasoningEffort;
@@ -1282,6 +1286,8 @@ export async function genSimTurn(opts: {
   const ui = useUiStore.getState();
   if (ui.generating) return { ok: false, error: '已有生成任务进行中' };
   const engine = opts.engine ?? 'private';
+  const hasImages = !!opts.userImages?.length || opts.history.some((m) => !!m.images?.length);
+  if (hasImages && engine !== 'private') return { ok: false, error: '图像分析需要使用 🏠 私有模型，请在模型中心切换后重试' };
   const gate = await agentGate(engine);
   if (gate) return { ok: false, error: gate };
   const msgs: QwenChatMessage[] = [
@@ -1289,18 +1295,22 @@ export async function genSimTurn(opts: {
       role: 'system',
       content:
         buildSimSystem(opts.summary ?? '', buildReadBlock(opts.userMsg), opts.userMsg, opts.history) +
-        mentorBlocks(opts.userMsg, opts.mentors),
+        mentorBlocks(opts.userMsg, opts.mentors) +
+        imageInputHint(opts.userImages?.length ?? 0),
     },
-    ...opts.history.map((m) => ({ role: m.role === 'agent' ? ('assistant' as const) : ('user' as const), content: m.text })),
-    { role: 'user', content: opts.userMsg },
+    ...opts.history.map((m) => ({
+      role: m.role === 'agent' ? ('assistant' as const) : ('user' as const),
+      content: qwenUserContent(m.text, m.images),
+    })),
+    { role: 'user', content: qwenUserContent(opts.userMsg, opts.userImages) },
   ];
   // 失控保险：总长超预算从最旧历史开始丢（保留 system 与本轮消息）；预算按模型 nCtx 动态预留补全空间，
-  // 聊久后提示词不会挤占补全导致输出被服务端提前截断
+  // 聊久后提示词不会挤占补全导致输出被服务端提前截断。图片按固定字符成本计入。
   const maxTokens = REASONING_EFFORT_MAX_TOKENS[opts.reasoningEffort ?? 'off'];
   const budget = promptCharBudget(useEditorRoomStore.getState().meta?.nCtx ?? 0, maxTokens);
-  let total = msgs.reduce((a, m) => a + m.content.length, 0);
+  let total = msgs.reduce((a, m) => a + qwenMessageChars(m.content), 0);
   while (total > budget && msgs.length > 2) {
-    total -= msgs[1].content.length;
+    total -= qwenMessageChars(msgs[1].content);
     msgs.splice(1, 1);
   }
   ui.setGenerating(true);

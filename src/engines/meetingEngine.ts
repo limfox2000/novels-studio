@@ -2,9 +2,9 @@
  *  直到无人有意见或达到最多轮数 → 总编辑产出会议纪要（可含可直接写入的【写入】草稿，点击确认后才生效）。
  *  共用全局生成互斥（uiStore.generating）与 Qwen 预检；每次发言单独 startGeneration，
  *  停止时由调用方置 cancelled 并中止当前请求。纪要不自动写入项目。 */
-import { qwGenerate, REASONING_EFFORT_MAX_TOKENS, type QwenChatMessage, type QwenUsage, type ReasoningEffort } from '../shared/qwenClient';
+import { qwGenerate, qwenUserContent, qwenMessageChars, REASONING_EFFORT_MAX_TOKENS, type QwenChatMessage, type QwenUsage, type ReasoningEffort } from '../shared/qwenClient';
 import { GenerationAborted } from '../shared/generation';
-import { agentGate, promptCharBudget } from '../shared/agentShared';
+import { agentGate, imageInputHint, promptCharBudget } from '../shared/agentShared';
 import { buildMaterialBlock, buildReadBlock, parseSimOutput, chaptersBlock, simCanvasIndex, canvasLookupBlock, chapterAgentBlockIfRelevant, EDITOR_MODULE_CAPS, WRITE_TARGETS, matchMentorModules, type MaterialKey, type SimChatMsg, type SimBlock, type SimWriteBlock, type WriteField } from './studioEngine';
 import { sanitizeMemoryEntries, TEMPLATE_CRAFT_SECTIONS } from './memoryTemplates';
 import { useUiStore } from '../stores/uiStore';
@@ -464,6 +464,8 @@ export async function genEditorTurn(opts: {
   editor: Editor;
   history: SimChatMsg[];
   userMsg: string;
+  /** 本轮用户附带的图片 data URL（仅 🏠 私有视觉模型支持） */
+  userImages?: string[];
   /** 推理强度（off=直接答；越高补全预算越大） */
   reasoningEffort?: ReasoningEffort;
   engine?: 'private' | 'public';
@@ -474,15 +476,23 @@ export async function genEditorTurn(opts: {
   const ui = useUiStore.getState();
   if (ui.generating) return { ok: false, error: '已有生成任务进行中' };
   const engine = opts.engine ?? 'private';
+  const hasImages = !!opts.userImages?.length || opts.history.some((m) => !!m.images?.length);
+  if (hasImages && engine !== 'private') return { ok: false, error: '图像分析需要使用 🏠 私有模型，请在模型中心切换后重试' };
   const gate = await agentGate(engine);
   if (gate) return { ok: false, error: gate };
   const msgs: QwenChatMessage[] = [
-    { role: 'system', content: editorChatSystem(opts.editor, opts.userMsg, opts.history) },
-    ...opts.history.map((m) => ({ role: m.role === 'agent' ? ('assistant' as const) : ('user' as const), content: m.text })),
-    { role: 'user', content: opts.userMsg },
+    {
+      role: 'system',
+      content: editorChatSystem(opts.editor, opts.userMsg, opts.history) + imageInputHint(opts.userImages?.length ?? 0),
+    },
+    ...opts.history.map((m) => ({
+      role: m.role === 'agent' ? ('assistant' as const) : ('user' as const),
+      content: qwenUserContent(m.text, m.images),
+    })),
+    { role: 'user', content: qwenUserContent(opts.userMsg, opts.userImages) },
   ];
   // 失控保险：总长超预算从最旧历史开始丢（保留 system 与本轮消息）；预算按模型 nCtx 动态预留补全空间。
-  // 补全预算：⚙「✍ 编辑输出不设上限」开（默认）=16384（实际写完为止，对话不可能触到）；关=8192。
+  // 图片按固定字符成本计入。补全预算：⚙「✍ 编辑输出不设上限」开（默认）=16384（实际写完为止，对话不可能触到）；关=8192。
   // 用户让「整理记忆」时模型可能重抄全部记忆（协议只约束新增也拦不住），8192 以下会中途截断。
   // 推理档位不压低该预算：思考 token 计入 max_tokens，取两者较大值
   const unlimited = useEditorRoomStore.getState().settings.editorUnlimited;
@@ -491,9 +501,9 @@ export async function genEditorTurn(opts: {
     REASONING_EFFORT_MAX_TOKENS[opts.reasoningEffort ?? 'off'],
   );
   const budget = promptCharBudget(useEditorRoomStore.getState().meta?.nCtx ?? 0, maxTokens);
-  let total = msgs.reduce((a, m) => a + m.content.length, 0);
+  let total = msgs.reduce((a, m) => a + qwenMessageChars(m.content), 0);
   while (total > budget && msgs.length > 2) {
-    total -= msgs[1].content.length;
+    total -= qwenMessageChars(msgs[1].content);
     msgs.splice(1, 1);
   }
   ui.setGenerating(true);

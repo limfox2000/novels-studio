@@ -17,6 +17,12 @@ export interface AgentChatMsg {
   text: string;
 }
 
+/** 本轮带图时注入的系统提示：直接观察图片，并把可见细节用于人物/环境设计。 */
+export function imageInputHint(count: number): string {
+  if (!count) return '';
+  return `\n\n【图片输入】本轮用户附带了 ${count} 张图片，已作为图像内容提供。请直接观察图片回答，不要声称无法查看图片；分析人物时可提取长相、发型、穿搭、配饰、材质、配色与气质，分析环境时可提取空间结构、光线、色调、物件与氛围。只写图片中可见或可合理推断的信息，不凭空补充；用户要求用于人物/环境设计时，按既有协议输出可落地设定块。`;
+}
+
 /** Qwen 动作预检：不在线时返回指引文案（不进入页面互斥、快速失败）；在线返回 null */
 async function qwenGate(): Promise<string | null> {
   const online = await useQwenStore.getState().ensureOnline();

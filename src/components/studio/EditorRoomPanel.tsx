@@ -6,7 +6,7 @@
  *  带【区域规划】块时出「📎 落为规划」——
  *  容器+N 座建筑整组落地，建筑按 AI 给的大小/位置摆好并自动成为容器子节点（v2.7）。
  *  关面板不中断生成，重开继续看流式进度。 */
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type ReactNode } from 'react';
 import { useReactFlow } from '@xyflow/react';
 import { useEditorRoomStore, type EditorRoomMessage, type EditorRoomSettings } from '../../stores/editorRoomStore';
 import {
@@ -28,6 +28,12 @@ import { referenceChapterText, stateReferenceSummary } from '../../stores/snapsh
 import { SimWriteButtons } from './SimWriteButtons';
 import { pickRandomCharAsset } from '../../services/charAssetApi';
 import { localImgDel, localImgGet, localImgSaveFromUrl } from '../../services/localImages';
+import {
+  CHAT_ATTACHMENT_MAX,
+  compressChatImage,
+  loadChatAttachmentUrls,
+  type ChatAttachmentInput,
+} from '../../services/chatAttachments';
 import { EDITOR_MODULES, useEditorialStore } from '../../stores/editorialStore';
 import { MeetingView } from './MeetingView';
 import { EditorialDeptDialog } from './EditorialDeptDialog';
@@ -65,6 +71,42 @@ import { LongTextAnalysisPanel } from './LongTextAnalysisPanel';
 function fmt(text: string): string {
   const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return esc.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+}
+
+/** 用户消息附带的粘贴图片：本体按需从 IndexedDB 读回，刷新后仍可显示。 */
+function UserMessageImages({ msg }: { msg: EditorRoomMessage }) {
+  const metaKey = msg.attachments?.map((a) => a.i).join(',') ?? '';
+  const [urls, setUrls] = useState<string[]>([]);
+  useEffect(() => {
+    let alive = true;
+    if (!metaKey) {
+      setUrls([]);
+      return;
+    }
+    void loadChatAttachmentUrls(msg.id, msg.attachments)
+      .then((v) => {
+        if (alive) setUrls(v);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [msg.id, msg.attachments, metaKey]);
+  if (!urls.length) return null;
+  return (
+    <div className="mb-1.5 flex flex-wrap justify-end gap-1.5" data-chat-message-images>
+      {urls.map((url, i) => (
+        <img
+          key={i}
+          src={url}
+          alt={`附图 ${i + 1}`}
+          data-chat-message-image
+          title={msg.attachments?.[i]?.name || `附图 ${i + 1}`}
+          className="max-h-32 max-w-[9rem] rounded-[10px] border border-white/60 object-cover shadow-sm"
+        />
+      ))}
+    </div>
+  );
 }
 
 /** token 数缩写：1234 → 1.2K，1234567 → 1.2M */
@@ -1151,7 +1193,11 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
   const compactBusy = useEditorRoomStore((s) => s.compactBusy);
   const generating = useUiStore((s) => s.generating);
   const chatWidth = useEditorRoomStore((s) => s.settings.chatWidth);
+  const engine = useEditorRoomStore((s) => s.settings.engine);
   const [input, setInput] = useState('');
+  const [pendingImages, setPendingImages] = useState<ChatAttachmentInput[]>([]);
+  const [attachBusy, setAttachBusy] = useState(false);
+  const [attachError, setAttachError] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [showDept, setShowDept] = useState(false);
   const [analysisOpen, setAnalysisOpen] = useState(false);
@@ -1185,6 +1231,12 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     if (mode !== 'chat' || !chatEditor) setAnalysisOpen(false);
   }, [mode, chatEditor]);
+
+  // 切换对话对象时丢弃尚未发送的图片，避免把上一段对话的图带进新上下文
+  useEffect(() => {
+    setPendingImages([]);
+    setAttachError('');
+  }, [activeConvKey]);
 
   // 🏛 作品责编技能记忆（v2.21）：作品责编（顶栏选择，随作品存档）在各模块的技能记忆解析为纯数据写入
   //  editorRoomStore（避免 store 循环依赖），总编辑对话（genSimTurn）按本轮话题命中注入；无技能记忆的模块不注入
@@ -1242,17 +1294,71 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages]);
 
+  /** 粘贴的图片先压缩（最长边 1568 / JPEG），本体存 IndexedDB，消息里只留元数据 */
+  const addImageFiles = async (files: File[]) => {
+    setAttachError('');
+    if (!files.length) return;
+    if (meetingRunning && routeChat) {
+      setAttachError('会议插话暂不支持图片，请等会议结束后再分析');
+      return;
+    }
+    if (engine !== 'private') {
+      setAttachError('图像分析需要使用 🏠 私有模型，请在模型中心切换后重试');
+      return;
+    }
+    const room = CHAT_ATTACHMENT_MAX - pendingImages.length;
+    if (room <= 0) {
+      setAttachError(`每条消息最多附带 ${CHAT_ATTACHMENT_MAX} 张图片`);
+      return;
+    }
+    if (files.length > room) setAttachError(`每条消息最多 ${CHAT_ATTACHMENT_MAX} 张图片，已保留前 ${room} 张`);
+    setAttachBusy(true);
+    try {
+      for (const file of files.slice(0, room)) {
+        try {
+          const img = await compressChatImage(file);
+          setPendingImages((prev) => [...prev, img].slice(0, CHAT_ATTACHMENT_MAX));
+        } catch (e) {
+          setAttachError(e instanceof Error ? e.message : '图片处理失败');
+        }
+      }
+    } finally {
+      setAttachBusy(false);
+    }
+  };
+
+  const pasteImages = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(e.clipboardData.items)
+      .filter((it) => it.kind === 'file' && it.type.startsWith('image/'))
+      .map((it) => it.getAsFile())
+      .filter((f): f is File => !!f);
+    if (!files.length) return;
+    e.preventDefault();
+    void addImageFiles(files);
+  };
+
   const send = () => {
     const t = input;
-    if (!t.trim()) return;
+    if (!t.trim() && !pendingImages.length) return;
     if (meetingRunning && routeChat) {
+      if (pendingImages.length) {
+        setAttachError('会议插话暂不支持图片，请等会议结束后再分析');
+        return;
+      }
       useEditorialStore.getState().addRemark(t);
       setInput('');
       return;
     }
-    if (busy || generating) return;
+    if (busy || generating || attachBusy) return;
+    if (pendingImages.length && engine !== 'private') {
+      setAttachError('图像分析需要使用 🏠 私有模型，请在模型中心切换后重试');
+      return;
+    }
+    const images = pendingImages;
     setInput('');
-    void useEditorRoomStore.getState().send(t);
+    setPendingImages([]);
+    setAttachError('');
+    void useEditorRoomStore.getState().send(t, images);
   };
 
   const copyText = async (text: string) => {
@@ -1298,6 +1404,7 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
               <div className="mt-1.5 max-h-40 overflow-y-auto whitespace-pre-wrap text-[12.5px] leading-[1.7] text-slate-400">{m.think}</div>
             </details>
           )}
+          {isUser && <UserMessageImages msg={m} />}
           <div
             className={
               isUser
@@ -1627,10 +1734,45 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
               会议进行中，此处发送的内容会作为插话进入讨论（可在会议页关闭）
             </div>
           )}
+          {pendingImages.length > 0 && (
+            <div className="mx-auto mb-1.5 flex w-full flex-wrap items-center gap-1.5" style={colStyle} data-chat-pending-images>
+              {pendingImages.map((img, i) => (
+                <div key={`${img.name}-${i}`} className="relative" data-chat-pending-image>
+                  <img
+                    src={img.dataUrl}
+                    alt={img.name || `待发送图片 ${i + 1}`}
+                    title={`${img.name} · ${img.w}×${img.h}`}
+                    className="h-16 w-16 rounded-[8px] border border-slate-200 object-cover shadow-sm"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setPendingImages((prev) => prev.filter((_, j) => j !== i))}
+                    disabled={busy || generating}
+                    title="移除这张图片"
+                    className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 shadow-sm transition hover:bg-rose-50 hover:text-rose-600 disabled:opacity-40"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+              <span className="text-[11px] text-slate-400">已附 {pendingImages.length}/{CHAT_ATTACHMENT_MAX} 张 · 发送后由编辑观察图片</span>
+            </div>
+          )}
+          {(attachError || attachBusy) && (
+            <div
+              className={`mx-auto mb-1.5 w-full text-[12px] ${attachError ? 'text-rose-600' : 'text-slate-400'}`}
+              style={colStyle}
+              role={attachError ? 'alert' : undefined}
+              data-chat-attach-status
+            >
+              {attachError || '正在处理图片…'}
+            </div>
+          )}
           <div className="mx-auto flex w-full items-end gap-2" style={colStyle}>
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              onPaste={pasteImages}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
@@ -1638,12 +1780,15 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
                 }
               }}
               rows={2}
+              data-chat-input
               placeholder={
                 restoringConv
                   ? '正在恢复单独对话的上下文…'
                   : meetingRunning && routeChat
                     ? '插话：会进入正在进行的会议讨论（Enter 发送）'
-                    : '描述想要的舞台：地点、人物、氛围…（Enter 发送）'
+                    : engine === 'private'
+                      ? '描述想要的舞台：地点、人物、氛围…（Enter 发送，可粘贴图片）'
+                      : '描述想要的舞台：地点、人物、氛围…（Enter 发送；切到 🏠 私有模型可粘贴图片）'
               }
               className="min-w-0 flex-1 resize-none rounded-[10px] border border-slate-200 bg-slate-50 px-3 py-2 text-[14px] leading-[1.7] text-slate-700 transition placeholder:text-slate-400 focus:border-brand-400 focus:bg-white focus:outline-none focus:ring-4 focus:ring-brand-500/10"
             />
@@ -1660,8 +1805,16 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
                 variant="primary"
                 icon={<Send />}
                 onClick={send}
-                disabled={!input.trim() || restoringConv}
-                title={restoringConv ? '正在恢复单独对话的上下文，请稍候' : undefined}
+                disabled={(!input.trim() && !pendingImages.length) || restoringConv || attachBusy}
+                title={
+                  restoringConv
+                    ? '正在恢复单独对话的上下文，请稍候'
+                    : attachBusy
+                      ? '图片处理中，请稍候'
+                      : pendingImages.length && engine !== 'private'
+                        ? '图像分析需要使用 🏠 私有模型'
+                        : undefined
+                }
               >
                 发送
               </Button>

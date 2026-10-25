@@ -9,6 +9,15 @@ import type { ResponsibleEditor } from '../engines/studioEngine';
 import { compactAgentContext } from '../shared/agentShared';
 import { qwGetMeta, REASONING_EFFORTS, type QwenUsage, type ReasoningEffort } from '../shared/qwenClient';
 import { stopGeneration } from '../shared/generation';
+import {
+  CHAT_VISION_TOTAL_MAX,
+  DEFAULT_IMAGE_PROMPT,
+  deleteChatAttachments,
+  loadChatAttachmentUrls,
+  saveChatAttachments,
+  type ChatAttachmentInput,
+  type ChatAttachmentMeta,
+} from '../services/chatAttachments';
 
 export interface EditorRoomMessage {
   id: string;
@@ -23,6 +32,8 @@ export interface EditorRoomMessage {
   /** 生成过的图片标记（【生图】块按块序号 i 对应；存的是服务器临时 URL，仅兜底展示——
    *  图片本体在浏览器 IndexedDB（services/localImages.ts，key=chat:<msgId>:<i>），服务器文件 10 分钟后被 GC） */
   images?: Array<{ i: number; url: string }>;
+  /** 用户粘贴的图片元数据（仅 user 消息）：本体在 IndexedDB 的 chat:<msgId>:u:<i>，存档只存轻量字段 */
+  attachments?: ChatAttachmentMeta[];
   /** 本条 agent 回复的对话对象（与编辑部某位编辑单独对话时记录；总编辑对话无此字段） */
   editorId?: string;
   editorName?: string;
@@ -99,7 +110,7 @@ interface EditorRoomState {
   /** 模型信息（/api/qwen/meta，不持久化；null=未读到） */
   meta: { model: string; nCtx: number; nCtxTrain: number } | null;
   metaError: string;
-  send: (userText: string) => Promise<void>;
+  send: (userText: string, images?: ChatAttachmentInput[]) => Promise<void>;
   stop: () => void;
   /** 重生成最后一条 agent 回复（连同其前的用户消息一起重发） */
   regenerate: () => Promise<void>;
@@ -128,6 +139,27 @@ export const useEditorRoomStore = create<EditorRoomState>()(
     (set, get) => {
       /** 单轮流式：pushUser 传新用户消息对象（null=重生成时复用历史里的） */
       const streamTurn = async (history: EditorRoomMessage[], userText: string, pushUser: EditorRoomMessage | null) => {
+        const engine = get().settings.engine;
+        // 图片本体在 IndexedDB：发送前读回当前消息与最近历史（只带私有视觉模型，总数受限，避免多轮重复图片撑爆上下文）
+        const currentImages =
+          engine === 'private' && pushUser?.attachments?.length
+            ? await loadChatAttachmentUrls(pushUser.id, pushUser.attachments).catch(() => [])
+            : [];
+        let imageBudget = Math.max(0, CHAT_VISION_TOTAL_MAX - currentImages.length);
+        const historyMsgs: SimChatMsg[] = [];
+        for (let i = history.length - 1; i >= 0; i--) {
+          const m = history[i];
+          let images: string[] | undefined;
+          if (engine === 'private' && imageBudget > 0 && m.role === 'user' && m.attachments?.length) {
+            const loaded = await loadChatAttachmentUrls(m.id, m.attachments.slice(0, imageBudget)).catch(() => []);
+            if (loaded.length) {
+              images = loaded;
+              imageBudget -= loaded.length;
+            }
+          }
+          historyMsgs.unshift({ role: m.role, text: m.text, ...(images ? { images } : {}) });
+        }
+
         const aid = `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         set((s) => ({
           messages: [
@@ -140,13 +172,13 @@ export const useEditorRoomStore = create<EditorRoomState>()(
         }));
         let lastFlush = 0;
         let lastThinkFlush = 0;
-        const historyMsgs: SimChatMsg[] = history.map((m) => ({ role: m.role, text: m.text }));
         const ed = get().chatEditor; // 对话对象发起前定格（切换按钮 busy 时禁用）
         const common = {
           history: historyMsgs,
           userMsg: userText,
+          ...(currentImages.length ? { userImages: currentImages } : {}),
           reasoningEffort: get().settings.reasoningEffort,
-          engine: get().settings.engine,
+          engine,
           onDelta: (acc: string) => {
             const now = Date.now();
             if (now - lastFlush > 400) {
@@ -242,13 +274,34 @@ export const useEditorRoomStore = create<EditorRoomState>()(
         meta: null,
         metaError: '',
 
-        send: async (userText) => {
-          const text = userText.trim();
-          const { busy, messages, chatEditor, activeConvKey } = get();
+        send: async (userText, images = []) => {
+          const { busy, messages, chatEditor, activeConvKey, settings } = get();
           // 刷新后编辑会话尚在恢复（编辑名单未就绪）：先别发，避免这条消息错发到总编辑上下文
           if (activeConvKey !== 'chief' && !chatEditor) return;
+          const text = userText.trim() || (images.length ? DEFAULT_IMAGE_PROMPT : '');
           if (!text || busy) return;
-          await streamTurn(messages, text, { id: `u-${Date.now()}`, role: 'user', text, ts: Date.now() });
+          if (images.length && settings.engine !== 'private') {
+            set({ error: '图像分析需要使用 🏠 私有模型，请在模型中心切换后重试' });
+            return;
+          }
+          const id = `u-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+          if (images.length) set({ busy: true, error: '' });
+          let attachments: ChatAttachmentMeta[] = [];
+          if (images.length) {
+            try {
+              attachments = await saveChatAttachments(id, images);
+            } catch (e) {
+              set({ busy: false, error: e instanceof Error ? e.message : '图片暂存失败，请重试' });
+              return;
+            }
+          }
+          await streamTurn(messages, text, {
+            id,
+            role: 'user',
+            text,
+            ts: Date.now(),
+            ...(attachments.length ? { attachments } : {}),
+          });
         },
 
         stop: () => stopGeneration(),
@@ -273,7 +326,12 @@ export const useEditorRoomStore = create<EditorRoomState>()(
           await streamTurn(history, userMsg.text, userMsg);
         },
 
-        clearChat: () => set({ messages: [], error: '' }),
+        clearChat: () => {
+          for (const m of get().messages) {
+            if (m.attachments?.length) deleteChatAttachments(m.id, m.attachments);
+          }
+          set({ messages: [], error: '' });
+        },
 
         /** 追加一条非模型生成的消息（会议纪要等）：永落总编辑对话（会议由总编辑组织，不落进编辑单独对话） */
         appendMessage: (m) =>
@@ -329,7 +387,11 @@ export const useEditorRoomStore = create<EditorRoomState>()(
             return { savedConvs: saved, activeConvKey: 'chief', chatEditor: null, messages: chief.messages, summary: chief.summary, error: '', usage: null };
           }),
 
-        deleteMessage: (id) => set((s) => ({ messages: s.messages.filter((m) => m.id !== id) })),
+        deleteMessage: (id) => {
+          const msg = get().messages.find((m) => m.id === id);
+          if (msg?.attachments?.length) deleteChatAttachments(id, msg.attachments);
+          set((s) => ({ messages: s.messages.filter((m) => m.id !== id) }));
+        },
 
         loadMeta: async () => {
           if (get().meta) return; // 已读到就不再请求
