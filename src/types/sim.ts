@@ -125,6 +125,9 @@ export interface SimChapter {
   content: string;
   /** 📸 本章舞台快照（R2/R3）：区域名单、冻结几何与采集时标签；生成大纲/正文时作为权威名单 */
   snapshot?: ChapterSnapshot;
+  /** ✨ 本章正文启用的写作技能 ID（全局技能库 nc2-writing-skills-v1；最多 3 个，缺省=不启用）。
+   *  只注入本章正文生成，不影响大纲；技能库中已删除的 ID 在解析时忽略。随章节存档/导出自然携带。 */
+  writingSkillIds?: string[];
 }
 
 /** 🎭 名单角色：在场（可行动/说话/被直接描写）/ 仅提及（只能被提到，不在现场行动） */

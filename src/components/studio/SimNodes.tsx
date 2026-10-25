@@ -106,8 +106,12 @@ export function SimEnvironmentNode({ id, data, selected }: NodeProps) {
       {/* 选中后显示缩放柄（写 node.width/height，经 dimensions change 进 store 持久化）；锁定后隐藏；柄色随类型 */}
       <NodeResizer isVisible={selected && !locked} minWidth={ENV_MIN_W} minHeight={ENV_MIN_H} color={meta.dot} />
       <div className={`group flex h-full w-full flex-col overflow-hidden rounded-xl border-2 shadow-md ${meta.border} ${meta.body}`}>
-        {/* 标题条：图标 + 名称 + 类型徽章 + 锁定 + 删除（悬停出现）——均只展示，编辑走属性面板；配色随类型（清淡） */}
-        <div className={`flex shrink-0 items-center gap-1 px-1.5 py-1 ${meta.bar}`}>
+        {/* 标题条：图标 + 名称 + 类型徽章 + 锁定 + 删除（悬停出现）——均只展示，编辑走属性面板；配色随类型（清淡）
+            选中后拖动标题条/空白处移动环境；未选中时拖动空白处平移画布（节点由 StudioPage 设为不可拖动） */}
+        <div
+          className={`flex shrink-0 cursor-grab items-center gap-1 px-1.5 py-1 ${meta.bar}`}
+          title={selected && !locked ? '拖动移动环境' : '点击选中后可拖动移动环境；未选中时拖动空白处平移画布'}
+        >
           <EnvIcon className="h-3.5 w-3.5 shrink-0 text-white/90" />
           <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-white">{d.name || '未命名'}</span>
           <span
@@ -148,8 +152,12 @@ export function SimEnvironmentNode({ id, data, selected }: NodeProps) {
             <X className="h-3 w-3" />
           </button>
         </div>
-        {/* 描述不在画布上展示（避免小节点里文字拥挤凌乱）：只在属性面板查看/编辑 */}
-        <div className="min-h-0 flex-1" />
+        {/* 描述不在画布上展示（避免小节点里文字拥挤凌乱）：只在属性面板查看/编辑
+            未选中时整个节点不可拖动 → 此处拖动平移画布；选中后拖动移动环境 */}
+        <div
+          className="min-h-0 flex-1"
+          style={{ cursor: selected && !locked ? 'grab' : 'default' }}
+        />
       </div>
     </>
   );

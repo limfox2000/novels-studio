@@ -25,6 +25,8 @@ import { qwGenerate, REASONING_EFFORT_MAX_TOKENS, type QwenChatMessage, type Qwe
 import { startGeneration, stopGeneration } from '../shared/generation';
 import { agentGate, promptCharBudget, QWEN_SAFE_LIMIT } from '../shared/agentShared';
 import { ENV_TYPE_LABELS, ENV_TYPE_META, GENDER_LABELS, genderOf, type CharacterData, type CharacterGender, type CharacterState, type EnvironmentType, type SimChapter, type SimNodeType, type SimVolume } from '../types/sim';
+import type { WritingSkill } from '../types/writingSkill';
+import { buildWritingSkillsBlock } from './writingSkills';
 import { activeCharacterState, characterStateOf, DEFAULT_STATE_ID, DEFAULT_STATE_LABEL, portraitKeyForState, STATE_LABEL_CAP } from '../stores/characterStates';
 import { imgSubmit, imgTask, imgConfigCached } from '../services/imgApi';
 
@@ -1629,7 +1631,7 @@ const CH_CONTENT_BUDGET = {
 };
 
 /** 文本双模型写正文的 system */
-function buildContentSystem(graphName: string, stage: ChapterStageContext): string {
+function buildContentSystem(graphName: string, stage: ChapterStageContext, skillsBlock = ''): string {
   const st = useStudioStore.getState();
   const full = st.rules.trim();
   const rulesBlock = full
@@ -1638,7 +1640,7 @@ function buildContentSystem(graphName: string, stage: ChapterStageContext): stri
   return `你是小说《${graphName || '未命名'}》的正文写手：根据本章大纲把剧情展开成小说正文。
 ${rulesBlock}${mainGoalBlock()}
 ${stage.block}
-【输出要求】
+${skillsBlock ? `${skillsBlock}\n` : ''}【输出要求】
 - 直接输出正文本身：不要输出章节名、标题、序号、解释或任何元话语，不要用 Markdown 标记
 - 严格按本章大纲的事件顺序完整展开，写足场景、对话与细节；直接从场景写起
 - 剧情走向遵循大纲，不得自行改写关键事件与结局；人物言行符合本章舞台设定（有快照名单时严格按在场/仅提及规则）`;
@@ -1654,6 +1656,8 @@ export async function genChapterContent(opts: {
   engine: 'private' | 'public';
   /** 🏛 正文生成责编（注入其职责与记忆） */
   responsible?: ResponsibleEditor;
+  /** ✨ 本章启用的写作技能（已按技能库解析；仅正文 system 使用，最多 3 个） */
+  writingSkills?: WritingSkill[];
   onDelta?: (acc: string) => void;
 }): Promise<{ ok: boolean; error?: string; content?: string; stage?: ChapterStageResult }> {
   const st0 = useStudioStore.getState();
@@ -1697,7 +1701,12 @@ export async function genChapterContent(opts: {
   try {
     const text = await qwGenerate({
       messages: [
-        { role: 'system', content: buildContentSystem(graphName, stage) + responsibleBlock(opts.responsible, '正文生成') },
+        {
+          role: 'system',
+          content:
+            buildContentSystem(graphName, stage, buildWritingSkillsBlock(opts.writingSkills ?? [])) +
+            responsibleBlock(opts.responsible, '正文生成'),
+        },
         { role: 'user', content: sections },
       ],
       maxTokens: 8192,

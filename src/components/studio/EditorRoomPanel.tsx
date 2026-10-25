@@ -51,6 +51,7 @@ import {
   PenLine,
   Plus,
   RotateCcw,
+  ScanText,
   Send,
   Settings2,
   Square,
@@ -58,6 +59,7 @@ import {
   UserPlus,
   X,
 } from 'lucide-react';
+import { LongTextAnalysisPanel } from './LongTextAnalysisPanel';
 
 /** 极简排版：转义后仅渲染 **加粗**（配合 whitespace-pre-wrap 保留换行） */
 function fmt(text: string): string {
@@ -1152,6 +1154,7 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
   const [input, setInput] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [showDept, setShowDept] = useState(false);
+  const [analysisOpen, setAnalysisOpen] = useState(false);
   const mode = useEditorialStore((s) => s.mode);
   const meetingRunning = useEditorialStore((s) => s.status === 'running');
   const routeChat = useEditorialStore((s) => s.routeChat);
@@ -1178,6 +1181,10 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
   }, [chatEditor, activeConvKey, editors, serverLoaded]);
   // 会话恢复中（编辑名单未就绪）：暂停发送，避免消息错发到总编辑上下文
   const restoringConv = activeConvKey !== 'chief' && !chatEditor;
+  // 长文分析只在「单独对话某编辑」时可用；切回总编辑/会议时收起
+  useEffect(() => {
+    if (mode !== 'chat' || !chatEditor) setAnalysisOpen(false);
+  }, [mode, chatEditor]);
 
   // 🏛 作品责编技能记忆（v2.21）：作品责编（顶栏选择，随作品存档）在各模块的技能记忆解析为纯数据写入
   //  editorRoomStore（避免 store 循环依赖），总编辑对话（genSimTurn）按本轮话题命中注入；无技能记忆的模块不注入
@@ -1430,7 +1437,10 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
 
   return (
     /* 桌面端固定宽（sm:w-[560px]）：不随流式文字抖动宽度（移动端左右贴边） */
-    <div className="fixed bottom-2 left-2 right-2 top-[calc(var(--topbar-h)+10px)] z-40 flex flex-col overflow-hidden rounded-[16px] border border-slate-200/80 bg-white shadow-panel sm:left-auto sm:right-4 sm:w-[560px]">
+    <div
+      data-testid="editor-room"
+      className="fixed bottom-2 left-2 right-2 top-[calc(var(--topbar-h)+10px)] z-40 flex flex-col overflow-hidden rounded-[16px] border border-slate-200/80 bg-white shadow-panel sm:left-auto sm:right-4 sm:w-[560px]"
+    >
       {/* 头部：标题 + 编辑部 / 设置 / 清空 / 关闭 */}
       <div className="flex flex-shrink-0 items-center gap-1.5 border-b border-slate-100 px-3 py-2">
         <span className="flex items-center gap-1.5 whitespace-nowrap text-[14px] font-semibold text-slate-700">
@@ -1521,6 +1531,23 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
               ))}
             </select>
             {chatEditor && <span className="whitespace-nowrap text-[12px] text-brand-600">单独对话</span>}
+            {chatEditor && (
+              <button
+                type="button"
+                onClick={() => setAnalysisOpen((v) => !v)}
+                disabled={busy || generating || meetingRunning}
+                data-longtext-open
+                title={`长文分析：让「${chatEditor.name}」按指定方向分析大段原文（独立面板，不写入对话）`}
+                className={`flex h-7 shrink-0 items-center gap-1 rounded-[8px] border px-1.5 text-[12px] transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                  analysisOpen
+                    ? 'border-brand-300 bg-brand-100 text-brand-700'
+                    : 'border-brand-200 bg-brand-50 text-brand-700 hover:bg-brand-100'
+                }`}
+              >
+                <ScanText className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">长文分析</span>
+              </button>
+            )}
           </>
         ) : (
           <span className="min-w-0 flex-1 truncate text-[12px] text-slate-400">编辑部会议：轮流发言，总编辑小结成纪要</span>
@@ -1644,6 +1671,13 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
         </>)}
       </div>
       {showDept && <EditorialDeptDialog onClose={() => setShowDept(false)} />}
+      {analysisOpen && mode === 'chat' && chatEditor && (
+        <LongTextAnalysisPanel
+          key={chatEditor.id}
+          editor={chatEditor}
+          onClose={() => setAnalysisOpen(false)}
+        />
+      )}
     </div>
   );
 }

@@ -51,6 +51,14 @@ export function activateChapter(
     useUiStore.getState().setActiveChapterId(chapterId);
 
     const now = useStudioStore.getState();
+    // 切章后清空节点选中：选中态的环境在 React Flow 中可拖动，若残留选中，拖动画布时
+    // 会误移环境而章节区域固定在世界坐标，看起来像区域与内容脱离。
+    if (!sameChapter) {
+      const selected = now.boards[targetBoardId]?.nodes.filter((n) => n.selected) ?? [];
+      if (selected.length) {
+        now.onNodesChange(selected.map((n) => ({ type: 'select' as const, id: n.id, selected: false })));
+      }
+    }
     const target = now.chapters.find((c) => c.id === chapterId);
     const board = now.boards[targetBoardId];
     const region = board?.regions.find((r) => r.chapterId === chapterId);

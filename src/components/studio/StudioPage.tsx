@@ -87,9 +87,17 @@ const CHAR_NOMINAL_SIZE = { w: 144, h: 104 };
 
 function StudioCanvas() {
   const storeNodes = useActiveNodes();
-  // 锁定的环境节点在 React Flow 层禁用拖动（属性编辑不受影响）
+  // 环境节点：选中后才可拖动（锁定的除外）。
+  // ⚠ React Flow 会给可拖动节点整个加 nopan——未选中环境若可拖动，拖动环境空白处会移动环境而不是平移画布，
+  //   章节区域固定在世界坐标 → 看起来像区域和内容脱离。未选中时设为不可拖动，拖动即平移画布；
+  //   点击选中后可正常拖动/缩放（缩放手柄也只在这种情况下出现）。
   const nodes = useMemo(
-    () => storeNodes.map((n) => (n.data.kind === 'environment' && n.data.locked ? { ...n, draggable: false } : n)),
+    () =>
+      storeNodes.map((n) =>
+        n.data.kind === 'environment'
+          ? { ...n, draggable: n.selected === true && n.data.locked !== true }
+          : n,
+      ),
     [storeNodes],
   );
   const edges = useActiveEdges();

@@ -1,6 +1,7 @@
 /** 📝 正文管理器（v2.11：与大纲管理器同形态的半页浮层——左侧章节竖列 + 右侧阅读区，阅读系统配色）。
  *  硬门槛（用户拍板）：本章在「📋 大纲」中生成了大纲，本章的「生成正文」才可点击（无大纲禁用+提示）。
  *  生成走 studioEngine.genChapterContent：📜全文规则 + 本章大纲 + 画布舞台 + 前情正文 → 流式写入；
+ *  ✨ 写作技能（v2.33）：左上角可选扩展包，按章启用 0–3 个，仅注入本章正文；管理入口/槽位保持轻量。
  *  写手引擎（🏠 私有 / 🌐 公共）在「模型中心」统一设置，存 editorRoomStore settings.contentEngine，这里只读显示。
  *  正文阅读视图：宋体衬线 + 段首缩进两字符 + 宽行距；
  *  配色沿用阅读器四档主题（与大纲管理器/正文阅读器共用 nc2-reader-v1 偏好互通）；
@@ -14,6 +15,9 @@ import { useUiStore } from '../../stores/uiStore';
 import { genChapterContent } from '../../engines/studioEngine';
 import { stopGeneration } from '../../shared/generation';
 import { useEditorialStore } from '../../stores/editorialStore';
+import { useWritingSkillStore } from '../../stores/writingSkillStore';
+import { resolveWritingSkills } from '../../engines/writingSkills';
+import { WritingSkillSlots } from './WritingSkillSlots';
 import { READER_PREF_KEY, READER_THEMES } from './readerThemes';
 import { useActiveChapterId } from './useActiveChapter';
 import { activateChapter } from './chapterSceneActions';
@@ -154,12 +158,18 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
     const engine = useEditorRoomStore.getState().settings.contentEngine;
     // 🏛 作品责任编辑：注入其职责与「正文生成」技能记忆（v2.21）
     const responsible = useEditorialStore.getState().getWorkResponsibleData('正文生成');
+    // ✨ 写作技能（v2.33）：按本章槽位从全局技能库解析；生成开始即固定，生成中改槽位只影响下一次
+    const writingSkills = resolveWritingSkills(
+      latest?.writingSkillIds ?? [],
+      useWritingSkillStore.getState().skills,
+    );
     const r = await genChapterContent({
       chapterId: sel.id,
       chapter: { title: sel.title, requirement: sel.requirement, outline: sel.outline, volumeId: sel.volumeId },
       prevChapters: st.chapters.slice(Math.max(0, idx - 3), idx),
       engine,
       ...(responsible ? { responsible } : {}),
+      ...(writingSkills.length ? { writingSkills } : {}),
       onDelta: (acc) => {
         const now = Date.now();
         if (now - lastFlush > 400) {
@@ -203,7 +213,7 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
       className="fixed bottom-2 left-2 right-2 top-[calc(var(--topbar-h)+10px)] z-40 flex flex-col overflow-hidden rounded-[16px] border border-slate-200/80 shadow-panel sm:bottom-4 sm:right-auto sm:w-[clamp(640px,60vw,880px)]"
       style={themed}
     >
-      {/* 头部：标题 + 引擎三选一 + 配色圆点 + 关闭 */}
+      {/* 头部：标题 + 写作技能（左上角，空时收起） + 引擎/配色/字号 + 关闭 */}
       <div className="flex flex-shrink-0 items-center gap-2 border-b bg-[var(--rd-card)] px-3 py-2" style={{ borderColor: t.border }}>
         <span className="flex items-center gap-1.5 whitespace-nowrap text-[14px] font-semibold">
           <FileText className="h-4 w-4 opacity-70" />
@@ -212,6 +222,7 @@ export function ContentManager({ onClose }: { onClose: () => void }) {
         <span className="hidden whitespace-nowrap text-[12px] sm:inline" style={{ color: t.sub }}>
           {chapters.reduce((a, c) => a + (c.content.trim() ? 1 : 0), 0)}/{chapters.length} 章成文
         </span>
+        {sel && <WritingSkillSlots chapter={sel} />}
         <span className="flex-1" />
         {generating && (
           <span className="hidden items-center gap-1 whitespace-nowrap text-[12px] sm:flex" style={{ color: t.sub }}>

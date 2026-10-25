@@ -40,6 +40,7 @@ import {
   type SimViewport,
 } from '../types/sim';
 import { uid } from '../utils/id';
+import { sameStringList, sanitizeWritingSkillIds } from '../types/writingSkill';
 import { absPositionOf, isDescendantOf, sortParentsFirst } from './graphGeom';
 import {
   DEFAULT_BOARD_ID,
@@ -135,6 +136,7 @@ export function sanitizeChapters(v: unknown): SimChapter[] {
     .filter((c): c is Record<string, unknown> => !!c && typeof c === 'object')
     .map((c, i) => {
       const snapshot = sanitizeChapterSnapshot(c.snapshot);
+      const writingSkillIds = sanitizeWritingSkillIds(c.writingSkillIds);
       return {
         id: typeof c.id === 'string' && c.id ? c.id : `ch-${i}-${uid()}`,
         title: pickStr(c.title),
@@ -143,6 +145,7 @@ export function sanitizeChapters(v: unknown): SimChapter[] {
         outline: pickStr(c.outline),
         content: pickStr(c.content),
         ...(snapshot ? { snapshot } : {}),
+        ...(writingSkillIds.length ? { writingSkillIds } : {}),
       };
     });
 }
@@ -589,6 +592,10 @@ interface SimState {
   deleteChapter: (id: string) => void;
   /** 章节上移/下移一位 */
   moveChapter: (id: string, dir: -1 | 1) => void;
+  /** ✨ 设置本章正文启用的写作技能（去重/最多 3 个；无变化不标记未保存） */
+  setChapterWritingSkillIds: (chapterId: string, ids: string[]) => void;
+  /** 全局技能库删除技能时，清理当前作品所有章节中的该技能引用 */
+  removeWritingSkillReferences: (skillId: string) => void;
   setOutlineBusy: (id: string | null) => void;
   setContentBusy: (id: string | null) => void;
 
@@ -896,6 +903,34 @@ export const useStudioStore = create<SimState>()(
           const chapters = [...s.chapters];
           [chapters[i], chapters[j]] = [chapters[j], chapters[i]];
           return { chapters };
+        }),
+      setChapterWritingSkillIds: (id, ids) =>
+        set((s) => {
+          const before = s.chapters.find((c) => c.id === id);
+          if (!before) return {};
+          const next = sanitizeWritingSkillIds(ids);
+          if (sameStringList(before.writingSkillIds ?? [], next)) return {};
+          return {
+            chapters: s.chapters.map((c) => {
+              if (c.id !== id) return c;
+              if (next.length) return { ...c, writingSkillIds: next };
+              const { writingSkillIds: _drop, ...rest } = c;
+              return rest;
+            }),
+          };
+        }),
+      removeWritingSkillReferences: (skillId) =>
+        set((s) => {
+          let changed = false;
+          const chapters = s.chapters.map((c) => {
+            if (!c.writingSkillIds?.includes(skillId)) return c;
+            changed = true;
+            const next = c.writingSkillIds.filter((x) => x !== skillId);
+            if (next.length) return { ...c, writingSkillIds: next };
+            const { writingSkillIds: _drop, ...rest } = c;
+            return rest;
+          });
+          return changed ? { chapters } : {};
         }),
       setOutlineBusy: (id) => set({ outlineBusyId: id }),
       setContentBusy: (id) => set({ contentBusyId: id }),
