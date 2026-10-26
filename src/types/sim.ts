@@ -34,7 +34,7 @@ export function isContainerEnv(t: EnvironmentType): boolean {
   return ENV_TYPE_META[t].container;
 }
 
-/** 🚻 人物性别（基础属性）：male=男（默认）/ female=女；决定节点头像与配色（男蓝/女玫红，SimNodes.GENDER_STYLE） */
+/** 🚻 人物性别（基础属性）：male=男（默认）/ female=女；决定剪影头像与配色（男蓝/女玫红，SimNodes.GENDER_STYLE） */
 export type CharacterGender = 'male' | 'female';
 
 /** 性别兜底：非 female 一律归默认男（sanitize 旧档案/损坏缓存共用；v2.13a 用户拍板不设「未设置」态） */
@@ -45,9 +45,44 @@ export function genderOf(v: unknown): CharacterGender {
 /** 性别 → 中文标签（AI 注入用：主角简报/画布摘要/编辑室协议） */
 export const GENDER_LABELS: Record<CharacterGender, string> = { male: '男', female: '女' };
 
+/** 🖼 人物大图尺寸预设：AI 生成使用；上传原图保持自身尺寸。 */
+export const CHARACTER_IMAGE_PRESETS = ['1:1', '4:3', '16:9', '9:16'] as const;
+export type CharacterImagePreset = (typeof CHARACTER_IMAGE_PRESETS)[number];
+
+export const CHARACTER_IMAGE_PRESET_DIMS: Record<
+  CharacterImagePreset,
+  { label: string; w: number; h: number }
+> = {
+  '1:1': { label: '1024×1024', w: 1024, h: 1024 },
+  '4:3': { label: '1440×1080', w: 1440, h: 1080 },
+  '16:9': { label: '1920×1080', w: 1920, h: 1080 },
+  '9:16': { label: '1080×1920', w: 1080, h: 1920 },
+};
+
+/** 从大图裁出的头部区域（源图像素坐标；size 同时是宽高，保持正方形） */
+export interface CharacterImageCrop {
+  x: number;
+  y: number;
+  size: number;
+}
+
+/** 人物状态的大图与圆形头像引用：图片本体在浏览器 IndexedDB，状态里只存轻量元数据。 */
+export interface CharacterStateImage {
+  /** IndexedDB key：charimg:<nodeId>:<stateId>:<nonce> */
+  key: string;
+  width: number;
+  height: number;
+  /** AI 生成时的尺寸预设；上传原图时为 'original' */
+  preset: CharacterImagePreset | 'original';
+  /** IndexedDB key：charhead:<nodeId>:<stateId>:<nonce>；undefined=未裁切，画布显示性别剪影 */
+  headKey?: string;
+  /** 头部裁切区域；只有存在 headKey 时才有意义 */
+  crop?: CharacterImageCrop;
+}
+
 /** 🧬 人物状态（v2.30）：同一人物随剧情变化的一套属性。
- *  人名/性别跨状态稳定，留在 CharacterData 顶层；其余属性与写真都属于状态。
- *  旧版平铺字段由 sanitize 自动迁入首项「状态0」，数据不丢。 */
+ *  人名/性别跨状态稳定，留在 CharacterData 顶层；其余属性与人物形象都属于状态。
+ *  旧版平铺字段由 sanitize 自动迁入首项「状态0」；旧 avatar/写真不迁移。 */
 export interface CharacterState {
   /** 状态 ID：人物内稳定；创建时首项固定 state0，新增用 uid。复制人物时保留 */
   id: string;
@@ -55,21 +90,18 @@ export interface CharacterState {
   label: string;
   /** 年龄（可选）：节点上跟在人名后显示（如「李刚 32」） */
   age?: number;
-  /** 形象（v2.21，可选）：服务器人物素材库的素材 id；未设置 = 默认素材（DEFAULT_CHARASSET） */
-  avatar?: string;
   /** 基础信息（v2.27）：长相、身材、习惯穿搭、性格——人物本身的样子与性情 */
   basicInfo: string;
   /** 身份信息（v2.27）：职业、身份、与故事相关的特殊设计——人物在世界中的位置与钩子 */
   identityInfo: string;
   /** 关系信息（v2.20，可选）：与其他人物之间的关系（如父子/仇敌/师徒） */
   relations?: string;
-  /** 🎨 写真引用（v2.30）：浏览器 IndexedDB 的 key，不存图片本体。
-   *  规范 key=portrait:<nodeId>:<stateId>；旧写真由迁移写在状态0 的 portrait:<nodeId>。undefined=该状态无写真 */
-  portraitKey?: string;
+  /** 🖼 人物形象（v2.31）：大图 + 手动裁切的头部圆形头像，按状态独立保存 */
+  image?: CharacterStateImage;
 }
 
 /** 人物节点：胶囊上显示 头像+人名+年龄（如「李刚 32」，永远浮在环境节点之上）；
- *  人名/性别是跨状态稳定的基础属性（性别决定头像与节点颜色）；其余设定属于当前状态。
+ *  人名/性别是跨状态稳定的基础属性（性别决定无头像时的剪影与节点颜色）；其余设定（含人物形象）属于当前状态。
  *  所有属性读取必须走 stores/characterStates 的解析函数，不能直接读节点上的平铺字段（v2.30 已移除）。 */
 export interface CharacterData extends Record<string, unknown> {
   kind: 'character';

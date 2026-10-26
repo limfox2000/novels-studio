@@ -188,7 +188,8 @@ async def api_simgraph_delete(request):
 # ── 生图系统（双轨）：🏠 私有 = ComfyUI（标准 txt2img 工作流）；🌐 公共 = 中转变体协议（/draw + 任务轮询） ──
 DEFAULT_IMGCONF = {
     "default": "public",  # 默认生图轨（前端读此字段决定 rail；服务端 rail 缺省恒为 public，旧前端零破坏）
-    "private": {"base_url": "", "model": ""},  # ComfyUI 地址 + checkpoint 模型名
+    # 私有轨：ComfyUI 控制面板地址 + 工作流 ID（workflow API）；model 为旧版 checkpoint 兼容字段
+    "private": {"base_url": "", "workflow_id": "", "model": ""},
     "public": {
         "base_url": "https://www.rightapi.ai",
         "api_key": "",
@@ -280,6 +281,8 @@ async def api_imgconf_set(request):
         priv = conf["private"]
         if isinstance(priv_body.get("base_url"), str):
             priv["base_url"] = priv_body["base_url"].strip()
+        if isinstance(priv_body.get("workflow_id"), str):
+            priv["workflow_id"] = priv_body["workflow_id"].strip()
         if isinstance(priv_body.get("model"), str):
             priv["model"] = priv_body["model"].strip()
     with open(IMGCONF_PATH, "w", encoding="utf-8") as f:
@@ -829,7 +832,7 @@ async def api_qwen_meta(request):
 async def api_img_submit(request):
     """提交生图任务（双轨）：{model, prompt, n?, size?, imageSize?, image?: [dataURL], rail?: 'public'|'private'}
     rail 缺省 public（旧版前端副本零破坏）。public=中转变体协议（/draw 提交 + /v1/tasks 轮询）；
-    private=ComfyUI（标准 txt2img 工作流，task_id 前缀 comfy-）。"""
+    private=ComfyUI 工作流 API（/api/workflow/generate，task_id 前缀 wf-；旧 checkpoint 模式前缀 comfy-）。"""
     conf = load_imgconf()
     try:
         body = await request.json()
@@ -837,18 +840,24 @@ async def api_img_submit(request):
         return web.json_response({"error": "请求格式错误"}, status=400)
     model = (body.get("model") or "").strip()
     prompt = (body.get("prompt") or "").strip()
-    if not model or not prompt:
-        return web.json_response({"error": "缺少 model 或 prompt"}, status=400)
+    if not prompt:
+        return web.json_response({"error": "缺少 prompt"}, status=400)
     rail = body.get("rail") if body.get("rail") in ("public", "private") else "public"
     if rail == "private":
         return await _img_submit_comfy(conf, body, model, prompt)
+    if not model:
+        return web.json_response({"error": "缺少 model"}, status=400)
     pub = conf["public"]
     if not pub.get("api_key"):
         return web.json_response({"error": "未配置公共生图 API Key，请先在「⚙ 设置」填写"}, status=400)
     payload = {"model": model, "prompt": prompt, "async": True}
-    for k in ("n", "size", "imageSize"):
+    for k in ("n", "size"):
         if body.get(k):
             payload[k] = body[k]
+    # 中转要求请求体字段名全小写（驼峰 imageSize 会被 400 拒绝、不转发上游）：
+    # 前端仍传 imageSize，出站时改名为 image_size。
+    if body.get("imageSize"):
+        payload["image_size"] = body["imageSize"]
     imgs = body.get("image") or []
     if len(imgs) > int(conf.get("max_refs", 8)):
         return web.json_response({"error": f"参考图数量超过上限 {conf.get('max_refs')}"}, status=400)
@@ -873,6 +882,40 @@ async def api_img_submit(request):
     except Exception as e:
         log.exception("img submit error")
         return web.json_response({"error": str(e)}, status=500)
+
+
+# 工作流 API（ComfyUI 控制面板）：前端比例 → 面板 aspect_ratio 标签；清晰度档位 → 总像素（megapixels）
+_WORKFLOW_ASPECT_RATIOS = {
+    "1:1": "1:1 (Square)",
+    "2:3": "2:3 (Portrait Photo)",
+    "3:2": "3:2 (Photo)",
+    "3:4": "3:4 (Portrait Standard)",
+    "4:3": "4:3 (Standard)",
+    "9:16": "9:16 (Portrait Widescreen)",
+    "16:9": "16:9 (Widescreen)",
+    "21:9": "21:9 (Ultrawide)",
+}
+# 1K≈1280×720、2K≈2560×1440、4K≈3840×2160 的总像素；最终由前端裁切/缩放到精确预设
+_WORKFLOW_MEGAPIXELS = {"1K": 1, "2K": 4, "4K": 8}
+
+
+def _workflow_aspect_ratio(size):
+    """'16:9' → '16:9 (Widescreen)'；像素串/未知比例按宽高比就近匹配，兜底 1:1"""
+    s = str(size or "1:1").strip().lower().replace("：", ":")
+    if s in _WORKFLOW_ASPECT_RATIOS:
+        return _WORKFLOW_ASPECT_RATIOS[s]
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*[:x×]\s*(\d+(?:\.\d+)?)$", s)
+    if m:
+        w, h = max(float(m.group(1)), 0.01), max(float(m.group(2)), 0.01)
+        for key, label in _WORKFLOW_ASPECT_RATIOS.items():
+            kw, kh = (float(x) for x in key.split(":"))
+            if abs(w / h - kw / kh) < 0.02:
+                return label
+    return _WORKFLOW_ASPECT_RATIOS["1:1"]
+
+
+def _workflow_megapixels(image_size):
+    return _WORKFLOW_MEGAPIXELS.get(str(image_size or "1K").upper(), 1)
 
 
 def _comfy_size_px(size, image_size):
@@ -906,12 +949,62 @@ def _comfy_txt2img_workflow(model, prompt, w, h):
     }
 
 
+async def _img_submit_workflow(priv, body, prompt):
+    """私有轨（工作流 API）：POST {base}/api/workflow/generate → prompt_id，前端轮询任务 id = wf-{prompt_id}。
+    input_values 的键来自工作流参数面板（steps/prompt/negative_prompt/aspect_ratio/megapixels）。"""
+    base = (priv.get("base_url") or "").rstrip("/")
+    wid = (priv.get("workflow_id") or "").strip()
+    if not base or not wid:
+        return web.json_response({"error": "未配置私有生图工作流（面板地址 + 工作流 ID），请先在「⚙ 设置」选择"}, status=400)
+    if body.get("image"):
+        return web.json_response({"error": "私有轨（ComfyUI 工作流）暂不支持参考图"}, status=400)
+    try:
+        steps = int(body.get("steps") or 20)
+    except (TypeError, ValueError):
+        steps = 20
+    payload = {
+        "workflow_id": wid,
+        "client_id": "novels-studio",
+        "input_values": {
+            "steps": max(1, min(100, steps)),
+            "prompt": prompt,
+            "negative_prompt": str(body.get("negativePrompt") or ""),
+            "aspect_ratio": _workflow_aspect_ratio(body.get("size")),
+            "megapixels": _workflow_megapixels(body.get("imageSize")),
+        },
+    }
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{base}/api/workflow/generate", data=json.dumps(payload).encode(),
+                              headers={"Content-Type": "application/json"},
+                              timeout=aiohttp.ClientTimeout(total=60)) as r:
+                text = await r.text()
+                if r.status != 200:
+                    log.warning(f"workflow submit HTTP {r.status}: {text[:300]}")
+                    return web.json_response({"error": f"ComfyUI 工作流 HTTP {r.status}: {text[:300]}"}, status=502)
+                data = json.loads(text)
+        if data.get("success") is False:
+            return web.json_response({"error": f"工作流提交失败: {data.get('error') or text[:300]}"}, status=502)
+        pid = data.get("prompt_id")
+        if not pid:
+            return web.json_response({"error": f"工作流未返回 prompt_id: {text[:300]}"}, status=502)
+        return web.json_response({"task_id": f"wf-{pid}"})
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "提交 ComfyUI 工作流超时"}, status=504)
+    except Exception as e:
+        log.exception("img workflow submit error")
+        return web.json_response({"error": str(e)}, status=500)
+
+
 async def _img_submit_comfy(conf, body, model, prompt):
-    """私有轨：ComfyUI POST {base}/prompt（API 格式工作流）→ prompt_id，前端轮询任务 id = comfy-{prompt_id}"""
+    """私有轨提交：配置了 workflow_id → 工作流 API；否则回落旧版原生 ComfyUI /prompt（兼容旧配置）。
+    旧版返回任务 id = comfy-{prompt_id}。"""
     priv = conf.get("private") or {}
+    if (priv.get("workflow_id") or "").strip():
+        return await _img_submit_workflow(priv, body, prompt)
     base = (priv.get("base_url") or "").rstrip("/")
     if not base or not model:
-        return web.json_response({"error": "未配置私有生图（ComfyUI）地址或模型，请先在「⚙ 设置」填写"}, status=400)
+        return web.json_response({"error": "未配置私有生图工作流（面板地址 + 工作流 ID），请先在「⚙ 设置」选择"}, status=400)
     if body.get("image"):
         return web.json_response({"error": "私有轨（ComfyUI）暂不支持参考图"}, status=400)
     w, h = _comfy_size_px(body.get("size"), body.get("imageSize"))
@@ -950,12 +1043,14 @@ def _extract_image_urls(data):
 
 async def api_img_task(request):
     """轮询任务；completed 时把结果图下载落盘，换成 /api/img/file/ 本地 URL（防 CDN 过期）。
-    comfy- 前缀任务走 ComfyUI /history 轮询 + /view 下载；其余走中转 /v1/tasks/{id}。"""
+    wf- 前缀走工作流面板 /api/workflow/result；comfy- 前缀走原生 ComfyUI /history + /view；其余走中转 /v1/tasks/{id}。"""
     tid = request.match_info["task_id"]
     conf = load_imgconf()
     cached = img_task_files.get(tid)
     if cached:
         return web.json_response({"status": "completed", "images": [f"/api/img/file/{f}" for f in cached]})
+    if tid.startswith("wf-"):
+        return await _img_task_workflow(conf, tid)
     if tid.startswith("comfy-"):
         return await _img_task_comfy(conf, tid)
     pub = conf["public"]
@@ -996,6 +1091,72 @@ async def api_img_task(request):
         return web.json_response({"status": status or "in_progress", "progress": data.get("progress", 0)})
     except Exception as e:
         log.exception("img task poll error")
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def _img_task_workflow(conf, tid):
+    """私有轨（工作流 API）轮询：GET {base}/api/workflow/result?prompt_id=…
+    pending=true = 仍在执行；pending=false 时从 results[] 取图片 URL 下载落盘。"""
+    pid = tid[len("wf-"):]
+    base = ((conf.get("private") or {}).get("base_url") or "").rstrip("/")
+    if not base:
+        return web.json_response({"error": "未配置私有生图工作流地址"}, status=400)
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{base}/api/workflow/result", params={"prompt_id": pid},
+                            timeout=aiohttp.ClientTimeout(total=30)) as r:
+                text = await r.text()
+                if r.status != 200:
+                    return web.json_response({"error": f"ComfyUI 工作流 HTTP {r.status}: {text[:200]}"}, status=502)
+                data = json.loads(text)
+            if data.get("success") is False or data.get("error"):
+                return web.json_response({"status": "failed",
+                                          "error": str(data.get("error") or "ComfyUI 工作流执行出错")})
+            pending = data.get("pending")
+            if pending is None:  # 兼容不带 pending 的旧响应：有 results 即视为完成
+                pending = not bool(data.get("results"))
+            if pending:
+                return web.json_response({"status": "in_progress"})
+            imgs = [it for it in (data.get("results") or [])
+                    if isinstance(it, dict) and it.get("type") == "image"
+                    and (it.get("url") or it.get("filename") or (isinstance(it.get("raw"), dict) and it["raw"].get("filename")))]
+            files = []
+            safe = re.sub(r"[^A-Za-z0-9]", "", tid)[-16:]
+            for i, im in enumerate(imgs):
+                fn = f"img_wf_{safe}_{i}.png"
+                fp = os.path.join(IMG_DIR, fn)
+                if not os.path.isfile(fp):
+                    raw = im.get("raw") if isinstance(im.get("raw"), dict) else {}
+                    src = str(im.get("url") or "")
+                    try:
+                        if src.startswith("/"):
+                            src = base + src
+                        if src.startswith("http"):
+                            async with s.get(src, timeout=aiohttp.ClientTimeout(total=120)) as r2:
+                                blob = await r2.read() if r2.status == 200 else b""
+                        else:
+                            fname = im.get("filename") or raw.get("filename")
+                            if not fname:
+                                continue
+                            async with s.get(f"{base}/view", params={
+                                    "filename": fname,
+                                    "subfolder": raw.get("subfolder", ""),
+                                    "type": raw.get("type", "output")},
+                                    timeout=aiohttp.ClientTimeout(total=120)) as r2:
+                                blob = await r2.read() if r2.status == 200 else b""
+                        if blob:
+                            with open(fp, "wb") as f:
+                                f.write(blob)
+                    except Exception as e:
+                        log.warning(f"workflow image download failed: {type(e).__name__}: {e}")
+                if os.path.isfile(fp):
+                    files.append(fn)
+        if files:
+            img_task_files[tid] = files
+            return web.json_response({"status": "completed", "images": [f"/api/img/file/{f}" for f in files]})
+        return web.json_response({"status": "failed", "error": "工作流完成但未取得图片"})
+    except Exception as e:
+        log.exception("img workflow task error")
         return web.json_response({"error": str(e)}, status=500)
 
 
@@ -1045,7 +1206,8 @@ async def _img_task_comfy(conf, tid):
 
 
 async def api_img_models(request):
-    """拉生图上游模型列表：rail=private → ComfyUI checkpoint 列表（object_info）；public（默认）→ 中转 /draw/v1/models"""
+    """拉生图上游列表：rail=private → ComfyUI 控制面板已保存的工作流列表（/api/workflow/list）；
+    public（默认）→ 中转 /draw/v1/models。返回 models 为 ID 数组，private 另附 workflows 元数据。"""
     rail = request.query.get("rail") if request.query.get("rail") in ("public", "private") else "public"
     conf = load_imgconf()
     try:
@@ -1053,15 +1215,21 @@ async def api_img_models(request):
             if rail == "private":
                 base = ((conf.get("private") or {}).get("base_url") or "").rstrip("/")
                 if not base:
-                    return web.json_response({"error": "未配置私有生图（ComfyUI）地址"}, status=400)
-                async with s.get(f"{base}/object_info/CheckpointLoaderSimple",
-                                 timeout=aiohttp.ClientTimeout(total=15)) as upstream:
+                    return web.json_response({"error": "未配置私有生图（ComfyUI 面板）地址"}, status=400)
+                async with s.get(f"{base}/api/workflow/list",
+                                 timeout=aiohttp.ClientTimeout(total=20)) as upstream:
                     text = await upstream.text()
                     if upstream.status != 200:
-                        return web.json_response({"error": f"ComfyUI HTTP {upstream.status}: {text[:200]}"}, status=502)
+                        return web.json_response({"error": f"工作流面板 HTTP {upstream.status}: {text[:200]}"}, status=502)
                     data = json.loads(text)
-                names = ((data.get("CheckpointLoaderSimple") or {}).get("input") or {}).get("required", {}).get("ckpt_name")
-                ids = [str(m) for m in (names[0] if isinstance(names, list) and names and isinstance(names[0], list) else [])]
+                if data.get("success") is False:
+                    return web.json_response({"error": f"工作流面板返回错误: {data.get('error') or text[:200]}"}, status=502)
+                flows = [w for w in (data.get("workflows") or []) if isinstance(w, dict)]
+                ids = [str(w.get("id")) for w in flows if w.get("id")]
+                return web.json_response({
+                    "models": ids,
+                    "workflows": [{"id": w.get("id"), "name": w.get("name"), "kind": w.get("kind")} for w in flows],
+                })
             else:
                 pub = conf["public"]
                 if not pub.get("api_key"):

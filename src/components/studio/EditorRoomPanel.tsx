@@ -26,8 +26,7 @@ import { genImage, type EditorRoomBlock, type EditorStateBlock, type Responsible
 import { activeCharacterState, characterStateIndex, DEFAULT_STATE_ID } from '../../stores/characterStates';
 import { referenceChapterText, stateReferenceSummary } from '../../stores/snapshotRefs';
 import { SimWriteButtons } from './SimWriteButtons';
-import { pickRandomCharAsset } from '../../services/charAssetApi';
-import { localImgDel, localImgGet, localImgSaveFromUrl } from '../../services/localImages';
+import { localImgGet, localImgSaveFromUrl } from '../../services/localImages';
 import {
   CHAT_ATTACHMENT_MAX,
   compressChatImage,
@@ -403,7 +402,7 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
     if (b.kind === 'character') {
       const gender = b.gender ?? 'male';
       st.updateCharacterOnBoard(board.id, id, { name: b.name, gender });
-      // 新建人物固定先写默认状态「状态0」；显式 stateId，异步形象也不会写进用户后来切到的状态
+      // 新建人物固定先写默认状态「状态0」；新人物没有形象，画布显示性别剪影
       st.updateCharacterStateOnBoard(
         board.id,
         id,
@@ -415,11 +414,6 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
         },
         DEFAULT_STATE_ID,
       );
-      void pickRandomCharAsset(gender === 'female' ? '女' : '男', b.age)
-        .then((avatar) => {
-          if (avatar) useStudioStore.getState().updateCharacterStateOnBoard(board.id, id, { avatar }, DEFAULT_STATE_ID);
-        })
-        .catch(() => undefined);
     } else st.updateEnvironmentOnBoard(board.id, id, { name: b.name, desc: b.desc ?? '', etype: b.etype ?? 'building' });
     if (parentNode) {
       st.reparentNodeOnBoard(board.id, id, parentNode.id);
@@ -626,18 +620,10 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
         setDoneMsg(`⚠ 状态「${target.label}」是默认状态（首项），不可删除`);
         return;
       }
-      if (!window.confirm(`删除人物「${d.name || '未命名'}」的状态「${target.label}」？该状态属性与写真引用会一并移除。${impactText}`)) return;
+      if (!window.confirm(`删除人物「${d.name || '未命名'}」的状态「${target.label}」？该状态属性与形象引用会一并移除。${impactText}`)) return;
+      // 图片字节的清理由 store 统一按全画布引用计数回收
       const r = st.deleteCharacterStateOnBoard(board.id, node.id, target.id);
       ok = r.ok;
-      if (ok) {
-        const removedKey = r.ok ? r.removed?.portraitKey : undefined;
-        if (removedKey) {
-          const still = Object.values(useStudioStore.getState().boards).some((bd) =>
-            bd.nodes.some((n) => n.data.kind === 'character' && n.data.states.some((s) => s.portraitKey === removedKey)),
-          );
-          if (!still) void localImgDel(removedKey).catch(() => {});
-        }
-      }
       msg = ok
         ? `✓ 已删除人物「${d.name || '未命名'}」状态「${target.label}」`
         : `⚠ 未删除状态：${opErr(r)}`;
@@ -894,7 +880,7 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
               : b.action === 'delete'
                 ? '删除该非默认状态（会先确认；默认状态与最后一个状态不可删）'
                 : b.action === 'create'
-                  ? `复制「${b.baseState || current?.label || '当前状态'}」的全部属性与写真引用，创建后设为当前状态`
+                  ? `复制「${b.baseState || current?.label || '当前状态'}」的全部属性与形象/头像引用，创建后设为当前状态`
                   : b.action === 'rename'
                     ? '只改状态标签，状态 ID 与属性不变'
                     : b.action === 'switch'

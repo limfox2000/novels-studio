@@ -65,13 +65,16 @@ import {
 import {
   STATE_LABEL_CAP,
   activeCharacterState,
+  collectStateImageKeys,
   initialCharacterData,
   newStateId,
   nextStateLabel,
   sanitizeCharacterData,
+  sanitizeCharacterImage,
   sanitizeStateAge,
   stateLabelTaken,
 } from './characterStates';
+import { releaseCharacterImageKeys } from '../services/characterImages';
 import {
   applyChapterScene as applyChapterScenePure,
   captureChapterSnapshot as captureSnapshotPure,
@@ -1385,7 +1388,8 @@ export const useStudioStore = create<SimState>()(
         const label = (rawLabel?.trim() || nextStateLabel(d.states)).slice(0, STATE_LABEL_CAP);
         if (stateLabelTaken(d.states, label)) return { ok: false, error: 'duplicate-label' };
         const stateId = newStateId();
-        // 复制基准状态的全部属性（含形象/写真引用），再覆盖块中明确写出的字段
+        // 复制基准状态的全部属性（含形象/头像引用），再覆盖块中明确写出的字段；
+        // image.key 带 nonce，后续换图/重裁会写新 key，不会覆盖或影响基准状态
         const next: CharacterState = {
           ...base,
           ...(opts?.patch ?? {}),
@@ -1428,12 +1432,11 @@ export const useStudioStore = create<SimState>()(
           if (age === undefined) delete next.age;
           else next.age = age;
         }
-        if ('portraitKey' in patch) {
-          const key = patch.portraitKey?.trim();
-          if (key) next.portraitKey = key;
-          else delete next.portraitKey;
+        if ('image' in patch) {
+          const image = sanitizeCharacterImage(patch.image);
+          if (image) next.image = image;
+          else delete next.image;
         }
-        if ('avatar' in patch && !patch.avatar?.trim()) delete next.avatar;
         if ('relations' in patch && !patch.relations?.trim()) delete next.relations;
         set(
           setBoardNodes(
@@ -1452,6 +1455,10 @@ export const useStudioStore = create<SimState>()(
             ),
           ),
         );
+        // 旧图/旧头像若已不再被任何画布状态引用，才真正删库（跨卷镜像/其它状态共享时保留）
+        const kept = new Set(collectStateImageKeys(next));
+        const released = collectStateImageKeys(target).filter((k) => !kept.has(k));
+        if (released.length) void releaseCharacterImageKeys(released, get().boards);
         return { ok: true, stateId: targetId };
       },
 
@@ -1537,6 +1544,7 @@ export const useStudioStore = create<SimState>()(
             ),
           ),
         );
+        void releaseCharacterImageKeys(collectStateImageKeys(removed), get().boards);
         return { ok: true, removed };
       },
 
@@ -1603,6 +1611,9 @@ export const useStudioStore = create<SimState>()(
         const s = get();
         const b = s.boards[s.activeBoardId];
         if (!b || !b.nodes.some((n) => n.id === id)) return;
+        const removedNode = b.nodes.find((n) => n.id === id);
+        const removedImageKeys =
+          removedNode?.data.kind === 'character' ? removedNode.data.states.flatMap(collectStateImageKeys) : [];
         // 后代提升回根：按删除前的父链换算绝对坐标（ towns 删掉不该连房子一起没）
         const byId = new Map(b.nodes.map((n) => [n.id, n]));
         const lifted = new Map(
@@ -1618,6 +1629,7 @@ export const useStudioStore = create<SimState>()(
             b.edges.filter((e) => e.source !== id && e.target !== id),
           ),
         );
+        if (removedImageKeys.length) void releaseCharacterImageKeys(removedImageKeys, get().boards);
       },
 
       copyNodesToBoard: (opts) => {

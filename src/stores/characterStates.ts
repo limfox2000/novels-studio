@@ -1,13 +1,22 @@
-/** 🧬 人物状态纯逻辑（v2.30）：迁移/解析/写真 key。
+/** 🧬 人物状态纯逻辑（v2.31）：迁移/解析/人物形象 key。
  *  不依赖 store，persist 恢复、存档载入、跨卷复制后的 sanitize 与 UI/引擎共用。
  *
  *  数据约定：
  *  - 人名/性别在 CharacterData 顶层，跨状态稳定；
- *  - 其余属性（年龄/形象/基础信息/身份信息/关系信息/写真引用）属于 CharacterState；
+ *  - 其余属性（年龄/基础信息/身份信息/关系信息/人物形象）属于 CharacterState；
  *  - states 至少一项，首项=默认状态「状态0」；activeStateId 决定当前显示/编辑/生成用哪个状态。
- *  - 旧版平铺字段只在「没有可用 states」时迁入状态0；已有 states 时绝不覆盖（避免把用户改过的状态0重置）。 */
+ *  - 旧版平铺字段只在「没有可用 states」时迁入状态0；已有 states 时绝不覆盖（避免把用户改过的状态0重置）。
+ *  - v2.31 起旧 avatar / portraitKey 不再迁移：形象改为每状态独立的大图 + 手动裁切头像。 */
 import { uid } from '../utils/id';
-import { genderOf, type CharacterData, type CharacterState } from '../types/sim';
+import {
+  CHARACTER_IMAGE_PRESETS,
+  genderOf,
+  type CharacterData,
+  type CharacterImageCrop,
+  type CharacterImagePreset,
+  type CharacterState,
+  type CharacterStateImage,
+} from '../types/sim';
 
 export const DEFAULT_STATE_ID = 'state0';
 export const DEFAULT_STATE_LABEL = '状态0';
@@ -23,14 +32,36 @@ export function sanitizeStateAge(v: unknown): number | undefined {
   return Math.max(0, Math.min(999, Math.round(v)));
 }
 
-/** 状态的规范写真 key：portrait:<nodeId>:<stateId> */
-export function portraitKeyForState(nodeId: string, stateId: string): string {
-  return `portrait:${nodeId}:${stateId}`;
+const IMAGE_KEY_CAP = 200;
+
+/** 新大图 key：带 nonce，换图/重裁总是写新 key，继承同一张图的其它状态不会被原地覆盖 */
+export function newCharacterImageKey(nodeId: string, stateId: string): string {
+  return `charimg:${nodeId}:${stateId}:${uid()}`;
 }
 
-/** 旧版写真 key：portrait:<nodeId>（迁移后只给状态0 引用，不搬字节） */
-export function legacyPortraitKey(nodeId: string): string {
-  return `portrait:${nodeId}`;
+/** 新头像 key：headKey 业务同上 */
+export function newCharacterHeadKey(nodeId: string, stateId: string): string {
+  return `charhead:${nodeId}:${stateId}:${uid()}`;
+}
+
+function validImageKey(v: unknown, prefix: 'charimg:' | 'charhead:'): v is string {
+  const key = typeof v === 'string' ? v.trim() : '';
+  return key.startsWith(prefix) && key.length <= IMAGE_KEY_CAP;
+}
+
+export function isCharacterImageKey(v: unknown): v is string {
+  return validImageKey(v, 'charimg:');
+}
+
+export function isCharacterHeadKey(v: unknown): v is string {
+  return validImageKey(v, 'charhead:');
+}
+
+/** 一个状态引用的大图/头像 key（用于引用计数与清理） */
+export function collectStateImageKeys(state: CharacterState): string[] {
+  const image = state.image;
+  if (!image) return [];
+  return [image.key, image.headKey].filter((k): k is string => !!k);
 }
 
 /** 当前状态；activeStateId 非法时回落首项（sanitize 后必有一项） */
@@ -94,14 +125,41 @@ function uniqueId(raw: unknown, used: Set<string>, index: number): string {
   return id;
 }
 
-/** 写真引用兜底：只收 portrait: 前缀；损坏值当作无图 */
-function sanitizePortraitKey(v: unknown): string | undefined {
-  const key = pickStr(v).trim();
-  return key.startsWith('portrait:') ? key : undefined;
+function intIn(v: unknown, min: number, max: number): number | undefined {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return undefined;
+  const n = Math.round(v);
+  return n >= min && n <= max ? n : undefined;
 }
 
-/** 旧版平铺人物 → 状态0（仅在没有可用 states 时调用） */
-function legacyState(raw: Record<string, unknown>, nodeId: string): CharacterState {
+/** 人物形象兜底：只接受轻量元数据 + 合法 IDB key；损坏值当作无图 */
+export function sanitizeCharacterImage(v: unknown): CharacterStateImage | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const raw = v as Record<string, unknown>;
+  const key = pickStr(raw.key).trim();
+  if (!isCharacterImageKey(key)) return undefined;
+  const width = intIn(raw.width, 1, 20000);
+  const height = intIn(raw.height, 1, 20000);
+  if (!width || !height) return undefined;
+  const preset: CharacterImagePreset | 'original' = (CHARACTER_IMAGE_PRESETS as readonly unknown[]).includes(raw.preset)
+    ? (raw.preset as CharacterImagePreset)
+    : 'original';
+  const headKey = isCharacterHeadKey(raw.headKey) ? raw.headKey.trim() : undefined;
+  let crop: CharacterImageCrop | undefined;
+  if (headKey && raw.crop && typeof raw.crop === 'object') {
+    const c = raw.crop as Record<string, unknown>;
+    const maxSize = Math.min(width, height);
+    const size = intIn(c.size, 1, maxSize);
+    if (size) {
+      const x = Math.max(0, Math.min(width - size, intIn(c.x, -width, width) ?? 0));
+      const y = Math.max(0, Math.min(height - size, intIn(c.y, -height, height) ?? 0));
+      crop = { x, y, size };
+    }
+  }
+  return { key, width, height, preset, ...(headKey ? { headKey } : {}), ...(crop ? { crop } : {}) };
+}
+
+/** 旧版平铺人物 → 状态0（仅在没有可用 states 时调用）；旧形象/写真不迁移 */
+function legacyState(raw: Record<string, unknown>): CharacterState {
   return {
     id: DEFAULT_STATE_ID,
     label: DEFAULT_STATE_LABEL,
@@ -109,14 +167,12 @@ function legacyState(raw: Record<string, unknown>, nodeId: string): CharacterSta
     basicInfo: pickStr(raw.basicInfo) || pickStr(raw.desc),
     identityInfo: pickStr(raw.identityInfo),
     ...(pickStr(raw.relations).trim() ? { relations: pickStr(raw.relations) } : {}),
-    ...(pickStr(raw.avatar).trim() ? { avatar: pickStr(raw.avatar) } : {}),
-    portraitKey: legacyPortraitKey(nodeId),
   };
 }
 
 /** 人物数据兜底（persist / 存档 / 复制共用）：
  *  - 有合法 states：逐项清洗，缺失/重复 ID 与标签确定性修复；
- *  - 无合法 states：旧平铺字段迁入状态0，旧写真 key 挂到状态0；
+ *  - 无合法 states：旧平铺字段迁入状态0；旧 avatar / 写真一律丢弃；
  *  - activeStateId 非法回落首项；名字/性别始终重建。 */
 export function sanitizeCharacterData(raw: Record<string, unknown>, nodeId: string): CharacterData {
   const name = pickStr(raw.name);
@@ -124,7 +180,7 @@ export function sanitizeCharacterData(raw: Record<string, unknown>, nodeId: stri
   const rawStates = Array.isArray(raw.states) ? raw.states : [];
   const entries = rawStates.filter((x): x is Record<string, unknown> => !!x && typeof x === 'object');
   if (!entries.length) {
-    const state = legacyState(raw, nodeId);
+    const state = legacyState(raw);
     return { kind: 'character', name, gender, states: [state], activeStateId: state.id };
   }
 
@@ -133,7 +189,7 @@ export function sanitizeCharacterData(raw: Record<string, unknown>, nodeId: stri
   const states: CharacterState[] = entries.map((s, i) => {
     const age = sanitizeStateAge(s.age);
     const relations = pickStr(s.relations);
-    const avatar = pickStr(s.avatar).trim();
+    const image = sanitizeCharacterImage(s.image);
     return {
       id: uniqueId(s.id, usedIds, i),
       label: uniqueLabel(s.label, usedLabels, i),
@@ -141,8 +197,7 @@ export function sanitizeCharacterData(raw: Record<string, unknown>, nodeId: stri
       basicInfo: pickStr(s.basicInfo),
       identityInfo: pickStr(s.identityInfo),
       ...(relations.trim() ? { relations } : {}),
-      ...(avatar ? { avatar } : {}),
-      ...(sanitizePortraitKey(s.portraitKey) ? { portraitKey: sanitizePortraitKey(s.portraitKey) } : {}),
+      ...(image ? { image } : {}),
     };
   });
   const wanted = pickStr(raw.activeStateId).trim();
@@ -150,8 +205,8 @@ export function sanitizeCharacterData(raw: Record<string, unknown>, nodeId: stri
   return { kind: 'character', name, gender, states, activeStateId };
 }
 
-/** 🆕 新人物种子：空状态0（写真引用先指向规范 key，实际无图也安全） */
-export function initialCharacterData(nodeId: string): CharacterData {
+/** 🆕 新人物种子：空状态0；没有任何图片，画布显示性别剪影 */
+export function initialCharacterData(_nodeId: string): CharacterData {
   const stateId = DEFAULT_STATE_ID;
   return {
     kind: 'character',
@@ -163,7 +218,6 @@ export function initialCharacterData(nodeId: string): CharacterData {
         label: DEFAULT_STATE_LABEL,
         basicInfo: '',
         identityInfo: '',
-        portraitKey: portraitKeyForState(nodeId, stateId),
       },
     ],
     activeStateId: stateId,

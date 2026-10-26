@@ -98,7 +98,7 @@ export function ModelCenterPanel({ onClose }: { onClose: () => void }) {
   const [imgLoadErr, setImgLoadErr] = useState('');
   const [imgKey, setImgKey] = useState('');
   const [imgPubModels, setImgPubModels] = useState<string[]>([]);
-  const [imgPrivModels, setImgPrivModels] = useState<string[]>([]);
+  const [imgPrivWorkflows, setImgPrivWorkflows] = useState<string[]>([]);
   const [imgMsg, setImgMsg] = useState('');
   const [imgBusy, setImgBusy] = useState(false);
   const [imgProbe, setImgProbe] = useState<{ status: 'testing' | 'ok' | 'failed'; url?: string; error?: string } | null>(null);
@@ -319,28 +319,28 @@ export function ModelCenterPanel({ onClose }: { onClose: () => void }) {
     }
   };
 
-  // 🏠 私生图「检查模型」：保存当前表单 → 拉 ComfyUI checkpoint 列表
+  // 🏠 私生图「刷新工作流」：保存当前表单 → 拉 ComfyUI 控制面板已保存的工作流列表
   const checkImgPriv = async () => {
     if (!img || imgBusy) return;
     setImgBusy(true);
     setImgMsg('检查中…');
     try {
       if (!(await saveImg(true))) return;
-      const models = await imgRelayModels('private');
+      const workflows = await imgRelayModels('private');
       if (closedRef.current) return;
-      if (!models.length) {
-        setImgMsg('⚠ ComfyUI 未返回 checkpoint 列表，请手动填写模型名');
+      if (!workflows.length) {
+        setImgMsg('⚠ 工作流面板未返回工作流，请确认地址，或手动填写工作流 ID');
         return;
       }
-      setImgPrivModels(models);
+      setImgPrivWorkflows(workflows);
       setImg((cur) =>
-        cur && (!cur.private?.model || !models.includes(cur.private.model))
-          ? { ...cur, private: { ...cur.private, model: models[0] } }
+        cur && (!cur.private?.workflow_id || !workflows.includes(cur.private.workflow_id))
+          ? { ...cur, private: { ...cur.private, workflow_id: workflows[0] } }
           : cur,
       );
-      setImgMsg(`✓ 拉取 ${models.length} 个 checkpoint`);
+      setImgMsg(`✓ 拉取 ${workflows.length} 个工作流`);
     } catch (e) {
-      if (!closedRef.current) setImgMsg('⚠ ' + (e as Error).message + '——请检查 ComfyUI 地址，或手动填写模型名');
+      if (!closedRef.current) setImgMsg('⚠ ' + (e as Error).message + '——请检查 ComfyUI 面板地址，或手动填写工作流 ID');
     } finally {
       if (!closedRef.current) setImgBusy(false);
     }
@@ -353,7 +353,8 @@ export function ModelCenterPanel({ onClose }: { onClose: () => void }) {
     setImgMsg('');
     setImgProbe({ status: 'testing' });
     const rail = img.default === 'private' ? ('private' as const) : ('public' as const);
-    const model = rail === 'private' ? img.private?.model || '' : img.public?.model_list?.[0] || 'gpt-image-2.5';
+    const model = rail === 'private' ? '' : img.public?.model_list?.[0] || 'gpt-image-2.5';
+    const label = rail === 'private' ? img.private?.workflow_id || '工作流' : model;
     try {
       const taskId = await imgSubmit({ model, prompt: 'a red circle on white background, flat style', size: '1:1', imageSize: '1K', rail });
       for (let k = 0; k < 60; k++) {
@@ -363,7 +364,7 @@ export function ModelCenterPanel({ onClose }: { onClose: () => void }) {
         if (closedRef.current) return;
         if (t.status === 'completed' && t.images?.length) {
           setImgProbe({ status: 'ok', url: t.images[0] });
-          setImgMsg(`✓ 链路可用（${model}）`);
+          setImgMsg(`✓ 链路可用（${label}）`);
           return;
         }
         if (t.status === 'failed') {
@@ -669,8 +670,8 @@ export function ModelCenterPanel({ onClose }: { onClose: () => void }) {
                 </div>
               </Card>
 
-              <Card icon={<House />} title="私有生图（ComfyUI）" subtitle="本地/自建，不支持参考图">
-                <Field label="ComfyUI 地址">
+              <Card icon={<House />} title="私有生图（ComfyUI 工作流）" subtitle="工作流 API 出图，不支持参考图">
+                <Field label="ComfyUI 面板地址" hint="填控制面板根地址（工作流 API）">
                   <Input
                     value={img.private?.base_url ?? ''}
                     onChange={(e) => setImg({ ...img, private: { ...img.private, base_url: e.target.value } })}
@@ -678,32 +679,32 @@ export function ModelCenterPanel({ onClose }: { onClose: () => void }) {
                   />
                 </Field>
                 <div className="flex items-end gap-2">
-                  <Field label="Checkpoint" className="min-w-0 flex-1">
-                    {imgPrivModels.length > 0 ? (
+                  <Field label="工作流" className="min-w-0 flex-1">
+                    {imgPrivWorkflows.length > 0 ? (
                       <Select
-                        value={img.private?.model ?? ''}
-                        onChange={(e) => setImg({ ...img, private: { ...img.private, model: e.target.value } })}
+                        value={img.private?.workflow_id ?? ''}
+                        onChange={(e) => setImg({ ...img, private: { ...img.private, workflow_id: e.target.value } })}
                       >
-                        {!img.private?.model && <option value="">请选择 checkpoint</option>}
-                        {imgPrivModels.map((m) => (
-                          <option key={m} value={m}>
-                            {m}
+                        {!img.private?.workflow_id && <option value="">请选择工作流</option>}
+                        {imgPrivWorkflows.map((w) => (
+                          <option key={w} value={w}>
+                            {w}
                           </option>
                         ))}
-                        {img.private?.model && !imgPrivModels.includes(img.private.model) && (
-                          <option value={img.private.model}>{img.private.model}（当前配置）</option>
+                        {img.private?.workflow_id && !imgPrivWorkflows.includes(img.private.workflow_id) && (
+                          <option value={img.private.workflow_id}>{img.private.workflow_id}（当前配置）</option>
                         )}
                       </Select>
                     ) : (
                       <Input
-                        value={img.private?.model ?? ''}
-                        onChange={(e) => setImg({ ...img, private: { ...img.private, model: e.target.value } })}
-                        placeholder="可点「检查模型」拉取"
+                        value={img.private?.workflow_id ?? ''}
+                        onChange={(e) => setImg({ ...img, private: { ...img.private, workflow_id: e.target.value } })}
+                        placeholder="可点「刷新工作流」拉取"
                       />
                     )}
                   </Field>
                   <Button size="sm" onClick={() => void checkImgPriv()} disabled={imgBusy}>
-                    检查模型
+                    刷新工作流
                   </Button>
                 </div>
               </Card>

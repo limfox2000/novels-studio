@@ -1,54 +1,45 @@
 /** 创作台属性面板（左侧停靠，可关闭）：选中单个节点时在此编辑其属性——
- *  🧑 人物 = 人名 + 性别（基础属性：男/女，决定节点配色）+ 形象（v2.21，服务器人物素材库）+ 年龄（v2.20）
- *  + 基础信息（v2.27：长相/身材/习惯穿搭/性格）+ 身份信息（v2.27：职业/身份/与故事相关的特殊设计）
- *  + 关系信息（v2.20，人物间关系，编辑室可填充）；🏗 环境 = 名称 + 类型 + 描述。
+ *  🧑 人物 = 人名 + 性别（基础属性：男/女，决定节点配色）+ 状态（年龄/基础信息/身份信息/关系信息/人物形象）
+ *  + 人物形象（v2.31：每状态一张大图，从大图手动裁出圆形头像）；🏗 环境 = 名称 + 类型 + 描述。
  *  节点面上只展示不输入（v2.3 用户拍板）。
  *  v2.4：面板放左侧、✕ 可关闭、点击节点**不自动弹出**——由顶栏「⚙ 属性」开关；已打开时点节点即切换显示。
  *  v2.28：未选中任何节点时显示「本书属性」（书名/封面/概览）——封面上传后存进作品状态，书架上显示；多选仍只提示。
  *  RF 外受控输入没问题（约定 7）。 */
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { BookOpen, Image as ImageIcon, Landmark, Layers, Mars, Pencil, Plus, SlidersHorizontal, Trash2, Upload, UserRound, Venus, X } from 'lucide-react';
+import { BookOpen, Crop, Image as ImageIcon, Landmark, Layers, Mars, Pencil, Plus, SlidersHorizontal, Sparkles, Trash2, Upload, UserRound, Venus, X } from 'lucide-react';
 import { useStudioStore, useActiveNodes, type CharacterStateError } from '../../stores/studioStore';
 import {
+  CHARACTER_IMAGE_PRESET_DIMS,
+  CHARACTER_IMAGE_PRESETS,
   genderOf,
   ENV_TYPE_LABELS,
   type CharacterData,
   type CharacterGender,
+  type CharacterImagePreset,
   type CharacterState,
+  type CharacterStateImage,
   type EnvironmentType,
   type SimNodeType,
 } from '../../types/sim';
-import {
-  activeCharacterState,
-  characterStateIndex,
-  nextStateLabel,
-  portraitKeyForState,
-} from '../../stores/characterStates';
+import { activeCharacterState, characterStateIndex, nextStateLabel } from '../../stores/characterStates';
 import { GENDER_STYLE } from './SimNodes';
+import { CharacterAvatar } from './CharacterAvatar';
+import { CharacterCropDialog } from './CharacterCropDialog';
 import { referenceChapterText, stateReferenceSummary, type StateReferenceSummary } from '../../stores/snapshotRefs';
 import {
-  CHARASSET_NAME_RE,
-  DEFAULT_CHARASSET,
-  charAssetUrl,
-  charStageOf,
-  deleteCharAsset,
-  listCharAssets,
-  uploadCharAsset,
-  type CharAsset,
-  type CharAssetGender,
-  type CharAssetStage,
-} from '../../services/charAssetApi';
-import { fileToDataUrl } from '../../services/imgApi';
+  prepareCharacterImageFile,
+  prepareCharacterImageUrl,
+  saveFullImage,
+} from '../../services/characterImages';
 import { bookHue, makeBookCover } from '../../services/bookCover';
-import { localImgDel, localImgGet, localImgSaveFromUrl } from '../../services/localImages';
+import { localImgGet } from '../../services/localImages';
 
-import { genCharacterPortrait } from '../../engines/studioEngine';
+import { genCharacterImage } from '../../engines/studioEngine';
 import { useEditorRoomStore } from '../../stores/editorRoomStore';
 import { Button } from '../ui/Button';
 import { IconButton } from '../ui/IconButton';
 import { Field, Input, Select, Textarea } from '../ui/Field';
-import { Dialog } from '../ui/Dialog';
 
 export function SimInspector({ open, onClose }: { open: boolean; onClose: () => void }) {
   const nodes = useActiveNodes();
@@ -115,34 +106,23 @@ export function SimInspector({ open, onClose }: { open: boolean; onClose: () => 
           </div>
         </div>
         <CharacterStateBar nodeId={id} data={d} boardId={activeBoardId} />
-        <div className="mt-2 flex items-start gap-3">
-          <div className="min-w-0 flex-1">
-            <Label>年龄</Label>
-            <Input
-              type="number"
-              min={0}
-              max={999}
-              value={typeof state.age === 'number' && Number.isFinite(state.age) ? state.age : ''}
-              onChange={(e) => {
-                const v = e.target.value.trim();
-                const n = Math.round(Number(v));
-                st.updateActiveCharacterState(id, {
-                  age: v === '' || !Number.isFinite(n) ? undefined : Math.max(0, Math.min(999, n)),
-                });
-              }}
-              placeholder="岁"
-            />
-          </div>
-          <div className="shrink-0">
-            <Label>形象</Label>
-            <CharAvatarPicker
-              value={state.avatar}
-              gender={genderOf(d.gender) === 'female' ? '女' : '男'}
-              stage={charStageOf(state.age)}
-              onChange={(v) => st.updateActiveCharacterState(id, { avatar: v })}
-            />
-          </div>
-        </div>
+        <Field label="年龄">
+          <Input
+            type="number"
+            min={0}
+            max={999}
+            value={typeof state.age === 'number' && Number.isFinite(state.age) ? state.age : ''}
+            onChange={(e) => {
+              const v = e.target.value.trim();
+              const n = Math.round(Number(v));
+              st.updateActiveCharacterState(id, {
+                age: v === '' || !Number.isFinite(n) ? undefined : Math.max(0, Math.min(999, n)),
+              });
+            }}
+            placeholder="岁"
+          />
+        </Field>
+        <CharacterImageSection nodeId={id} state={state} gender={genderOf(d.gender)} />
         <Label>基础信息</Label>
         <Textarea
           value={state.basicInfo}
@@ -167,8 +147,6 @@ export function SimInspector({ open, onClose }: { open: boolean; onClose: () => 
           rows={3}
           className="resize-none"
         />
-        <Label>写真</Label>
-        <PortraitBox nodeId={id} state={state} />
       </>
     );
   } else if (selected) {
@@ -303,8 +281,6 @@ function BookProperties() {
   );
 }
 
-const MAX_CHARASSET_BYTES = 5 * 1024 * 1024;
-
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 const STATE_ERR_TEXT: Record<CharacterStateError, string> = {
@@ -315,19 +291,6 @@ const STATE_ERR_TEXT: Record<CharacterStateError, string> = {
   protected: '默认状态（首项）不可删除，可重命名',
   'last-state': '人物至少保留一个状态',
 };
-
-/** 状态引用是否仍被任何画布上的任何人物状态使用（跨卷镜像会共享同一写真 key） */
-function portraitKeyReferenced(key: string): boolean {
-  return Object.values(useStudioStore.getState().boards).some((b) =>
-    b.nodes.some((n) => n.data.kind === 'character' && n.data.states.some((st) => st.portraitKey === key)),
-  );
-}
-
-/** 清掉最后一个引用后才删除 IndexedDB 图片，避免误删其它状态/镜像仍在用的共享写真 */
-function releasePortraitKey(key: string | undefined): void {
-  if (!key || portraitKeyReferenced(key)) return;
-  void localImgDel(key).catch(() => {});
-}
 
 /** 🧬 状态条（v2.30）：切换/新建（复制当前）/重命名/删除。状态属性由下方表单写当前状态。 */
 function CharacterStateBar({ nodeId, data, boardId }: { nodeId: string; data: CharacterData; boardId: string }) {
@@ -342,7 +305,7 @@ function CharacterStateBar({ nodeId, data, boardId }: { nodeId: string; data: Ch
 
   const add = () => {
     const label = window.prompt(
-      `新状态名称（将复制「${state.label}」的属性与写真，创建后切到新状态）`,
+      `新状态名称（将复制「${state.label}」的属性与形象，创建后切到新状态）`,
       nextStateLabel(data.states),
     );
     if (label === null) return;
@@ -362,18 +325,14 @@ function CharacterStateBar({ nodeId, data, boardId }: { nodeId: string; data: Ch
     const impact = refs.count
       ? `\n\n该状态被 ${refs.count} 章引用：${referenceChapterText(refs, 6)}。删除后这些章节在切回同步前会显示「资料缺失」；章节场景会随画布自动同步。`
       : '';
-    if (!window.confirm(`删除状态「${state.label}」？切到该状态的人物设定与写真引用会一并移除（其它状态仍在用的图片不会被删）。${impact}`)) return;
+    if (!window.confirm(`删除状态「${state.label}」？该状态的人物设定与形象引用会一并移除（其它状态仍在用的图片不会被删）。${impact}`)) return;
     const r = st.deleteCharacterState(nodeId, state.id);
-    if (!r.ok) {
-      window.alert(`⚠ ${STATE_ERR_TEXT[r.error]}`);
-      return;
-    }
-    releasePortraitKey(r.removed?.portraitKey);
+    if (!r.ok) window.alert(`⚠ ${STATE_ERR_TEXT[r.error]}`);
   };
 
   const defaultLabel = `状态${index}`;
   return (
-    <div className="mt-2" title="点击数字切换状态；画布、属性表单、写真与章节生成都使用当前状态">
+    <div className="mt-2" title="点击数字切换状态；画布、属性表单、人物形象与章节生成都使用当前状态">
       <div className="flex items-center gap-1.5">
         <Layers className="h-3.5 w-3.5 shrink-0 text-slate-400" />
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
@@ -399,7 +358,7 @@ function CharacterStateBar({ nodeId, data, boardId }: { nodeId: string; data: Ch
           })}
           <IconButton
             icon={<Plus />}
-            title="新建状态：复制当前状态的全部属性与写真引用，并切换到新状态"
+            title="新建状态：复制当前状态的全部属性与形象引用，并切换到新状态"
             onClick={add}
           />
         </div>
@@ -433,51 +392,119 @@ function CharacterStateBar({ nodeId, data, boardId }: { nodeId: string; data: Ch
   );
 }
 
-/** 🎨 写真区（v2.19b / v2.30 按状态）：点「生成写真」→ 先驱动文本双模型按**当前状态**写生图提示词，再调生图 API。
- *  图片只保留在浏览器本地（IndexedDB）：规范 key=portrait:<nodeId>:<stateId>，旧写真 key=portrait:<nodeId>。
- *  生成总是 copy-on-write 写当前状态的规范 key，不覆盖从基准状态继承来的图片；点图放大看原图。 */
-function PortraitBox({ nodeId, state }: { nodeId: string; state: CharacterState }) {
-  const [url, setUrl] = useState<string | undefined>(undefined);
+type CropTarget = {
+  stateId: string;
+  stateLabel: string;
+  image: CharacterStateImage;
+  fullUrl: string;
+};
+
+/** 🖼 人物形象区（v2.31，按状态）：
+ *  - 上传：保留原图尺寸（最长边 >4096 等比缩小）；
+ *  - AI：按所选预设构图生成，再在客户端裁切/缩放到精确像素；
+ *  - 头像：从大图手动框选头部，生成 256×256 圆形头像；未裁切时画布显示性别剪影；
+ *  - 大图/头像本体只进 IndexedDB，状态里只存元数据。 */
+function CharacterImageSection({
+  nodeId,
+  state,
+  gender,
+}: {
+  nodeId: string;
+  state: CharacterState;
+  gender: CharacterGender;
+}) {
+  const image = state.image;
+  const [fullUrl, setFullUrl] = useState<string | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [stage, setStage] = useState<'prompt' | 'image' | null>(null);
   const [err, setErr] = useState('');
+  const [mode, setMode] = useState<CharacterImagePreset>('1:1');
   const [zoom, setZoom] = useState(false);
+  const [cropTarget, setCropTarget] = useState<CropTarget | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
   const stateIdRef = useRef(state.id);
   stateIdRef.current = state.id;
 
-  // 本地读写真：引用可能来自基准状态（继承），所以按 state.portraitKey 读，而不是按规范 key 推导
+  // 大图从 IndexedDB 读取；元数据存在但字节缺失（换浏览器/被清理）时给出明确提示
   useEffect(() => {
     let alive = true;
-    setUrl(undefined);
+    setFullUrl(undefined);
     setErr('');
-    if (state.portraitKey) {
-      void localImgGet(state.portraitKey)
-        .then((v) => {
-          if (alive && v) setUrl(v);
-        })
-        .catch(() => {});
-    }
+    if (!image?.key) return;
+    void localImgGet(image.key)
+      .then((v) => {
+        if (!alive) return;
+        if (v) setFullUrl(v);
+        else setErr('形象文件缺失（可能来自其它浏览器或已被清理），请重新上传或生成。');
+      })
+      .catch(() => {
+        if (alive) setErr('读取本地形象失败，请刷新后重试。');
+      });
     return () => {
       alive = false;
     };
-  }, [nodeId, state.id, state.portraitKey]);
+  }, [nodeId, state.id, image?.key]);
 
-  const gen = async () => {
+  const openCrop = async (img: CharacterStateImage, sid: string, label: string, url?: string) => {
+    let src = url ?? fullUrl;
+    if (!src) {
+      try {
+        src = await localImgGet(img.key);
+      } catch {
+        src = undefined;
+      }
+    }
+    if (!src) {
+      setErr('形象文件缺失，无法裁切头像；请重新上传或生成。');
+      return;
+    }
+    setCropTarget({ image: img, fullUrl: src, stateId: sid, stateLabel: label });
+  };
+
+  const onFile = async (file?: File) => {
+    if (!file || busy) return;
+    const sid = state.id;
+    const label = state.label;
+    setBusy(true);
+    setErr('');
+    try {
+      // 上传始终保留原图尺寸（超 4096 长边等比缩小）；预设只用于 AI 生成
+      const prepared = await prepareCharacterImageFile(file, 'original');
+      const saved = await saveFullImage(nodeId, sid, prepared, 'original');
+      useStudioStore.getState().updateCharacterState(nodeId, { image: saved.image }, sid);
+      if (stateIdRef.current === sid) {
+        setFullUrl(saved.dataUrl);
+        setCropTarget({ image: saved.image, fullUrl: saved.dataUrl, stateId: sid, stateLabel: label });
+      }
+    } catch (e) {
+      setErr(errMsg(e));
+    } finally {
+      setBusy(false);
+      if (fileRef.current) fileRef.current.value = '';
+    }
+  };
+
+  const generate = async () => {
     if (busy) return;
+    const sid = state.id;
+    const label = state.label;
+    const preset = mode;
     setBusy(true);
     setErr('');
     setStage('prompt');
     try {
       const engine = useEditorRoomStore.getState().settings.engine;
-      const r = await genCharacterPortrait({ id: nodeId, stateId: state.id, engine, onStage: setStage });
-      if (r.ok && r.url) {
-        const key = portraitKeyForState(nodeId, state.id);
-        const data = await localImgSaveFromUrl(key, r.url); // 抢在服务器 GC 前转存本地
-        useStudioStore.getState().updateCharacterState(nodeId, { portraitKey: key }, state.id);
-        if (stateIdRef.current === state.id) setUrl(data);
-      } else if (stateIdRef.current === state.id) setErr(r.error || '生成失败');
+      const r = await genCharacterImage({ id: nodeId, stateId: sid, engine, preset, onStage: setStage });
+      if (!r.ok || !r.url) throw new Error(r.error || '生成失败');
+      const prepared = await prepareCharacterImageUrl(r.url, preset);
+      const saved = await saveFullImage(nodeId, sid, prepared, preset);
+      useStudioStore.getState().updateCharacterState(nodeId, { image: saved.image }, sid);
+      if (stateIdRef.current === sid) {
+        setFullUrl(saved.dataUrl);
+        setCropTarget({ image: saved.image, fullUrl: saved.dataUrl, stateId: sid, stateLabel: label });
+      }
     } catch (e) {
-      if (stateIdRef.current === state.id) setErr(errMsg(e));
+      setErr(errMsg(e));
     } finally {
       setBusy(false);
       setStage(null);
@@ -485,66 +512,169 @@ function PortraitBox({ nodeId, state }: { nodeId: string; state: CharacterState 
   };
 
   const remove = () => {
-    const oldKey = state.portraitKey;
-    useStudioStore.getState().updateCharacterState(nodeId, { portraitKey: undefined }, state.id);
-    setUrl(undefined);
-    releasePortraitKey(oldKey);
+    if (!image || busy) return;
+    if (!window.confirm(`移除「${state.label}」的人物形象与头像？（其它状态仍在使用的图片不会被删）`)) return;
+    useStudioStore.getState().updateCharacterState(nodeId, { image: undefined }, state.id);
+    setFullUrl(undefined);
+    setZoom(false);
+    setCropTarget(null);
   };
 
+  const presetLabel =
+    image?.preset === 'original' ? '原图尺寸' : image?.preset ? CHARACTER_IMAGE_PRESET_DIMS[image.preset].label : '';
+  const avatarHint = !image
+    ? `未设置形象，画布显示${gender === 'female' ? '女' : '男'}性剪影`
+    : image.headKey
+      ? '已裁切头像'
+      : `未裁切头像，画布显示${gender === 'female' ? '女' : '男'}性剪影`;
+
   return (
-    <div>
-      {url ? (
+    <div data-testid="character-image-section">
+      <Label>人物形象</Label>
+      {image && fullUrl ? (
         <button
           type="button"
           onClick={() => setZoom(true)}
-          title={`点击放大查看「${state.label}」写真原图`}
-          className="block w-full overflow-hidden rounded-[10px] border border-slate-200 bg-slate-50"
+          title="点击查看完整大图"
+          className="block w-full overflow-hidden rounded-[10px] border border-slate-200 bg-slate-100"
+          data-testid="character-image-full"
         >
-          <img src={url} alt={`${state.label}人物写真`} draggable={false} className="h-36 w-full object-cover" />
+          <img src={fullUrl} alt={`${state.label}人物形象`} draggable={false} className="h-44 w-full object-contain" />
         </button>
+      ) : image ? (
+        <div className="flex h-32 w-full items-center justify-center rounded-[10px] border border-dashed border-amber-300 bg-amber-50/60 px-3 text-center text-[12px] leading-relaxed text-amber-700">
+          形象文件缺失，请重新上传或生成
+        </div>
       ) : (
-        <div className="flex h-36 w-full items-center justify-center rounded-[10px] border border-dashed border-slate-300 bg-slate-50 px-3 text-center text-[12px] leading-relaxed text-slate-400">
-          {busy ? (stage === 'prompt' ? '正在生成提示词…' : '正在生成图片…（约 1-2 分钟）') : `「${state.label}」暂无写真——点下方按钮由 AI 生成`}
+        <div className="flex h-32 w-full flex-col items-center justify-center gap-2 rounded-[10px] border border-dashed border-slate-300 bg-slate-50 px-3 text-center text-[12px] leading-relaxed text-slate-400">
+          <CharacterAvatar image={undefined} gender={gender} stateId={state.id} size={52} />
+          <span>当前状态还没有人物形象</span>
         </div>
       )}
-      <div className="mt-2 flex items-center gap-1.5">
+
+      <div className="mt-1.5 flex items-center justify-between gap-2 text-[11px] text-slate-400">
+        <span className="min-w-0 truncate">
+          {image ? `${image.width}×${image.height} · ${presetLabel}` : 'PNG / JPEG / WebP · 最大 20MB · 上传保留原尺寸'}
+        </span>
+        {busy && <span className="shrink-0 text-brand-600">{stage === 'prompt' ? '生成提示词…' : '生成图片…'}</span>}
+      </div>
+
+      <div className="mt-2 flex items-center gap-2 rounded-[10px] border border-slate-200 bg-white p-2">
+        <CharacterAvatar image={image} gender={gender} stateId={state.id} size={46} />
+        <div className="min-w-0 flex-1">
+          <div className="text-[11px] font-medium text-slate-600">画布头像</div>
+          <div className="mt-0.5 text-[11px] leading-snug text-slate-400" data-avatar-status>
+            {avatarHint}
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-2">
+        <label className="mb-1 block text-[11px] text-slate-400" htmlFor="character-image-size">
+          AI 生成尺寸（上传保留原图尺寸）
+        </label>
+        <Select
+          id="character-image-size"
+          value={mode}
+          onChange={(e) => setMode(e.target.value as CharacterImagePreset)}
+          disabled={busy}
+          title="AI 按所选比例构图生成，并在本地裁切/缩放到精确像素；上传图片则始终保留原尺寸（最长边超过 4096 时等比缩小）。"
+          data-testid="character-image-size"
+        >
+          {CHARACTER_IMAGE_PRESETS.map((p) => (
+            <option key={p} value={p}>
+              {CHARACTER_IMAGE_PRESET_DIMS[p].label}（{p}）
+            </option>
+          ))}
+        </Select>
+      </div>
+
+      <div className="mt-2 flex flex-wrap gap-1.5">
         <Button
           type="button"
           size="sm"
-          variant={url ? 'secondary' : 'primary'}
-          icon={<ImageIcon />}
-          onClick={() => void gen()}
+          icon={<Upload />}
+          onClick={() => fileRef.current?.click()}
           disabled={busy}
-          title={
-            busy
-              ? stage === 'prompt'
-                ? '正在生成提示词'
-                : '正在调用生图 API'
-              : url
-                ? `重新生成「${state.label}」写真（只覆盖当前状态）`
-                : 'AI 先按当前状态的基础信息与身份信息写生图提示词，再调用生图 API 出立绘（图片保存在浏览器本地）'
-          }
+          title="上传本地图片作为当前状态的人物形象；成功后自动打开头像裁切"
+          data-testid="character-image-upload"
         >
-          {busy ? (stage === 'prompt' ? '提示词中…' : '生成图片中…') : url ? '重新生成' : '生成写真'}
+          上传
         </Button>
-        {url && !busy && (
+        <Button
+          type="button"
+          size="sm"
+          variant={image ? 'secondary' : 'primary'}
+          icon={<Sparkles />}
+          onClick={() => void generate()}
+          disabled={busy}
+          title={busy ? '正在生成' : 'AI 按当前状态的基础信息与身份信息写生图提示词，生成单张完整人物形象；成功后自动打开头像裁切'}
+          data-testid="character-image-ai"
+        >
+          {busy ? '生成中…' : image ? '重新生成' : 'AI 生成'}
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          icon={<Crop />}
+          onClick={() => image && void openCrop(image, state.id, state.label)}
+          disabled={busy || !image || !fullUrl}
+          title={image ? '从大图中框选头部区域作为画布圆形头像' : '先上传或生成人物形象，再选取头像'}
+          data-testid="character-image-crop"
+        >
+          {image?.headKey ? '调整头像' : '选取头像'}
+        </Button>
+        {image && (
           <Button
             type="button"
             size="sm"
             icon={<Trash2 />}
             onClick={remove}
-            title="移除当前状态的写真引用；若图片仍被其它状态/镜像使用则保留本地图片"
+            disabled={busy}
+            title="移除当前状态的人物形象与头像引用；其它状态/镜像仍在用的图片会保留"
+            data-testid="character-image-remove"
           >
             移除
           </Button>
         )}
       </div>
+
+      <input
+        ref={fileRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp"
+        className="hidden"
+        data-testid="character-image-file-input"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) void onFile(f);
+          e.target.value = '';
+        }}
+      />
+
       {err && <p className="mt-1.5 text-[12px] leading-relaxed text-rose-500">{err}</p>}
+      <p className="mt-1.5 text-[10px] leading-relaxed text-slate-400">
+        大图与头像只保存在本机浏览器，随画布元数据引用；导出到其它浏览器后需重新设置图片。
+      </p>
+
+      {cropTarget && (
+        <CharacterCropDialog
+          nodeId={nodeId}
+          stateId={cropTarget.stateId}
+          stateLabel={cropTarget.stateLabel}
+          image={cropTarget.image}
+          fullDataUrl={cropTarget.fullUrl}
+          onClose={() => setCropTarget(null)}
+        />
+      )}
+
       {zoom &&
-        url &&
+        image &&
+        fullUrl &&
         createPortal(
           <div
             className="fixed inset-0 z-[70] flex items-center justify-center bg-black/80 p-6"
+            data-testid="character-image-zoom"
             onMouseDown={(e) => {
               if (e.target === e.currentTarget) setZoom(false);
             }}
@@ -557,177 +687,15 @@ function PortraitBox({ nodeId, state }: { nodeId: string; state: CharacterState 
             >
               <X className="h-5 w-5" />
             </button>
-            <img src={url} alt={`${state.label}人物写真原图`} draggable={false} className="max-h-[92vh] max-w-[94vw] rounded-[16px] shadow-2xl" />
+            <img
+              src={fullUrl}
+              alt={`${state.label}人物形象原图`}
+              draggable={false}
+              className="max-h-[92vh] max-w-[94vw] rounded-[16px] object-contain shadow-2xl"
+            />
           </div>,
           document.body,
         )}
-    </div>
-  );
-}
-
-function CharAvatarPicker({
-  value,
-  gender,
-  stage,
-  onChange,
-}: {
-  value?: string;
-  gender: CharAssetGender;
-  stage: CharAssetStage | undefined;
-  onChange: (v: string | undefined) => void;
-}) {
-  const [assets, setAssets] = useState<CharAsset[]>([]);
-  const [err, setErr] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [open, setOpen] = useState(false);
-  const current = value || DEFAULT_CHARASSET;
-  const shown = stage ? assets.filter((a) => a.gender === gender && a.stage === stage) : [];
-  const curLabel = current === DEFAULT_CHARASSET ? `${current}（默认）` : current;
-
-  const reload = useCallback(async () => {
-    try {
-      setAssets(await listCharAssets());
-    } catch (e) {
-      setErr(`素材库加载失败：${errMsg(e)}`);
-    }
-  }, []);
-
-  useEffect(() => {
-    void reload();
-  }, [reload]);
-
-  const onFile = async (file: File) => {
-    setErr('');
-    if (!stage) return;
-    if (file.size > MAX_CHARASSET_BYTES) {
-      setErr('图片超过 5MB');
-      return;
-    }
-    let name = file.name.replace(/\.[^.]+$/, '');
-    if (!CHARASSET_NAME_RE.test(name)) {
-      const input = window.prompt('素材名（英文/数字/-/_，1–40 字符，不可与已有素材重名）', '');
-      if (!input) return;
-      name = input.trim();
-      if (!CHARASSET_NAME_RE.test(name)) {
-        setErr('素材名不合法');
-        return;
-      }
-    }
-    setBusy(true);
-    try {
-      await uploadCharAsset(name, gender, stage, await fileToDataUrl(file));
-      await reload();
-      onChange(name === DEFAULT_CHARASSET ? undefined : name);
-    } catch (e) {
-      setErr(errMsg(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const onDelete = async (id: string) => {
-    if (!window.confirm(`删除素材「${id}」？使用它的人物将回落默认形象。`)) return;
-    setErr('');
-    try {
-      await deleteCharAsset(id);
-      if (current === id) onChange(undefined);
-      await reload();
-    } catch (e) {
-      setErr(errMsg(e));
-    }
-  };
-
-  const pick = (id: string) => {
-    onChange(id === DEFAULT_CHARASSET ? undefined : id);
-    setOpen(false);
-  };
-
-  return (
-    <div>
-      <button
-        type="button"
-        onClick={() => setOpen(true)}
-        title={`形象：${curLabel}（点击打开素材库）`}
-        className="flex h-14 w-14 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 transition hover:bg-slate-100"
-      >
-        <img
-          src={charAssetUrl(current)}
-          alt=""
-          draggable={false}
-          className="h-12 w-12 object-contain"
-          style={{ imageRendering: 'pixelated' }}
-        />
-      </button>
-      {err && !open && <p className="mt-1 text-[12px] text-rose-500">{err}</p>}
-      {open && (
-        <Dialog
-          onClose={() => setOpen(false)}
-          z={60}
-          width="sm"
-          icon={<ImageIcon />}
-          title="人物素材库"
-          subtitle={stage ? `${gender}·${stage}（${shown.length} 张）` : '未设置年龄'}
-        >
-          {!stage && <p className="mb-2 text-[12px] text-slate-400">请先在属性中设置年龄，再选择对应年龄段的素材。</p>}
-          <div className="grid grid-cols-4 gap-2">
-            {shown.map((a) => {
-              const active = a.id === current;
-              const isDefault = a.id === DEFAULT_CHARASSET;
-              return (
-                <div key={a.id} className="group relative">
-                  <button
-                    type="button"
-                    title={isDefault ? `${a.id}（默认形象）` : a.id}
-                    onClick={() => pick(a.id)}
-                    className={`flex w-full items-center justify-center rounded-[10px] border p-1 transition ${
-                      active
-                        ? 'border-brand-500 bg-brand-50 ring-2 ring-brand-200'
-                        : 'border-slate-200 bg-slate-50 hover:bg-slate-100'
-                    }`}
-                  >
-                    <img
-                      src={charAssetUrl(a.id)}
-                      alt={a.id}
-                      draggable={false}
-                      className="h-12 w-12 object-contain"
-                      style={{ imageRendering: 'pixelated' }}
-                    />
-                  </button>
-                  {!isDefault && (
-                    <button
-                      type="button"
-                      title={`删除素材 ${a.id}`}
-                      onClick={() => void onDelete(a.id)}
-                      className="absolute -right-1.5 -top-1.5 hidden h-4 w-4 items-center justify-center rounded-full bg-slate-600 text-white group-hover:flex"
-                    >
-                      <X className="h-2.5 w-2.5" />
-                    </button>
-                  )}
-                </div>
-              );
-            })}
-            <label
-              title={stage ? `上传到 ${gender}·${stage}（png/jpeg/webp，≤5MB）` : '请先设置年龄，再上传对应年龄段的素材'}
-              className={`flex h-[60px] cursor-pointer items-center justify-center rounded-[10px] border border-dashed border-slate-300 text-slate-400 hover:bg-slate-100 ${
-                busy || !stage ? 'pointer-events-none opacity-50' : ''
-              }`}
-            >
-              <Plus className="h-5 w-5" />
-              <input
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  e.target.value = '';
-                  if (f) void onFile(f);
-                }}
-              />
-            </label>
-          </div>
-          {err && <p className="mt-2 text-[12px] text-rose-500">{err}</p>}
-        </Dialog>
-      )}
     </div>
   );
 }

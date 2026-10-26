@@ -12,7 +12,7 @@ export interface ImgSubmitPayload {
   prompt: string;
   n?: number;
   size?: string;
-  imageSize?: string;
+  imageSize?: string; // 清晰度档位；服务端公共轨出站时改名为 image_size（中转要求全小写字段名）
   image?: string[]; // data URL 数组（参考图；private 轨不支持）
   rail?: ImgRail; // 缺省 public（私有轨 = ComfyUI，任务 id 前缀 comfy-）
 }
@@ -193,7 +193,7 @@ export async function imgSaveConfig(patch: Partial<ImgConfig>): Promise<ImgConfi
   return conf;
 }
 
-/** 拉生图上游模型列表：rail=private → ComfyUI checkpoint 列表；public（默认）→ 中转真实模型 ID（供设置面板刷新） */
+/** 拉生图上游列表：rail=private → ComfyUI 控制面板的工作流 ID 列表；public（默认）→ 中转真实模型 ID（供设置面板刷新） */
 export async function imgRelayModels(rail?: ImgRail): Promise<string[]> {
   const q = rail ? `?rail=${rail}` : '';
   const j = await jfetch(`${API_BASE}/api/img/models${q}`);

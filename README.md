@@ -65,12 +65,12 @@ python server.py            # 打开 http://127.0.0.1:8768/
 | --- | --- | --- |
 | `qwenconfig.json` | 文本模型（私有/公共双轨） | `base_url`、`model`、`api_key`、`public.{base_url,api_key,model}` |
 | `scriptconfig.json` | 脚本生成（OpenAI chat 协议） | `base_url`、`api_key`、`model_list` |
-| `imgconfig.json` | 生图（公共中转 / 私有 ComfyUI） | `default`、`public.{base_url,api_key,model_list}`、`private.{base_url,model}` |
+| `imgconfig.json` | 生图（公共中转 / 私有 ComfyUI 工作流） | `default`、`public.{base_url,api_key,model_list}`、`private.{base_url,workflow_id}` |
 | `vidconfig.json` | 视频生成（ComfyUI 工作流） | `base_url`、`token`、`workflow_*` |
 
 配置模板见根目录 `*.example.json`。服务端读取配置后，前端只能看到打码后的 Key；所有上游请求由 `server.py` 代理。
 
-文本模型需要兼容 OpenAI Chat Completions；公共轨支持 OpenAI Responses API 中转。生图公共轨需要兼容 `/draw` + 任务轮询协议，私有轨使用 ComfyUI 标准 txt2img 工作流。
+文本模型需要兼容 OpenAI Chat Completions；公共轨支持 OpenAI Responses API 中转。生图公共轨需要兼容 `/draw` + 任务轮询协议，私有轨使用 ComfyUI 控制面板的工作流 API（`/api/workflow/generate` + `/api/workflow/result`，按 `workflow_id` 执行已保存的工作流）。
 
 ## 数据与隐私
 

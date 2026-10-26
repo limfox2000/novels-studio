@@ -37,7 +37,6 @@ import type { SimData, SimNodeType } from '../../types/sim';
 import { ENV_TYPE_META, genderOf } from '../../types/sim';
 import { DEFAULT_STATE_ID } from '../../stores/characterStates';
 import { genRandomCharacter } from '../../engines/studioEngine';
-import { pickRandomCharAsset } from '../../services/charAssetApi';
 import { GENDER_STYLE, simNodeTypes } from './SimNodes';
 import { SimInspector } from './SimInspector';
 import { EditorRoomPanel } from './EditorRoomPanel';
@@ -510,9 +509,9 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
     const s2 = useStudioStore.getState();
     if (r.ok && r.block) {
       const gender = genderOf(r.block.gender);
-      const avatar = await pickRandomCharAsset(gender === 'female' ? '女' : '男', r.block.age).catch(() => undefined);
       s2.updateCharacter(id, { name: r.block.name, gender });
-      // 显式写状态0：生成期间用户若新建/切换了状态，也不会把随机属性写进别的状态
+      // 显式写状态0：生成期间用户若新建/切换了状态，也不会把随机属性写进别的状态。
+      // 新人物默认没有形象，画布先显示性别剪影，由用户上传/生成后再裁头像。
       s2.updateCharacterState(
         id,
         {
@@ -520,7 +519,6 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
           basicInfo: r.block.basicInfo ?? '',
           identityInfo: r.block.identityInfo ?? '',
           relations: r.block.relations,
-          avatar,
         },
         DEFAULT_STATE_ID,
       );

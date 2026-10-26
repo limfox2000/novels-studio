@@ -1,4 +1,4 @@
-/** 创作台节点：🧑 人物（人物卡片：形象+人名+年龄，zIndex 恒顶层）+ 🏗 环境（可缩放容器，RF12 parentId 嵌套层级）。
+/** 创作台节点：🧑 人物（人物卡片：圆形头像+人名+年龄，zIndex 恒顶层）+ 🏗 环境（可缩放容器，RF12 parentId 嵌套层级）。
  *  节点面上**只展示不输入**：人名/环境名/类型/描述一律在左侧属性面板（SimInspector）编辑——
  *  节点内嵌输入框极易误入输入态、难拖拽（v2.3 用户反馈），现在整面都可拖拽。
  *  环境拖到别的环境节点里即成为其子节点（随父移动），拖出回根层（判定在 StudioPage onNodeDragStop）。
@@ -8,7 +8,7 @@ import type { ComponentType } from 'react';
 import { NodeResizer, type NodeProps } from '@xyflow/react';
 import { BedDouble, Blocks, Building2, DoorOpen, Landmark, Lock, LockOpen, Map, Package, X } from 'lucide-react';
 import { useStudioStore, ENV_MIN_W, ENV_MIN_H } from '../../stores/studioStore';
-import { charAssetUrl, DEFAULT_CHARASSET } from '../../services/charAssetApi';
+import { CharacterAvatar } from './CharacterAvatar';
 import {
   ENV_TYPE_LABELS,
   ENV_TYPE_META,
@@ -32,38 +32,24 @@ const ENV_ICON: Record<EnvironmentType, ComponentType<{ className?: string }>> =
   item: Package,
 };
 
-/** 🚻 性别 → 头像/胶囊配色/人名文字色/MiniMap 点色（人物节点与属性面板共用；男蓝=默认 / 女玫红） */
-export const GENDER_STYLE: Record<CharacterGender, { avatar: string; label: string; capsule: string; text: string; dot: string }> = {
-  male: { avatar: '👨', label: '男', capsule: 'border-blue-300/60 bg-blue-600', text: 'text-blue-600', dot: '#2563eb' },
-  female: { avatar: '👩', label: '女', capsule: 'border-rose-300/60 bg-rose-500', text: 'text-rose-500', dot: '#f43f5e' },
+/** 🚻 性别 → 胶囊配色/人名文字色/MiniMap 点色（人物节点与属性面板共用；男蓝=默认 / 女玫红） */
+export const GENDER_STYLE: Record<CharacterGender, { label: string; capsule: string; text: string; dot: string }> = {
+  male: { label: '男', capsule: 'border-blue-300/60 bg-blue-600', text: 'text-blue-600', dot: '#2563eb' },
+  female: { label: '女', capsule: 'border-rose-300/60 bg-rose-500', text: 'text-rose-500', dot: '#f43f5e' },
 };
 
-// ── 人物节点：人物卡片（素材图原尺寸 64×64 透明显示，下方人名+年龄；人名色按性别区分；仅展示，编辑在属性面板；永远浮在环境之上——zIndex 由 store 恒置 CHAR_ZINDEX） ──
+// ── 人物节点：人物卡片（圆形头像 64×64 + 下方人名+年龄；人名色按性别区分；仅展示，编辑在属性面板；永远浮在环境之上——zIndex 由 store 恒置 CHAR_ZINDEX） ──
 
 export function SimCharacterNode({ id, data }: NodeProps) {
   const d = data as CharacterData;
-  const g = GENDER_STYLE[genderOf(d.gender)];
+  const gender = genderOf(d.gender);
+  const g = GENDER_STYLE[gender];
   const state = activeCharacterState(d);
   const ageTxt = typeof state.age === 'number' && Number.isFinite(state.age) && state.age > 0 ? ` ${state.age}` : '';
   return (
     <div className="group relative flex min-w-[84px] flex-col items-center rounded-xl px-2 pb-1.5 pt-1.5">
-      <img
-        src={charAssetUrl(state.avatar || DEFAULT_CHARASSET)}
-        alt=""
-        width={64}
-        height={64}
-        draggable={false}
-        onError={(e) => {
-          // 形象素材已被删除 → 回落默认素材
-          const img = e.currentTarget;
-          if (img.dataset.fallback) return;
-          img.dataset.fallback = '1';
-          img.src = charAssetUrl(DEFAULT_CHARASSET);
-        }}
-        className="h-16 w-16 shrink-0"
-        style={{ imageRendering: 'pixelated' }}
-      />
-      <span className={`max-w-[128px] truncate text-xs font-semibold ${g.text}`}>
+      <CharacterAvatar image={state.image} gender={gender} stateId={state.id} size={64} />
+      <span className={`mt-1 max-w-[128px] truncate text-xs font-semibold ${g.text}`}>
         {d.name || '未命名'}
         {ageTxt && <span className="font-normal opacity-80">{ageTxt}</span>}
       </span>

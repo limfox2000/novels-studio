@@ -77,13 +77,16 @@ export function pointInRegionEdge(r: Rect, p: Point): boolean {
 /** 状态属性稳定指纹：不含 label（重命名不算内容变化），用于检测采集后的原地修改。
  *  FNV-1a 32 位即可：只做“是否变化”比较，不做安全用途。 */
 export function stateFingerprint(state: CharacterState): string {
+  // 保持 6 个槽位：无图状态与旧指纹一致；有图时 key/头像/裁剪变化即视为内容变化
   const parts = [
     typeof state.age === 'number' ? state.age : '',
-    state.avatar ?? '',
+    state.image?.key ?? '',
     state.basicInfo,
     state.identityInfo,
     state.relations ?? '',
-    state.portraitKey ?? '',
+    state.image?.headKey
+      ? JSON.stringify([state.image.headKey, state.image.crop?.x ?? null, state.image.crop?.y ?? null, state.image.crop?.size ?? null])
+      : '',
   ];
   const text = JSON.stringify(parts);
   let h = 0x811c9dc5;

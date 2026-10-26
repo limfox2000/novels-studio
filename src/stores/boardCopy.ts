@@ -2,7 +2,7 @@
  *
  *  两种语义：
  *  - mirror：保留节点 ID，视作同一人物/环境在另一卷的镜像；目标已有同 ID 时按 conflict 更新或跳过。
- *  - new：全部节点换新 ID，父子/内部连线/人物写真一起重映射，成为独立副本。
+ *  - new：全部节点换新 ID，父子/内部连线/人物形象与头像一起重映射，成为独立副本。
  *
  *  选择环境时可选带上全部后代；未选中的祖先不会被自动带上：
  *  父在复制集 → 挂到映射后的父；父不在集但目标卷已有同 ID 环境 → 挂入该容器；
@@ -10,7 +10,7 @@
 import type { Edge } from '@xyflow/react';
 import type { SimBoard, SimNodeType } from '../types/sim';
 import { uid } from '../utils/id';
-import { portraitKeyForState } from './characterStates';
+import { newCharacterHeadKey, newCharacterImageKey } from './characterStates';
 import { absPositionOf, sortParentsFirst } from './graphGeom';
 
 export type BoardCopyMode = 'mirror' | 'new';
@@ -44,8 +44,8 @@ export interface BoardCopyResult {
   report: BoardCopyReport;
   /** 源节点 id → 目标节点 id（跳过/更新的镜像节点映射到自身 id） */
   idMap: Record<string, string>;
-  /** new 模式的人物写真复制任务；由 UI 异步执行，不阻塞节点复制 */
-  portraitTasks: Array<{ fromKey: string; toKey: string }>;
+  /** new 模式的人物形象/头像复制任务；由 UI 异步执行，不阻塞节点复制 */
+  imageTasks: Array<{ fromKey: string; toKey: string }>;
 }
 
 const CHAR_Z_INDEX = 100;
@@ -124,6 +124,7 @@ export function planBoardCopy(
   };
   const idMap: Record<string, string> = {};
   const inserted = new Set<string>();
+  const imageTasks: Array<{ fromKey: string; toKey: string }> = [];
 
   // 1) 先决定每个节点的目标 id，并处理镜像冲突
   for (const n of sourceOrder) {
@@ -204,13 +205,27 @@ export function planBoardCopy(
       expandParent: _expandParent,
       ...rest
     } = raw;
-    // 复制为新：保留状态的 stateId，但每个状态的写真引用改写到新节点自己的规范 key
-    // （继承同一张基准图的多个状态会产生多个目标 key，由 portraitTasks 分别复制）
+    // 复制为新：保留状态的 stateId，但每个状态的图/头像引用改写到新节点自己的新 key
+    // （继承同一张基准图的多个状态会产生多个目标 key，由 imageTasks 分别复制）
     const data = clone(n.data);
-    if (mode === 'new' && data.kind === 'character') {
-      data.states = data.states.map((s) =>
-        s.portraitKey ? { ...s, portraitKey: portraitKeyForState(mappedId, s.id) } : s,
-      );
+    if (mode === 'new' && n.data.kind === 'character' && data.kind === 'character') {
+      const srcStates = n.data.states;
+      data.states = data.states.map((s) => {
+        const src = srcStates.find((x) => x.id === s.id);
+        if (!s.image || !src?.image) return s;
+        const key = newCharacterImageKey(mappedId, s.id);
+        const headKey = src.image.headKey ? newCharacterHeadKey(mappedId, s.id) : undefined;
+        imageTasks.push({ fromKey: src.image.key, toKey: key });
+        if (src.image.headKey && headKey) imageTasks.push({ fromKey: src.image.headKey, toKey: headKey });
+        return {
+          ...s,
+          image: {
+            ...s.image,
+            key,
+            ...(headKey ? { headKey } : { headKey: undefined }),
+          },
+        };
+      });
     }
     const node: SimNodeType = {
       ...(rest as unknown as SimNodeType),
@@ -281,24 +296,14 @@ export function planBoardCopy(
     report.edgesAdded++;
   }
 
-  // 5) new 模式人物写真：逐状态从源 key 复制到新节点规范 key（UI 异步执行）；
+  // 5) imageTasks 已在第 2 步随新节点 key 一并生成（new 模式由 UI 异步复制字节）；
   //    mirror 保留 nodeId/stateId 与原 key，共享图片，不产生任务。
-  const portraitTasks =
-    mode === 'new'
-      ? copySet.nodes.flatMap((n) =>
-          n.data.kind === 'character'
-            ? n.data.states
-                .filter((s): s is typeof s & { portraitKey: string } => !!s.portraitKey)
-                .map((s) => ({ fromKey: s.portraitKey, toKey: portraitKeyForState(idMap[n.id], s.id) }))
-            : [],
-        )
-      : [];
 
   return {
     nodes: sortParentsFirst(working),
     edges,
     report,
     idMap,
-    portraitTasks,
+    imageTasks,
   };
 }

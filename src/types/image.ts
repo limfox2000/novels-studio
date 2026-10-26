@@ -162,11 +162,12 @@ export interface AudOutData extends Record<string, unknown> {
   createdAt: number;
 }
 
-/** 生图配置（双轨）：default=默认轨；🏠 private=ComfyUI（地址+checkpoint 模型名）；🌐 public=中转（地址+key+真实模型 ID 表）。
- *  api_key 服务端打码返回，前端不持有明文。base_url/api_key/key_set/model_list 为旧版前端兼容别名（镜像 public 轨，服务端返回）。 */
+/** 生图配置（双轨）：default=默认轨；🏠 private=ComfyUI 控制面板（地址 + 工作流 ID）；🌐 public=中转（地址+key+真实模型 ID 表）。
+ *  api_key 服务端打码返回，前端不持有明文。base_url/api_key/key_set/model_list 为旧版前端兼容别名（镜像 public 轨，服务端返回）。
+ *  private.model 为旧版原生 ComfyUI checkpoint，仅在未配置 workflow_id 时由服务端兼容使用。 */
 export interface ImgConfig {
   default: 'public' | 'private';
-  private: { base_url: string; model: string };
+  private: { base_url: string; workflow_id: string; model?: string };
   public: { base_url: string; api_key: string; key_set?: boolean; model_list: string[] };
   base_url?: string; // 兼容别名 → public.base_url
   api_key?: string; // 兼容别名 → public.api_key（打码）

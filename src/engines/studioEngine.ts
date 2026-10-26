@@ -24,10 +24,10 @@ import { GenerationAborted } from '../shared/generation';
 import { qwGenerate, qwenUserContent, qwenMessageChars, REASONING_EFFORT_MAX_TOKENS, type QwenChatMessage, type QwenUsage, type ReasoningEffort } from '../shared/qwenClient';
 import { startGeneration, stopGeneration } from '../shared/generation';
 import { agentGate, imageInputHint, promptCharBudget, QWEN_SAFE_LIMIT } from '../shared/agentShared';
-import { ENV_TYPE_LABELS, ENV_TYPE_META, GENDER_LABELS, genderOf, type CharacterData, type CharacterGender, type CharacterState, type EnvironmentType, type SimChapter, type SimNodeType, type SimVolume } from '../types/sim';
+import { CHARACTER_IMAGE_PRESET_DIMS, ENV_TYPE_LABELS, ENV_TYPE_META, GENDER_LABELS, genderOf, type CharacterData, type CharacterGender, type CharacterImagePreset, type CharacterState, type EnvironmentType, type SimChapter, type SimNodeType, type SimVolume } from '../types/sim';
 import type { WritingSkill } from '../types/writingSkill';
 import { buildWritingSkillsBlock } from './writingSkills';
-import { activeCharacterState, characterStateOf, DEFAULT_STATE_ID, DEFAULT_STATE_LABEL, portraitKeyForState, STATE_LABEL_CAP } from '../stores/characterStates';
+import { activeCharacterState, characterStateOf, STATE_LABEL_CAP } from '../stores/characterStates';
 import { imgSubmit, imgTask, imgConfigCached } from '../services/imgApi';
 
 // ── 画布结构摘要（注入编辑室系统上下文）：地图名 + 环境层级链 + 人物（≤900 字符） ──
@@ -948,11 +948,14 @@ export const EDITOR_MODULE_CAPS: Record<string, { blockKinds: string[]; writeFie
 };
 
 /** 生图调用（v2.19a 复用生图画布链路；v2.24 双轨）：rail/模型取 imgconfig.json 默认轨
- *  （public=model_list 首项，private=private.model；读不到配置回落公共轨 gpt-image-2.5）。
+ *  （public=model_list 首项，private=private.workflow_id 工作流 API；读不到配置回落公共轨 gpt-image-2.5）。
  *  提交 /api/img/submit → 2.5s 轮询 → 完成返回落盘 URL。 */
 export async function genImage(opts: {
   prompt: string;
+  /** 比例（如 '16:9'）；私有轨只接受比例，不接受精确像素 */
   size?: string;
+  /** 私有轨清晰度档位 1K/2K/4K；缺省 1K（旧调用行为不变） */
+  imageSize?: '1K' | '2K' | '4K';
   onProgress?: (progress: number) => void;
 }): Promise<{ ok: boolean; urls?: string[]; error?: string }> {
   try {
@@ -960,16 +963,17 @@ export async function genImage(opts: {
     let model = 'gpt-image-2.5';
     try {
       const c = await imgConfigCached();
-      if (c.default === 'private' && c.private?.base_url && c.private?.model) {
+      if (c.default === 'private' && c.private?.base_url && (c.private?.workflow_id || c.private?.model)) {
         rail = 'private';
-        model = c.private.model;
+        // 工作流 API 由服务端按配置读取 workflow_id；model 仅旧版原生 ComfyUI checkpoint 兼容
+        model = c.private.workflow_id ? '' : c.private.model || '';
       } else {
         model = c.public?.model_list?.[0] || c.model_list?.[0] || model;
       }
     } catch {
       /* 读不到配置走内置默认（公共轨 gpt-image-2.5） */
     }
-    const taskId = await imgSubmit({ model, prompt: opts.prompt, size: opts.size || '1:1', imageSize: '1K', rail });
+    const taskId = await imgSubmit({ model, prompt: opts.prompt, size: opts.size || '1:1', imageSize: opts.imageSize ?? '1K', rail });
     const deadline = Date.now() + 10 * 60 * 1000;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 2500));
@@ -1146,7 +1150,7 @@ ${readBlock}${projectDataBlock()}${chapterBlock}${refBlock}
 关系信息：（此人物与其他人物之间的关系，如「李刚之父；与王明有旧怨」，一段话；用户没提到人物关系、或当前没有其他人物可关联时，省略整段）
 - 新建人物自动带默认状态「状态0」；更新已有人的年龄/基础信息/身份信息/关系信息只改当前状态。人名、性别跨状态稳定，任何状态切换都不改变
 
-【人物状态产出协议】（段名一字不差；只操作画布上**已有**人物的状态，不创建人物，也不改人名/性别/所在环境/形象/写真）
+【人物状态产出协议】（段名一字不差；只操作画布上**已有**人物的状态，不创建人物，也不改人名/性别/所在环境/形象/头像）
 【人物状态】
 人物：（已有人的当前名字，必须从【画布索引】/【画布检索】一字不差抄写，不得编造）
 卷：（可选：目标卷画布名，从【画布索引】的「全部画布」一字不差抄写；省略=当前画布；找不到/重名时不要猜，先请用户确认）
@@ -1158,7 +1162,8 @@ ${readBlock}${projectDataBlock()}${chapterBlock}${refBlock}
 基础信息：（可选：只写要改成的完整段落）
 身份信息：（可选：只写要改成的完整段落）
 关系信息：（可选：只写要改成的完整段落）
-- 新建：复制「基于」状态的全部属性与写真引用，再覆盖写出的字段，创建后设为当前状态
+- 新建：复制「基于」状态的全部属性与形象/头像引用，再覆盖写出的字段，创建后设为当前状态
+- 形象与头像只由用户在属性面板上传、AI 生成或裁切；协议里不要输出图片字段，也不要编造图片 key
 - 修改：只改「状态」指定状态的年龄/基础信息/身份信息/关系信息，未写的属性保留
 - 切换：把指定状态设为当前状态（画布展示与后续章节生成使用它）
 - 重命名：只改状态标签，状态 ID 与属性不变；默认状态也可以重命名
@@ -1399,15 +1404,16 @@ ${simCanvasSummary()}
   }
 }
 
-/** 🎨 人物写真（v2.19b，属性面板写真区）：两步——先驱动文本双模型按人物设定写生图提示词，
- *  再调生图 API 出单人立绘（1:1）。提示词阶段占文本生成互斥（ui.generating，结束即释放）；
- *  出图阶段与编辑室【生图】块共用 genImage（不占文本互斥）。
- *  ⚠ 返回的 url 是服务器临时文件（media GC 10 分钟后回收）——调用方必须立即 localImgSaveFromUrl 转存浏览器本地。 */
-export async function genCharacterPortrait(opts: {
+/** 🎨 人物形象大图 AI 生成（v2.31，替代旧写真）：两步——先驱动文本双模型按**当前状态**写生图提示词，
+ *  再按预设比例调用生图 API（2K 档），客户端再精确裁切/缩放到预设像素。
+ *  提示词阶段占文本生成互斥（ui.generating，结束即释放）；出图阶段与编辑室【生图】块共用 genImage（不占文本互斥）。
+ *  ⚠ 返回的 url 是服务器临时文件（media GC 10 分钟后回收）——调用方必须立即 prepareCharacterImageUrl 转存浏览器本地。 */
+export async function genCharacterImage(opts: {
   id: string;
-  /** 写真针对的状态；缺省=当前状态（v2.30 每个状态独立写真） */
+  /** 形象针对的状态；缺省=当前状态（每个状态独立形象） */
   stateId?: string;
   engine: 'private' | 'public';
+  preset: CharacterImagePreset;
   onStage?: (stage: 'prompt' | 'image') => void;
 }): Promise<{ ok: boolean; url?: string; prompt?: string; error?: string }> {
   const st0 = useStudioStore.getState();
@@ -1437,14 +1443,24 @@ export async function genCharacterPortrait(opts: {
     ]
       .filter(Boolean)
       .join('\n');
+    const dims = CHARACTER_IMAGE_PRESET_DIMS[opts.preset];
+    const framing: Record<CharacterImagePreset, string> = {
+      '1:1': '方形 1:1：半身立绘，头部完整并略留顶部空间',
+      '4:3': '横向 4:3：半身人物为主，背景可带简约环境',
+      '16:9': '宽幅 16:9：人物置身场景中，主体清晰，完整保留头部',
+      '9:16': '竖幅 9:16：全身站姿，头顶留白、脚下完整',
+    };
     prompt = (
       await qwGenerate({
         messages: [
           {
             role: 'system',
-            content: `你是生图提示词写手：根据【人物设定】写一段中文生图提示词，用于生成该人物的单人立绘。
+            content: `你是生图提示词写手：根据【人物设定】写一段中文生图提示词，用于生成该人物的单张完整人物形象图。
 【人物设定】
 ${brief}
+【画面规格】
+- ${framing[opts.preset]}（目标成图 ${dims.w}×${dims.h}）
+- 画面中只有一个主体人物，头部完整、五官清晰；不要多人、文字、边框、水印、分屏或拼图
 【要求】
 - 一段话 60~150 字：外貌与年龄感、发型发色、服饰（贴合人物设定的时代背景）、神态气质、姿态动作、背景环境与光线
 - 只描述画面本身，不要出现人名，不要解释，不要输出提示词以外的任何内容`,
@@ -1465,9 +1481,10 @@ ${brief}
     useUiStore.getState().setGenerating(false);
   }
   if (!prompt) return { ok: false, error: 'AI 未返回提示词，请重试' };
-  // 出图阶段：不占文本互斥（与【生图】块一致），期间可继续大纲/正文/聊天生成
+  // 出图阶段：不占文本互斥（与【生图】块一致），期间可继续大纲/正文/聊天生成；
+  // 私有轨只接受比例与档位，统一请求 2K，再由客户端裁切到预设精确像素。
   opts.onStage?.('image');
-  const r = await genImage({ prompt, size: '1:1' });
+  const r = await genImage({ prompt, size: opts.preset, imageSize: '2K' });
   return r.ok && r.urls?.length ? { ok: true, url: r.urls[0], prompt } : { ok: false, error: r.error || '生成失败', prompt };
 }
 

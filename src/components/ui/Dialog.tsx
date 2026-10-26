@@ -12,7 +12,7 @@ const WIDTH = {
   lg: 'w-[min(620px,calc(100vw-2rem))]',
 } as const;
 
-/** ESC 只关最上层弹窗（素材选择器/写真灯箱可以叠在其它弹窗之上） */
+/** ESC 只关最上层弹窗（灯箱/裁切等浮层可以叠在其它弹窗之上） */
 const stack: symbol[] = [];
 
 export interface DialogProps {

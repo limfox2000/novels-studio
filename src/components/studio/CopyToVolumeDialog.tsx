@@ -1,6 +1,6 @@
 /** 🗂 跨卷复制对话框（v2.29，仅复制）：当前画布选中节点 → 另一张画布（默认主画布/其它卷）。
  *  - 保留 ID 镜像：同一人物/环境在另一卷的镜像；目标已有同 ID 时默认跳过，可改为更新数据（保留目标位置/父子）。
- *  - 复制为新：全部换新 ID，父子/内部连线/人物写真一起重映射，副本独立。
+ *  - 复制为新：全部换新 ID，父子/内部连线/人物形象与头像一起重映射，副本独立。
  *  只写目标画布，默认不切换标签；复制落点=目标画布已保存视口的中心（无视口则原点）。 */
 import { useEffect, useMemo, useState } from 'react';
 import { Copy, Loader2 } from 'lucide-react';
@@ -53,7 +53,7 @@ export function CopyToVolumeDialog({ onClose }: { onClose: () => void }) {
   const [switchAfter, setSwitchAfter] = useState(false);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<BoardCopyResult | null>(null);
-  const [portraitWarning, setPortraitWarning] = useState('');
+  const [imageWarning, setImageWarning] = useState('');
   const [error, setError] = useState('');
 
   // 目标画布被删除/切换后兜底到第一张可用目标
@@ -81,7 +81,7 @@ export function CopyToVolumeDialog({ onClose }: { onClose: () => void }) {
     setBusy(true);
     setError('');
     setResult(null);
-    setPortraitWarning('');
+    setImageWarning('');
     try {
       // 目标画布视口中心（flow 坐标）；没有保存视口时以原点为中心。
       // 用画布容器自身中心（顶栏/属性面板会让窗口中心偏移），容器未挂载时才退回窗口中心。
@@ -106,13 +106,13 @@ export function CopyToVolumeDialog({ onClose }: { onClose: () => void }) {
         selectResult: switchAfter,
       });
       setResult(r);
-      if (r.portraitTasks.length) {
-        const settled = await Promise.allSettled(
-          r.portraitTasks.map((t) => localImgCopy(t.fromKey, t.toKey)),
-        );
-        // 源人物本来就没有写真（'missing'）是正常情况，不提示；只有读写异常才算失败
+      if (r.imageTasks.length) {
+        const settled = await Promise.allSettled(r.imageTasks.map((t) => localImgCopy(t.fromKey, t.toKey)));
+        // 源人物本来就没有图/头像（'missing'）是正常情况，不提示；只有读写异常才算失败
         const failed = settled.filter((x) => x.status === 'rejected').length;
-        if (failed) setPortraitWarning(`${failed}/${r.portraitTasks.length} 张状态写真未能复制（节点已复制，可稍后重新生成写真）。`);
+        if (failed) {
+          setImageWarning(`${failed}/${r.imageTasks.length} 个形象图/头像文件未能复制（节点已复制，可稍后重新上传或生成）。`);
+        }
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -235,7 +235,7 @@ export function CopyToVolumeDialog({ onClose }: { onClose: () => void }) {
             {mode === 'mirror' && conflict === 'skip' ? '（将跳过这些节点，继续复制缺失后代）' : ''}
           </span>
         )}
-        {mode === 'new' && <span className="mt-1 block">新 ID 会自动重映射父子关系、内部连线与每个人物状态的写真。</span>}
+        {mode === 'new' && <span className="mt-1 block">新 ID 会自动重映射父子关系、内部连线与每个人物状态的形象/头像。</span>}
       </div>
 
       {error && <p className="mt-2 rounded-[8px] bg-rose-50 px-3 py-2 text-[12px] text-rose-600">{error}</p>}
@@ -247,7 +247,7 @@ export function CopyToVolumeDialog({ onClose }: { onClose: () => void }) {
           {result.report.warnings.length > 0 && (
             <span className="mt-1 block text-amber-700">{result.report.warnings.join('；')}</span>
           )}
-          {portraitWarning && <span className="mt-1 block text-amber-700">{portraitWarning}</span>}
+          {imageWarning && <span className="mt-1 block text-amber-700">{imageWarning}</span>}
         </div>
       )}
     </Dialog>
