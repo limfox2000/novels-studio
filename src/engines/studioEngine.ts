@@ -23,8 +23,8 @@ import { useUiStore } from '../stores/uiStore';
 import { GenerationAborted } from '../shared/generation';
 import { qwGenerate, qwenUserContent, qwenMessageChars, REASONING_EFFORT_MAX_TOKENS, type QwenChatMessage, type QwenUsage, type ReasoningEffort } from '../shared/qwenClient';
 import { startGeneration, stopGeneration } from '../shared/generation';
-import { agentGate, imageInputHint, promptCharBudget, QWEN_SAFE_LIMIT } from '../shared/agentShared';
-import { CHARACTER_IMAGE_PRESET_DIMS, ENV_TYPE_LABELS, ENV_TYPE_META, GENDER_LABELS, genderOf, type CharacterData, type CharacterGender, type CharacterImagePreset, type CharacterState, type EnvironmentType, type SimChapter, type SimNodeType, type SimVolume } from '../types/sim';
+import { agentGate, characterImageBatchHint, characterImageHint, imageInputHint, promptCharBudget, QWEN_SAFE_LIMIT, type CharacterImageBatch, type CharacterVisionRef } from '../shared/agentShared';
+import { CHARACTER_IMAGE_PRESET_DIMS, ENV_TYPE_LABELS, ENV_TYPE_META, GENDER_LABELS, genderOf, type CharacterData, type CharacterGender, type CharacterImagePreset, type CharacterState, type CharacterStateImage, type EnvironmentType, type SimChapter, type SimNodeType, type SimVolume } from '../types/sim';
 import type { WritingSkill } from '../types/writingSkill';
 import { buildWritingSkillsBlock } from './writingSkills';
 import { activeCharacterState, characterStateOf, STATE_LABEL_CAP } from '../stores/characterStates';
@@ -424,6 +424,231 @@ export function canvasLookupBlock(
   }
   const carried = carriedFrom ? `（本轮未点名，沿用最近提到的「${carriedFrom.slice(0, 40)}」）` : '';
   return `\n\n【画布检索】${carried}（系统按名字从画布查出的真实名单与归属，以此为准；回答/修改必须使用名单中的实际名字，不要凭记忆自拟名字）\n${parts.join('\n')}`;
+}
+
+/** 本轮按名/按群组命中的人物中、有形象大图的状态（编辑室读图候选）。
+ *  ⚠ 只有用户**明确要求读取形象图**时才检索画布；普通提到人物/长相/穿搭不会自动附图。
+ *  agent 没有工具调用，因此按消息里点到的状态名优先，否则当前状态，再退到第一个有图的状态。 */
+export interface CharacterImageCandidate {
+  nodeId: string;
+  name: string;
+  stateId: string;
+  stateLabel: string;
+  image: CharacterStateImage;
+}
+
+/** 批量读图的目标来源（气泡标注用）：named=本轮点名；environment=环境成员；history=回看最近提到的人；
+ *  chapter=当前章名单；canvas=当前画布有形象图的人物（「所有人」等没点名时的兜底）。 */
+export type CharacterImageScope = 'named' | 'environment' | 'history' | 'chapter' | 'canvas';
+
+export interface CharacterImageSelection {
+  /** 本轮实际选中的候选（按群组上限截断；store 再按批量大小拆成多次请求） */
+  candidates: CharacterImageCandidate[];
+  /** 命中且有形象大图的人物总数（可能大于 candidates.length） */
+  total: number;
+  /** 是否群组/批量请求（「这些人/他们/所有人/全员」） */
+  group: boolean;
+  source: CharacterImageScope;
+}
+
+/** 一次批量读图最多选多少人（store 会按每批 CHARACTER_VISION_MAX 张分多次请求）。
+ *  避免「所有人物形象」在几十人的画布上一次读完。 */
+export const CHARACTER_VISION_GROUP_MAX = 12;
+
+/** 明确要求读取形象图/立绘/参考图；只提名字或讨论长相不算。
+ *  也接受「看看李刚的图片」「参考他的立绘」这类 动词 + 图片/形象 的说法。 */
+const IMAGE_READ_REQUEST_RE = /形象图|形象大图|人物形象图|人物形象大图|人物图|人物图片|人物立绘|立绘|画像|参考图|原图|(?:读取|读一下|看一下|看看|查看|展示|发我|给我|提供|参考|对照|比对)[^。！？\n]{0,8}(?:形象|立绘|画像|图片|图像)/;
+/** 「根据其形象重新设置」「按照这些人的形象统一设计」：目的是按形象改设定，同样视为明确读图要求。
+ *  必须带改/统一类动作，避免把「根据形象写一段外貌描写」这种纯文字请求也变成读图。 */
+const IMAGE_BASIS_RE = /(?:根据|按照|依照|依据|基于|按|以|用)[^。！？\n]{0,10}(?:形象|立绘|画像|图片|图像|原图)[^。！？\n]{0,10}(?:重新|统一|改|调整|设置|设计|重做|重建|对照|核对|修改|为准)/;
+/** 明确请求里用代词/群组指代人物时才回看最近消息定位是谁。 */
+const IMAGE_REF_FOLLOWUP_RE = /他|她|他们|她们|其|这个人物|该人物|这个人|此人|上述|刚才|前面|该批|这批/;
+/** 群组读图：这些人/他们/全员/所有人…（决定是否展开环境成员、回看名单、或兜底到章节/画布） */
+const IMAGE_GROUP_REF_RE = /这些人|这批人|那些人|他们|她们|大家|全员|全体|所有(?:人物|角色|人)|全部(?:人物|角色|人)|每个人|各位|逐个|逐一/;
+/** 提到环境且带「里面的人/所有人」时才展开成员（只说「读取医院的形象图」不展开） */
+const IMAGE_ENV_GROUP_RE = /其中|里面|内部|里(?:的)?(?:人|人物|角色)|所有|全部|全员|全体|每个人|逐个|逐一/;
+
+type ImageTargetRef = { n: SimNodeType; stateId?: string };
+
+const allNamedChars = (idx: CanvasIdx): SimNodeType[] =>
+  idx.nodes.filter((n) => n.data.kind === 'character' && !!nameOf(n));
+
+/** 在一段文本里找出所有被点到的画布人物（不限于 matchScope 的前 6 个），按出现位置排序。
+ *  群组场景下用户可能一次列出 5~10 个名字，不能只取相似度前 6。 */
+function matchAllChars(idx: CanvasIdx, text: string, limit: number): SimNodeType[] {
+  const msg = normLookup(text);
+  if (!msg) return [];
+  const hits: Array<{ n: SimNodeType; score: number; at: number }> = [];
+  for (const n of allNamedChars(idx)) {
+    const score = lookupScore(n.data.name || '', msg);
+    if (!score) continue;
+    const full = normLookup(n.data.name || '');
+    hits.push({ n, score, at: full ? msg.indexOf(full) : -1 });
+  }
+  hits.sort((a, b) => {
+    if (a.at >= 0 && b.at >= 0) return a.at - b.at;
+    if (a.at >= 0) return -1;
+    if (b.at >= 0) return 1;
+    return b.score - a.score;
+  });
+  return hits.slice(0, limit).map((h) => h.n);
+}
+
+/** 命中环境 → 其内部（含下层）的有名人物；用于「医院里这些人」这种群组请求。 */
+function envOccupantTargets(idx: CanvasIdx, envs: SimNodeType[], limit: number): ImageTargetRef[] {
+  const out: ImageTargetRef[] = [];
+  const seen = new Set<string>();
+  for (const env of envs) {
+    if (env.data.kind !== 'environment') continue;
+    for (const c of collectEnvChars(idx, env)) {
+      if (!nameOf(c.n) || seen.has(c.n.id)) continue;
+      seen.add(c.n.id);
+      out.push({ n: c.n });
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+}
+
+/** 回看最近消息（用户与 agent 都算）：先找点名的人物，再找「某环境里这些人」的成员。
+ *  agent 消息也算，因为「这些人」经常指上一轮回复里列出的名单。 */
+function historyImageTargets(
+  idx: CanvasIdx,
+  history: ReadonlyArray<{ role: string; text: string }>,
+  allowEnv: boolean,
+  limit: number,
+): { refs: ImageTargetRef[]; text: string; source: CharacterImageScope } | undefined {
+  const recent = history.filter((m) => !!m.text?.trim()).slice(-16).reverse();
+  for (const m of recent) {
+    const chars = matchAllChars(idx, m.text, limit);
+    if (chars.length) return { refs: chars.map((n) => ({ n })), text: m.text, source: 'history' };
+    if (!allowEnv) continue;
+    const envs = matchScope(idx, m.text).envHits;
+    if (envs.length) {
+      const refs = envOccupantTargets(idx, envs, limit);
+      if (refs.length) return { refs, text: m.text, source: 'history' };
+    }
+  }
+  return undefined;
+}
+
+/** 群组请求完全没点名时：优先当前章名单，否则当前画布所有有名字的人物。
+ *  只对「这些人/他们/全员/所有人」生效；单数代词（其/他）不兜底到全画布。 */
+function defaultGroupTargets(
+  idx: CanvasIdx,
+  group: boolean,
+): { refs: ImageTargetRef[]; source: 'chapter' | 'canvas' } | undefined {
+  if (!group) return undefined;
+  const st = useStudioStore.getState();
+  const chapterId = useUiStore.getState().activeChapterId;
+  const chapter = st.chapters.find((c) => c.id === chapterId) ?? st.chapters[0];
+  const snap = chapter?.snapshot;
+  if (snap && snap.boardId === st.activeBoardId && snap.entries.length) {
+    const refs: ImageTargetRef[] = [];
+    for (const e of snap.entries) {
+      const n = idx.byId.get(e.characterId);
+      if (n?.data.kind === 'character' && nameOf(n)) refs.push({ n, stateId: e.stateId });
+    }
+    if (refs.length) return { refs, source: 'chapter' };
+  }
+  return { refs: allNamedChars(idx).map((n) => ({ n })), source: 'canvas' };
+}
+
+export function characterImageCandidates(
+  userMsg: string,
+  history: ReadonlyArray<{ role: string; text: string }> = [],
+  boardId?: string,
+): CharacterImageSelection {
+  const empty: CharacterImageSelection = { candidates: [], total: 0, group: false, source: 'named' };
+  const raw = (userMsg || '').trim();
+  // 没有明确读图要求：不检索画布、不附图
+  if (!raw || (!IMAGE_READ_REQUEST_RE.test(raw) && !IMAGE_BASIS_RE.test(raw))) return empty;
+  const idx = canvasIdx(boardId);
+  if (!idx.nodes.length) return empty;
+
+  const group = IMAGE_GROUP_REF_RE.test(raw);
+  let refs: ImageTargetRef[] = [];
+  let source: CharacterImageScope = 'named';
+  let scopeText = raw;
+
+  // 1) 本轮点名的人物（全部，不限于前 6 个）
+  const directChars = matchAllChars(idx, raw, 60);
+  if (directChars.length) refs = directChars.map((n) => ({ n }));
+
+  // 2) 本轮点名「某环境里的人/所有人」→ 展开成员（只说「读取医院的形象图」时不展开）
+  const directEnvs = matchScope(idx, raw).envHits;
+  if (directEnvs.length && (group || IMAGE_ENV_GROUP_RE.test(raw))) {
+    const occ = envOccupantTargets(idx, directEnvs, 60);
+    const seen = new Set(refs.map((r) => r.n.id));
+    const extra = occ.filter((r) => !seen.has(r.n.id));
+    if (extra.length) {
+      refs.push(...extra);
+      if (!directChars.length) source = 'environment';
+    }
+  }
+
+  // 3) 没点名且用了代词/群组说法（这些人/他们/其）→ 回看最近消息里点到的人或环境成员
+  const followup = IMAGE_REF_FOLLOWUP_RE.test(raw) || group;
+  if (!refs.length && followup) {
+    const carried = historyImageTargets(idx, history, group || IMAGE_ENV_GROUP_RE.test(raw), 60);
+    if (carried) {
+      refs = carried.refs;
+      scopeText = carried.text;
+      source = carried.source;
+    }
+  }
+
+  // 4) 群组请求仍没目标 → 当前章名单 / 当前画布有图人物
+  if (!refs.length) {
+    const fallback = defaultGroupTargets(idx, group);
+    if (fallback) {
+      refs = fallback.refs;
+      source = fallback.source;
+    }
+  }
+  if (!refs.length) return { ...empty, group };
+
+  // 去重（同一人物只读一张）并按顺序解析最终状态
+  const seen = new Set<string>();
+  const uniq = refs.filter((r) => {
+    if (seen.has(r.n.id)) return false;
+    seen.add(r.n.id);
+    return true;
+  });
+  const normRaw = normLookup(raw);
+  const normScope = normLookup(scopeText);
+  const all: CharacterImageCandidate[] = [];
+  for (const r of uniq) {
+    if (r.n.data.kind !== 'character') continue;
+    const d = r.n.data;
+    const name = nameOf(r.n);
+    if (!name) continue; // 未命名人物无法在提示里对应图片
+    // 长标签优先，避免「状态1」命中「状态10」
+    const findWanted = (normText: string) =>
+      [...d.states]
+        .sort((a, b) => normLookup(b.label).length - normLookup(a.label).length)
+        .find((s) => {
+          const label = normLookup(s.label);
+          return label.length >= 2 && normText.includes(label);
+        });
+    const wantedNow = findWanted(normRaw);
+    const wantedCarried = scopeText !== raw ? findWanted(normScope) : undefined;
+    const preferred = r.stateId ? d.states.find((s) => s.id === r.stateId) : undefined;
+    const cur = activeCharacterState(d);
+    const state =
+      (wantedNow?.image ? wantedNow : undefined) ??
+      (preferred?.image ? preferred : undefined) ??
+      (wantedCarried?.image ? wantedCarried : undefined) ??
+      (cur.image ? cur : d.states.find((s) => !!s.image));
+    if (!state?.image) continue;
+    all.push({ nodeId: r.n.id, name, stateId: state.id, stateLabel: state.label, image: state.image });
+  }
+  return {
+    candidates: all.slice(0, CHARACTER_VISION_GROUP_MAX),
+    total: all.length,
+    group,
+    source,
+  };
 }
 
 // ── 🎯 全文目标（v2.16）：各处生成的统一方向 ──
@@ -1278,6 +1503,10 @@ export async function genSimTurn(opts: {
   userMsg: string;
   /** 本轮用户附带的图片 data URL（仅 🏠 私有视觉模型支持） */
   userImages?: string[];
+  /** 系统自动附带的画布人物形象图（仅 🏠 私有视觉模型；排在用户附图之后） */
+  charImages?: CharacterVisionRef[];
+  /** 多批读图时的批次信息（系统按每批 ≤3 张分多次请求） */
+  charImageBatch?: CharacterImageBatch;
   summary?: string;
   /** 推理强度（off=直接答；越高补全预算越大） */
   reasoningEffort?: ReasoningEffort;
@@ -1291,7 +1520,9 @@ export async function genSimTurn(opts: {
   const ui = useUiStore.getState();
   if (ui.generating) return { ok: false, error: '已有生成任务进行中' };
   const engine = opts.engine ?? 'private';
-  const hasImages = !!opts.userImages?.length || opts.history.some((m) => !!m.images?.length);
+  const charImages = opts.charImages ?? [];
+  const turnImages = [...(opts.userImages ?? []), ...charImages.map((c) => c.url)];
+  const hasImages = !!turnImages.length || opts.history.some((m) => !!m.images?.length);
   if (hasImages && engine !== 'private') return { ok: false, error: '图像分析需要使用 🏠 私有模型，请在模型中心切换后重试' };
   const gate = await agentGate(engine);
   if (gate) return { ok: false, error: gate };
@@ -1301,13 +1532,15 @@ export async function genSimTurn(opts: {
       content:
         buildSimSystem(opts.summary ?? '', buildReadBlock(opts.userMsg), opts.userMsg, opts.history) +
         mentorBlocks(opts.userMsg, opts.mentors) +
-        imageInputHint(opts.userImages?.length ?? 0),
+        imageInputHint(turnImages.length, charImages.length) +
+        characterImageHint(charImages) +
+        characterImageBatchHint(opts.charImageBatch),
     },
     ...opts.history.map((m) => ({
       role: m.role === 'agent' ? ('assistant' as const) : ('user' as const),
       content: qwenUserContent(m.text, m.images),
     })),
-    { role: 'user', content: qwenUserContent(opts.userMsg, opts.userImages) },
+    { role: 'user', content: qwenUserContent(opts.userMsg, turnImages.length ? turnImages : undefined) },
   ];
   // 失控保险：总长超预算从最旧历史开始丢（保留 system 与本轮消息）；预算按模型 nCtx 动态预留补全空间，
   // 聊久后提示词不会挤占补全导致输出被服务端提前截断。图片按固定字符成本计入。

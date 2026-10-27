@@ -3,7 +3,14 @@
  *  genSimTurn 内含 agentGate 预检/页面互斥。压缩上下文复用 agentShared 的 compactAgentContext。 */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { genSimTurn, type SimChatMsg } from '../engines/studioEngine';
+import {
+  characterImageCandidates,
+  genSimTurn,
+  type CharacterImageCandidate,
+  type SimBlock,
+  type SimChatMsg,
+  type SimWriteBlock,
+} from '../engines/studioEngine';
 import { genEditorTurn, type Editor, type EditorTurnResult } from '../engines/meetingEngine';
 import type { ResponsibleEditor } from '../engines/studioEngine';
 import { compactAgentContext } from '../shared/agentShared';
@@ -18,6 +25,7 @@ import {
   type ChatAttachmentInput,
   type ChatAttachmentMeta,
 } from '../services/chatAttachments';
+import { CHARACTER_VISION_MAX, loadCharacterVisionImage } from '../services/characterImages';
 
 export interface EditorRoomMessage {
   id: string;
@@ -34,6 +42,10 @@ export interface EditorRoomMessage {
   images?: Array<{ i: number; url: string }>;
   /** 用户粘贴的图片元数据（仅 user 消息）：本体在 IndexedDB 的 chat:<msgId>:u:<i>，存档只存轻量字段 */
   attachments?: ChatAttachmentMeta[];
+  /** 本轮系统自动读取的画布人物形象（仅 agent 消息，私有视觉模型）：轻量元数据，图片本体在人物形象的 IndexedDB 里 */
+  charImageRefs?: Array<{ name: string; state: string }>;
+  /** 批量读图的来源/上限说明（「按当前章节名单」「分 2 批分析」等；无则不显示） */
+  charImageNote?: string;
   /** 本条 agent 回复的对话对象（与编辑部某位编辑单独对话时记录；总编辑对话无此字段） */
   editorId?: string;
   editorName?: string;
@@ -85,6 +97,14 @@ export interface EditorRoomUsage {
 const MAX_MESSAGES = 60; // 持久化上限（超过裁最旧）
 const COMPACT_KEEP = 6; // 压缩后保留最近消息条数
 const AUTO_COMPACT_RATIO = 0.92;
+/** 一次群组读图最多分几批（每批 ≤CHARACTER_VISION_MAX 张），防止「全画布人物」变成几十次请求 */
+const CHARACTER_VISION_MAX_BATCHES = 4;
+
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
 
 interface EditorRoomState {
   messages: EditorRoomMessage[];
@@ -145,7 +165,14 @@ export const useEditorRoomStore = create<EditorRoomState>()(
           engine === 'private' && pushUser?.attachments?.length
             ? await loadChatAttachmentUrls(pushUser.id, pushUser.attachments).catch(() => [])
             : [];
-        let imageBudget = Math.max(0, CHAT_VISION_TOTAL_MAX - currentImages.length);
+        // 🖼 人物形象：仅私有视觉模型；只有用户明确要求读取形象图/立绘/参考图时才检索画布并读大图，
+        // 普通提到人物不附图。群组请求（这些人/他们/全员）会展开环境成员/章节名单，再按每批 ≤3 张分多次请求。
+        const selection =
+          engine === 'private'
+            ? characterImageCandidates(userText, history)
+            : { candidates: [], total: 0, group: false, source: 'named' as const };
+        // 明确读图时人物形象优先：本轮不再带历史附图，避免旧图把 4 张预算占满、一张形象图都塞不进来
+        let imageBudget = selection.candidates.length ? 0 : Math.max(0, CHAT_VISION_TOTAL_MAX - currentImages.length);
         const historyMsgs: SimChatMsg[] = [];
         for (let i = history.length - 1; i >= 0; i--) {
           const m = history[i];
@@ -159,103 +186,201 @@ export const useEditorRoomStore = create<EditorRoomState>()(
           }
           historyMsgs.unshift({ role: m.role, text: m.text, ...(images ? { images } : {}) });
         }
+        // 每批 = min(3 张, 本轮剩余图片预算)，同时给用户本轮附图留位置；最多 4 批。
+        const batchSize = Math.min(
+          CHARACTER_VISION_MAX,
+          Math.max(0, CHAT_VISION_TOTAL_MAX - currentImages.length),
+        );
+        const targets = batchSize > 0
+          ? selection.candidates.slice(0, batchSize * CHARACTER_VISION_MAX_BATCHES)
+          : [];
+        const loadedChars = (
+          await Promise.all(
+            targets.map(async (c) => {
+              const url = await loadCharacterVisionImage(c.image).catch(() => undefined);
+              return url ? { ...c, url } : undefined;
+            }),
+          )
+        ).filter((x): x is CharacterImageCandidate & { url: string } => !!x);
+        const charBatches = batchSize > 0 ? chunkArray(loadedChars, batchSize) : [];
+        const callBatches: Array<Array<CharacterImageCandidate & { url: string }>> = charBatches.length ? charBatches : [[]];
+        // 气泡一次列出全部已读人物（而不是只显示最后一批），并标注来源/上限
+        const charImageRefs = loadedChars.map(({ name, stateLabel }) => ({ name, state: stateLabel }));
+        const noteParts: string[] = [];
+        if (selection.group && (selection.source === 'chapter' || selection.source === 'canvas')) {
+          noteParts.push(selection.source === 'chapter' ? '按当前章节名单' : '按当前画布人物');
+        }
+        if (selection.candidates.length && batchSize === 0) {
+          noteParts.push('本轮附图已占满 4 张图片上限，人物形象未读取；请不带附图重发');
+        } else if (selection.total > loadedChars.length) {
+          noteParts.push(`共 ${selection.total} 人有形象，本轮读取 ${loadedChars.length} 人`);
+        }
+        if (charBatches.length > 1) noteParts.push(`分 ${charBatches.length} 批分析`);
+        const charImageNote = noteParts.join('；');
 
         const aid = `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         set((s) => ({
           messages: [
             ...s.messages,
             ...(pushUser ? [pushUser] : []),
-            { id: aid, role: 'agent' as const, text: '', ts: Date.now() },
+            {
+              id: aid,
+              role: 'agent' as const,
+              text: '',
+              ts: Date.now(),
+              ...(charImageRefs.length ? { charImageRefs } : {}),
+              ...(charImageNote ? { charImageNote } : {}),
+            },
           ].slice(-MAX_MESSAGES),
           busy: true,
           error: '',
         }));
-        let lastFlush = 0;
-        let lastThinkFlush = 0;
         const ed = get().chatEditor; // 对话对象发起前定格（切换按钮 busy 时禁用）
-        const common = {
-          history: historyMsgs,
-          userMsg: userText,
-          ...(currentImages.length ? { userImages: currentImages } : {}),
-          reasoningEffort: get().settings.reasoningEffort,
-          engine,
-          onDelta: (acc: string) => {
-            const now = Date.now();
-            if (now - lastFlush > 400) {
-              lastFlush = now;
-              useEditorRoomStore.setState((s) => ({
-                messages: s.messages.map((m) => (m.id === aid ? { ...m, text: acc } : m)),
-              }));
-            }
-          },
-          onThink: (acc: string) => {
-            const now = Date.now();
-            if (now - lastThinkFlush > 400) {
-              lastThinkFlush = now;
-              useEditorRoomStore.setState((s) => ({
-                messages: s.messages.map((m) => (m.id === aid ? { ...m, think: acc } : m)),
-              }));
-            }
-          },
-          onUsage: (u: QwenUsage) => {
-            useEditorRoomStore.setState({
-              usage: { promptTokens: u.prompt_tokens, completionTokens: u.completion_tokens, nCtx: get().meta?.nCtx ?? 0, at: Date.now() },
-            });
-          },
-        };
-        // 对话对象：编辑部编辑=职责系统+【更新职责】协议；总编辑=原 genSimTurn（含摘要/画布写入协议+🏛 全文协作责编）
-        const r = ed
-          ? await genEditorTurn({ ...common, editor: ed })
-          : await genSimTurn({ ...common, summary: get().summary, mentors: get().mentorByModule });
-        if (r.ok && r.chat !== undefined) {
-          // 编辑单独对话与总编辑轮次的返回形状不同：blocks/writes 两形状均可选携带，personaDraft/memUpdates 仅编辑轮次有
-          const uni = r as Partial<EditorTurnResult>;
-          const blocks = uni.blocks;
-          const writes = uni.writes;
-          const personaDraft = uni.personaDraft;
-          const memUpdates = uni.memUpdates;
-          useEditorRoomStore.setState((s) => ({
-            messages: s.messages.map((m) =>
-              m.id === aid
-                ? {
-                    ...m,
-                    text: r.chat!,
-                    ts: Date.now(),
-                    engine: r.engine,
-                    ...(ed ? { editorId: ed.id, editorName: ed.name } : {}),
-                    ...(blocks?.length ? { blocks } : { blocks: undefined }),
-                    ...(writes?.length ? { writes } : { writes: undefined }),
-                    ...(personaDraft ? { personaDraft } : { personaDraft: undefined }),
-                    ...(memUpdates?.length ? { memUpdates } : { memUpdates: undefined }),
-                  }
-                : m,
-            ),
-            error: '',
-            busy: false,
-          }));
-          // 自动压缩：本轮用量超阈值（nCtx 已知才判）
-          const s = get();
-          if (
-            s.settings.autoCompact &&
-            !s.compactBusy &&
-            s.usage &&
-            s.usage.nCtx > 0 &&
-            (s.usage.promptTokens + s.usage.completionTokens) / s.usage.nCtx > AUTO_COMPACT_RATIO
-          ) {
-            void get().compact();
+        let accText = '';
+        let accThink = '';
+        const mergedBlocks: SimBlock[] = [];
+        const mergedWrites: SimWriteBlock[] = [];
+        const memByTarget = new Map<string, string[]>();
+        let personaDraft: string | undefined;
+        let lastEngine: 'private' | 'public' | undefined;
+        let produced = false;
+        let failError = '';
+        const usageSum = { promptTokens: 0, completionTokens: 0 };
+
+        // 每批一次请求：人物形象图每批 ≤3 张；结果按批次标题拼成一条 agent 回复，blocks/writes 合并供一键落地。
+        for (let bi = 0; bi < callBatches.length; bi++) {
+          const batch = callBatches[bi];
+          const batchNo = bi + 1;
+          const batchesTotal = callBatches.length;
+          const heading =
+            batchesTotal > 1
+              ? `${accText ? '\n\n' : ''}【第 ${batchNo}/${batchesTotal} 批：${batch
+                  .map((c) => `${c.name}（${c.stateLabel}）`)
+                  .join('、')}】\n`
+              : '';
+          const baseText = accText + heading;
+          if (heading) {
+            useEditorRoomStore.setState((s) => ({
+              messages: s.messages.map((m) => (m.id === aid ? { ...m, text: baseText } : m)),
+            }));
           }
-        } else {
-          // 中止/失败：已有部分文本则保留并标注，空泡删除
-          useEditorRoomStore.setState((s) => {
-            const cur = s.messages.find((m) => m.id === aid);
-            return cur && cur.text.trim()
+          let lastFlush = 0;
+          let lastThinkFlush = 0;
+          const baseThink = accThink;
+          const common = {
+            history: historyMsgs,
+            userMsg: userText,
+            ...(currentImages.length ? { userImages: currentImages } : {}),
+            ...(batch.length
+              ? { charImages: batch.map((c) => ({ name: c.name, state: c.stateLabel, url: c.url })) }
+              : {}),
+            ...(batchesTotal > 1 ? { charImageBatch: { index: batchNo, total: batchesTotal } } : {}),
+            reasoningEffort: get().settings.reasoningEffort,
+            engine,
+            onDelta: (acc: string) => {
+              const now = Date.now();
+              if (now - lastFlush > 400) {
+                lastFlush = now;
+                const text = baseText + acc;
+                useEditorRoomStore.setState((s) => ({
+                  messages: s.messages.map((m) => (m.id === aid ? { ...m, text } : m)),
+                }));
+              }
+            },
+            onThink: (acc: string) => {
+              const now = Date.now();
+              if (now - lastThinkFlush > 400) {
+                lastThinkFlush = now;
+                accThink = baseThink + (baseThink && acc ? '\n' : '') + acc;
+                useEditorRoomStore.setState((s) => ({
+                  messages: s.messages.map((m) => (m.id === aid ? { ...m, think: accThink } : m)),
+                }));
+              }
+            },
+            onUsage: (u: QwenUsage) => {
+              usageSum.promptTokens += u.prompt_tokens;
+              usageSum.completionTokens += u.completion_tokens;
+              useEditorRoomStore.setState({
+                usage: {
+                  promptTokens: usageSum.promptTokens,
+                  completionTokens: usageSum.completionTokens,
+                  nCtx: get().meta?.nCtx ?? 0,
+                  at: Date.now(),
+                },
+              });
+            },
+          };
+          // 对话对象：编辑部编辑=职责系统+【更新职责】协议；总编辑=原 genSimTurn（含摘要/画布写入协议+🏛 全文协作责编）
+          const r = ed
+            ? await genEditorTurn({ ...common, editor: ed })
+            : await genSimTurn({ ...common, summary: get().summary, mentors: get().mentorByModule });
+          if (r.ok && r.chat !== undefined) {
+            // 编辑单独对话与总编辑轮次的返回形状不同：blocks/writes 两形状均可选携带，personaDraft/memUpdates 仅编辑轮次有
+            const uni = r as Partial<EditorTurnResult>;
+            accText += heading + r.chat;
+            produced = true;
+            if (uni.blocks?.length) mergedBlocks.push(...uni.blocks);
+            if (uni.writes?.length) mergedWrites.push(...uni.writes);
+            if (uni.personaDraft && !personaDraft) personaDraft = uni.personaDraft;
+            for (const u of uni.memUpdates ?? []) {
+              const arr = memByTarget.get(u.target) ?? [];
+              arr.push(u.text);
+              memByTarget.set(u.target, arr);
+            }
+            if (r.engine) lastEngine = r.engine;
+          } else {
+            failError = r.error || '生成失败';
+            if (!produced) break;
+            accText += `\n\n（第 ${batchNo}/${batchesTotal} 批读取失败：${failError}）`;
+            break;
+          }
+        }
+
+        if (!produced) {
+          // 首批就失败/中止：空泡删除（与单轮行为一致）
+          useEditorRoomStore.setState((s) => ({
+            messages: s.messages.filter((m) => m.id !== aid),
+            busy: false,
+            error: failError || '生成失败',
+          }));
+          return;
+        }
+        // 同一目标的多批记忆合并成一条（气泡按 msgId:target 去重吸收，不能拆成多条）
+        const memUpdates = [...memByTarget].map(([target, texts]) => ({
+          target,
+          text: texts.join('\n'),
+          count: texts.length,
+        }));
+        useEditorRoomStore.setState((s) => ({
+          messages: s.messages.map((m) =>
+            m.id === aid
               ? {
-                  messages: s.messages.map((m) => (m.id === aid ? { ...m, text: `${m.text}\n（已停止）` } : m)),
-                  busy: false,
-                  error: r.error || '生成失败',
+                  ...m,
+                  text: accText,
+                  think: accThink || undefined,
+                  ts: Date.now(),
+                  engine: lastEngine,
+                  ...(ed ? { editorId: ed.id, editorName: ed.name } : {}),
+                  ...(mergedBlocks.length ? { blocks: mergedBlocks } : { blocks: undefined }),
+                  ...(mergedWrites.length ? { writes: mergedWrites } : { writes: undefined }),
+                  ...(personaDraft ? { personaDraft } : { personaDraft: undefined }),
+                  ...(memUpdates.length ? { memUpdates } : { memUpdates: undefined }),
                 }
-              : { messages: s.messages.filter((m) => m.id !== aid), busy: false, error: r.error || '生成失败' };
-          });
+              : m,
+          ),
+          error: failError,
+          busy: false,
+        }));
+        // 自动压缩：本轮用量超阈值（nCtx 已知才判）
+        const s = get();
+        if (
+          s.settings.autoCompact &&
+          !s.compactBusy &&
+          s.usage &&
+          s.usage.nCtx > 0 &&
+          (s.usage.promptTokens + s.usage.completionTokens) / s.usage.nCtx > AUTO_COMPACT_RATIO
+        ) {
+          void get().compact();
         }
       };
 

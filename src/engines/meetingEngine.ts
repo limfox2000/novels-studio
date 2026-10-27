@@ -4,7 +4,7 @@
  *  停止时由调用方置 cancelled 并中止当前请求。纪要不自动写入项目。 */
 import { qwGenerate, qwenUserContent, qwenMessageChars, REASONING_EFFORT_MAX_TOKENS, type QwenChatMessage, type QwenUsage, type ReasoningEffort } from '../shared/qwenClient';
 import { GenerationAborted } from '../shared/generation';
-import { agentGate, imageInputHint, promptCharBudget } from '../shared/agentShared';
+import { agentGate, characterImageBatchHint, characterImageHint, imageInputHint, promptCharBudget, type CharacterImageBatch, type CharacterVisionRef } from '../shared/agentShared';
 import { buildMaterialBlock, buildReadBlock, parseSimOutput, chaptersBlock, simCanvasIndex, canvasLookupBlock, chapterAgentBlockIfRelevant, EDITOR_MODULE_CAPS, WRITE_TARGETS, matchMentorModules, type MaterialKey, type SimChatMsg, type SimBlock, type SimWriteBlock, type WriteField } from './studioEngine';
 import { sanitizeMemoryEntries, TEMPLATE_CRAFT_SECTIONS } from './memoryTemplates';
 import { useUiStore } from '../stores/uiStore';
@@ -467,6 +467,10 @@ export async function genEditorTurn(opts: {
   userMsg: string;
   /** 本轮用户附带的图片 data URL（仅 🏠 私有视觉模型支持） */
   userImages?: string[];
+  /** 系统自动附带的画布人物形象图（仅 🏠 私有视觉模型；排在用户附图之后） */
+  charImages?: CharacterVisionRef[];
+  /** 多批读图时的批次信息（系统按每批 ≤3 张分多次请求） */
+  charImageBatch?: CharacterImageBatch;
   /** 推理强度（off=直接答；越高补全预算越大） */
   reasoningEffort?: ReasoningEffort;
   engine?: 'private' | 'public';
@@ -477,20 +481,26 @@ export async function genEditorTurn(opts: {
   const ui = useUiStore.getState();
   if (ui.generating) return { ok: false, error: '已有生成任务进行中' };
   const engine = opts.engine ?? 'private';
-  const hasImages = !!opts.userImages?.length || opts.history.some((m) => !!m.images?.length);
+  const charImages = opts.charImages ?? [];
+  const turnImages = [...(opts.userImages ?? []), ...charImages.map((c) => c.url)];
+  const hasImages = !!turnImages.length || opts.history.some((m) => !!m.images?.length);
   if (hasImages && engine !== 'private') return { ok: false, error: '图像分析需要使用 🏠 私有模型，请在模型中心切换后重试' };
   const gate = await agentGate(engine);
   if (gate) return { ok: false, error: gate };
   const msgs: QwenChatMessage[] = [
     {
       role: 'system',
-      content: editorChatSystem(opts.editor, opts.userMsg, opts.history) + imageInputHint(opts.userImages?.length ?? 0),
+      content:
+        editorChatSystem(opts.editor, opts.userMsg, opts.history) +
+        imageInputHint(turnImages.length, charImages.length) +
+        characterImageHint(charImages) +
+        characterImageBatchHint(opts.charImageBatch),
     },
     ...opts.history.map((m) => ({
       role: m.role === 'agent' ? ('assistant' as const) : ('user' as const),
       content: qwenUserContent(m.text, m.images),
     })),
-    { role: 'user', content: qwenUserContent(opts.userMsg, opts.userImages) },
+    { role: 'user', content: qwenUserContent(opts.userMsg, turnImages.length ? turnImages : undefined) },
   ];
   // 失控保险：总长超预算从最旧历史开始丢（保留 system 与本轮消息）；预算按模型 nCtx 动态预留补全空间。
   // 图片按固定字符成本计入。补全预算：⚙「✍ 编辑输出不设上限」开（默认）=16384（实际写完为止，对话不可能触到）；关=8192。

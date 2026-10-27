@@ -228,6 +228,41 @@ export async function saveHeadshot(
   };
 }
 
+// ── 编辑室视觉输入（agent 读取人物形象）──
+
+/** 一次对话消息里自动附带的人物形象图上限（与用户附图共享 CHAT_VISION_TOTAL_MAX 预算） */
+export const CHARACTER_VISION_MAX = 3;
+/** 发给视觉模型前把最长边压到这个尺寸：保留五官/穿搭细节，又避免 1920 大图撑大请求与视觉 token */
+export const CHARACTER_VISION_EDGE = 1024;
+
+/** 人物形象大图 → 视觉模型输入（最长边压到 maxEdge）；大图字节缺失返回 undefined（不回退裁切头像）。
+ *  只读 IndexedDB，不改动原始存档；每轮按需读取，不做常驻缓存（图片体积大，避免长期占用内存）。 */
+export async function loadCharacterVisionImage(
+  image: CharacterStateImage,
+  maxEdge = CHARACTER_VISION_EDGE,
+): Promise<string | undefined> {
+  const dataUrl = await localImgGet(image.key).catch(() => undefined);
+  if (!dataUrl) return undefined;
+  try {
+    const decoded = await decodeDataUrl(dataUrl);
+    try {
+      const edge = Math.max(decoded.width, decoded.height);
+      if (edge <= maxEdge) return dataUrl;
+      const scale = maxEdge / edge;
+      const w = Math.max(1, Math.round(decoded.width * scale));
+      const h = Math.max(1, Math.round(decoded.height * scale));
+      const { canvas, ctx } = canvasOf(w, h);
+      ctx.drawImage(decoded.src, 0, 0, w, h);
+      return exportJpeg(canvas);
+    } finally {
+      decoded.close();
+    }
+  } catch {
+    // 缩放失败时退回原图，交给上游视觉模型处理
+    return dataUrl;
+  }
+}
+
 // ── 头像缓存（画布节点与属性面板共用） ──
 
 const headCache = new Map<string, string>();

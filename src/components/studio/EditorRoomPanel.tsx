@@ -1409,6 +1409,23 @@ export function EditorRoomPanel({ onClose }: { onClose: () => void }) {
               />
             </div>
           )}
+          {!isUser && (!!m.charImageRefs?.length || !!m.charImageNote) && (
+            <div
+              className="mt-0.5 flex flex-wrap items-center gap-1 px-0.5 text-[12px] text-slate-400"
+              title="编辑本轮从画布人物属性读取了这些形象图（仅 🏠 私有视觉模型）；群组请求会按每批 ≤3 张分批分析。可在属性面板的人物形象区查看或更换"
+            >
+              <ImageIcon className="h-3.5 w-3.5" />
+              {m.charImageRefs?.length ? (
+                <>
+                  已读取人物形象：
+                  {m.charImageRefs.map((r) => `${r.name}${r.state ? `（${r.state}）` : ''}`).join('、')}
+                </>
+              ) : (
+                '人物形象未读取'
+              )}
+              {m.charImageNote && <span className="text-slate-300">（{m.charImageNote}）</span>}
+            </div>
+          )}
           {!isUser && !streaming && m.text && (
             <div className="mt-0.5 flex items-center gap-1 px-0.5">
               {m.editorName && (

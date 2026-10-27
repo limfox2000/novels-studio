@@ -17,10 +17,48 @@ export interface AgentChatMsg {
   text: string;
 }
 
-/** 本轮带图时注入的系统提示：直接观察图片，并把可见细节用于人物/环境设计。 */
-export function imageInputHint(count: number): string {
-  if (!count) return '';
-  return `\n\n【图片输入】本轮用户附带了 ${count} 张图片，已作为图像内容提供。请直接观察图片回答，不要声称无法查看图片；分析人物时可提取长相、发型、穿搭、配饰、材质、配色与气质，分析环境时可提取空间结构、光线、色调、物件与氛围。只写图片中可见或可合理推断的信息，不凭空补充；用户要求用于人物/环境设计时，按既有协议输出可落地设定块。`;
+/** 随消息附带的画布人物形象图（仅私有视觉模型） */
+export interface CharacterVisionRef {
+  /** 人物名 */
+  name: string;
+  /** 形象所属状态标签 */
+  state: string;
+  /** data URL */
+  url: string;
+}
+
+/** 批量读图的分批信息（1 起）：一次请求只带一批人物形象，多批由 store 顺序发送并汇总。 */
+export interface CharacterImageBatch {
+  index: number;
+  total: number;
+}
+
+/** 本轮带图时注入的系统提示：直接观察图片，并把可见细节用于人物/环境设计。
+ *  characterCount=其中来自画布人物属性、由系统自动附上的形象图数量（排在用户附图之后）。 */
+export function imageInputHint(count: number, characterCount = 0): string {
+  if (!count && !characterCount) return '';
+  const origin = !characterCount
+    ? `本轮用户附带了 ${count} 张图片`
+    : characterCount === count
+      ? `本轮附带了 ${count} 张画布人物形象图`
+      : `本轮附带了 ${count} 张图片（末尾 ${characterCount} 张为画布人物形象图，其余为用户附图）`;
+  return `\n\n【图片输入】${origin}，已作为图像内容提供。请直接观察图片回答，不要声称无法查看图片；分析人物时可提取长相、发型、穿搭、配饰、材质、配色与气质，分析环境时可提取空间结构、光线、色调、物件与氛围。只写图片中可见或可合理推断的信息，不凭空补充；用户要求用于人物/环境设计时，按既有协议输出可落地设定块。`;
+}
+
+/** 画布人物形象图的来源说明：让模型知道这些图对应哪个人物/状态、不是用户新上传的参考图，
+ *  以及主要用途是「对照文字设定、统一人物设计」。 */
+export function characterImageHint(refs: ReadonlyArray<Pick<CharacterVisionRef, 'name' | 'state'>>): string {
+  if (!refs.length) return '';
+  const list = refs
+    .map((r, i) => `${i + 1}.「${r.name}」${r.state ? `（形象状态：${r.state}）` : ''}`)
+    .join('；');
+  return `\n\n【画布人物形象图】用户本轮明确要求读取人物形象，系统已从其人物属性中读取 ${refs.length} 张形象大图并附在本条消息末尾，顺序：${list}。这些图不是用户新上传的参考图，主要用于**统一人物设计**：把图中可见的长相、身材、穿搭、配饰、气质与该人物的文字设定逐项对照，指出不一致处并给出可落地的统一建议（改文字或改形象由用户决定）。只写图中可见或可合理推断的信息，看不清或图里没有的内容不要编造；除非用户明确要求写入，不要自行修改设定。`;
+}
+
+/** 多批读图时的系统提示：让模型只处理本批人物，避免它声称看不到其它批次或给没附图的人编造形象。 */
+export function characterImageBatchHint(batch: CharacterImageBatch | undefined): string {
+  if (!batch || batch.total <= 1) return '';
+  return `\n\n【分批读取形象图】本轮人物形象图较多，系统按每批最多 3 张分 ${batch.total} 批发送，当前是第 ${batch.index}/${batch.total} 批。只分析和处理本批附图人物；用户原话里的「这些人/他们/全部/所有人」在本批中仅指本批人物。不要声称看不到其它批次的人物，不要编造未附图人物的长相，也不要输出不在本批名单中的人物设定；其它批次会另行发送，最后由系统汇总。`;
 }
 
 /** Qwen 动作预检：不在线时返回指引文案（不进入页面互斥、快速失败）；在线返回 null */
