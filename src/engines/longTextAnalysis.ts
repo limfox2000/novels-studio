@@ -12,6 +12,12 @@ import { agentGate, promptCharBudget } from '../shared/agentShared';
 import { qwGenerate, type QwenUsage } from '../shared/qwenClient';
 import { GenerationAborted, startGeneration } from '../shared/generation';
 import { useUiStore } from '../stores/uiStore';
+import {
+  sanitizeWritingSkillContent,
+  sanitizeWritingSkillDesc,
+  sanitizeWritingSkillName,
+  type WritingSkillInput,
+} from '../types/writingSkill';
 import type { Editor } from './meetingEngine';
 
 const MAX_TOKENS = 3072;
@@ -116,6 +122,26 @@ function normalizeDirection(raw: string): string {
   return raw.replace(/\s+/g, ' ').trim().slice(0, DIRECTION_CAP);
 }
 
+/** 方向要求整理写作技能（如「把 xx 写法整理成一个写作 skill」）时，分析需按技能规范产出 */
+export function directionWantsWritingSkill(direction: string): boolean {
+  return /技能|skill/i.test(direction);
+}
+
+/** 写作技能规范：skill 模式下拼进每次调用的 system，让模型知道目标与产出格式。
+ *  写作说明按 900 字要求（写入库时 sanitizeWritingSkillContent 还会截到 1000，留余量防截断丢尾）。 */
+const SKILL_SPEC = `【产出目标：写作技能】
+本次分析方向要求整理一份可保存的「写作技能」——注入正文生成 system 的专项写作说明，包含三个字段：
+- 名称（≤20 字）：技能主题，如「战斗节奏」。
+- 适用场景（≤60 字）：什么时候参考，如「遭遇战、追逃、围杀等」。
+- 写作说明（≤900 字）：具体写法本身，会被原样放进【写作技能补充】块，仅在相关场景被 AI 参考。
+写作说明必须写成可操作的写法（怎么写），条目化，不写剧情，不写分析结论或评价；与全文规则、大纲、人物设定冲突时以后者为准。
+最终报告必须以以下固定格式收尾（便于直接保存）：
+【写作技能】
+名称：…
+适用场景：…
+写作说明：
+…（≤900 字，条目化写法）`;
+
 /** 剪辑器摘要：只取与编辑视角相关的字段，硬上限 1600 字，避免把整份技能记忆塞进每一次调用 */
 export function buildLongTextEditorBrief(editor: Editor): string {
   const persona = (editor.persona ?? '').trim().slice(0, 600);
@@ -135,7 +161,9 @@ export function buildLongTextEditorBrief(editor: Editor): string {
 export function estimateLongTextChunkChars(nCtx: number, direction: string, editor: Editor): number {
   const budget = promptCharBudget(nCtx, MAX_TOKENS);
   const brief = buildLongTextEditorBrief(editor);
-  return clamp(budget - brief.length - normalizeDirection(direction).length - 700, MIN_CHUNK_CHARS, MAX_CHUNK_CHARS);
+  const dir = normalizeDirection(direction);
+  const specLen = directionWantsWritingSkill(dir) ? SKILL_SPEC.length : 0;
+  return clamp(budget - brief.length - dir.length - specLen - 700, MIN_CHUNK_CHARS, MAX_CHUNK_CHARS);
 }
 
 /** 设置界面的轻量预估：只按字符数估算，不提前拆分原文 */
@@ -265,7 +293,8 @@ export function planLongTextAnalysis(opts: {
 
   const brief = buildLongTextEditorBrief(opts.editor);
   const budgetChars = promptCharBudget(opts.nCtx, MAX_TOKENS);
-  const chunkChars = clamp(budgetChars - brief.length - direction.length - 700, MIN_CHUNK_CHARS, MAX_CHUNK_CHARS);
+  const specLen = directionWantsWritingSkill(direction) ? SKILL_SPEC.length : 0;
+  const chunkChars = clamp(budgetChars - brief.length - direction.length - specLen - 700, MIN_CHUNK_CHARS, MAX_CHUNK_CHARS);
   const chunks = splitLongText(text, chunkChars);
   if (chunks.length > MAX_CHUNKS) {
     return {
@@ -274,11 +303,11 @@ export function planLongTextAnalysis(opts: {
     };
   }
   const noteChars = clamp(
-    Math.floor((budgetChars - brief.length - direction.length - 900) / Math.max(1, chunks.length)),
+    Math.floor((budgetChars - brief.length - direction.length - specLen - 900) / Math.max(1, chunks.length)),
     NOTE_MIN,
     NOTE_MAX,
   );
-  const reduceBudget = Math.max(600, budgetChars - brief.length - direction.length - 600);
+  const reduceBudget = Math.max(600, budgetChars - brief.length - direction.length - specLen - 600);
   const groupSize = Math.max(1, Math.floor(reduceBudget / (noteChars + 20)));
   const groups = Math.ceil(chunks.length / groupSize);
   const reduceCalls = groups > 1 ? groups + 1 : 1;
@@ -306,8 +335,8 @@ export function planLongTextAnalysis(opts: {
   };
 }
 
-function systemFor(brief: string, direction: string): string {
-  return `${brief}\n\n【本次分析方向】\n${direction}`;
+function systemFor(brief: string, direction: string, spec = ''): string {
+  return `${brief}\n\n【本次分析方向】\n${direction}${spec ? `\n\n${spec}` : ''}`;
 }
 
 function formatSections(...sections: string[]): string {
@@ -331,7 +360,7 @@ async function reduceNotes(opts: {
     temperature: number;
   }) => Promise<string>;
 }): Promise<string> {
-  const sys = systemFor(opts.brief, opts.direction);
+  const sys = systemFor(opts.brief, opts.direction, directionWantsWritingSkill(opts.direction) ? SKILL_SPEC : '');
   const reduceBudget = Math.max(600, opts.budgetChars - sys.length - 600);
   const summaryPrompt = (body: string) =>
     formatSections(
@@ -393,6 +422,44 @@ async function reduceNotes(opts: {
   });
 }
 
+/** 从最终报告解析可保存的写作技能草稿：取最后一个【写作技能】块，
+ *  解析 名称 / 适用场景（可空）/ 写作说明（同行或下一行起，读到报告末尾）。
+ *  名称或说明为空返回 null；字段经 writingSkill sanitize 清洗（名称 20 / 场景 60 / 说明 1000 上限）。 */
+export function parseWritingSkillDraft(report: string): WritingSkillInput | null {
+  const text = normalizeText(report);
+  const at = text.lastIndexOf('【写作技能】');
+  if (at === -1) return null;
+  const lines = text
+    .slice(at + '【写作技能】'.length)
+    .split('\n')
+    .map((l) => l.trim());
+  let name = '';
+  let desc = '';
+  let content = '';
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const nm = /^(?:名称|名字)\s*[:：]\s*(.*)$/.exec(line);
+    if (nm) {
+      name = nm[1].trim();
+      continue;
+    }
+    const dm = /^(?:适用场景|适用)\s*[:：]\s*(.*)$/.exec(line);
+    if (dm) {
+      desc = dm[1].trim();
+      continue;
+    }
+    const cm = /^写作说明\s*[:：]\s*(.*)$/.exec(line);
+    if (cm) {
+      content = [cm[1].trim(), ...lines.slice(i + 1)].join('\n');
+      break;
+    }
+  }
+  const cleanName = sanitizeWritingSkillName(name);
+  const cleanContent = sanitizeWritingSkillContent(content);
+  if (!cleanName || !cleanContent) return null;
+  return { name: cleanName, description: sanitizeWritingSkillDesc(desc), content: cleanContent };
+}
+
 /** 执行一次完整分析。调用方负责在组件内提供 cancelled 标志与进度回调。 */
 export async function runLongTextAnalysis(opts: LongTextAnalysisOptions): Promise<LongTextAnalysisResult> {
   const startedAt = Date.now();
@@ -401,6 +468,7 @@ export async function runLongTextAnalysis(opts: LongTextAnalysisOptions): Promis
   const prepared = planLongTextAnalysis({ text: opts.text, direction: opts.direction, editor: opts.editor, nCtx: opts.nCtx });
   if (!prepared.ok) return { ok: false, error: prepared.error, artifacts };
   const { plan, chunks, brief, direction } = prepared;
+  const skillMode = directionWantsWritingSkill(direction);
 
   const gate = await agentGate(opts.engine);
   if (gate) return { ok: false, error: gate, artifacts };
@@ -413,7 +481,7 @@ export async function runLongTextAnalysis(opts: LongTextAnalysisOptions): Promis
   let lastEmit = 0;
   let stream = '';
   const total = plan.totalCalls;
-  const sys = systemFor(brief, direction);
+  const sys = systemFor(brief, direction, skillMode ? SKILL_SPEC : '');
 
   const emit = (phase: 1 | 2 | 3, label: string, detail: string, force = false) => {
     const now = Date.now();
@@ -590,15 +658,25 @@ export async function runLongTextAnalysis(opts: LongTextAnalysisOptions): Promis
       label: '再校验与结论',
       detail: '生成最终分析报告',
       system: sys,
-      user: formatSections(
-        '【最终分析结果】',
-        `【原文概况】共 ${normalizeText(opts.text).length} 字，按模型上下文分为 ${chunks.length} 段。`,
-        `【修订后的全篇总结】\n${fit(s2, 1600)}`,
-        `【第二轮对照与校对】\n${fit(c1, 1100)}`,
-        `【第三轮再分析】\n${fit(a2, 1000)}`,
-        '基于以上三轮结果，输出面向作者的最终分析报告。要求：结论明确、证据可追溯、建议可执行；不要复述内部流程。',
-        '输出结构：\n一、结论\n二、方向下的全篇规律（带原文证据）\n三、两轮仿写对照说明了什么\n四、具体改法 / 可执行清单\n五、适用边界\n2000 字以内，直接输出报告。',
-      ),
+      user: skillMode
+        ? formatSections(
+            '【最终分析结果】',
+            `【原文概况】共 ${normalizeText(opts.text).length} 字，按模型上下文分为 ${chunks.length} 段。`,
+            `【修订后的全篇总结】\n${fit(s2, 1400)}`,
+            `【第二轮对照与校对】\n${fit(c1, 900)}`,
+            `【第三轮再分析】\n${fit(a2, 800)}`,
+            '基于以上结果，输出面向作者的精简最终报告 + 可直接保存的写作技能。要求：结论明确、证据可追溯、建议可执行；不复述内部流程。',
+            '输出结构：\n一、结论\n二、方向下的全篇规律（带原文证据）\n三、可执行清单\n正文合计 1200 字以内。\n然后另起一段，严格按 system 中【产出目标：写作技能】的固定格式输出【写作技能】块，放在报告最末尾。',
+          )
+        : formatSections(
+            '【最终分析结果】',
+            `【原文概况】共 ${normalizeText(opts.text).length} 字，按模型上下文分为 ${chunks.length} 段。`,
+            `【修订后的全篇总结】\n${fit(s2, 1600)}`,
+            `【第二轮对照与校对】\n${fit(c1, 1100)}`,
+            `【第三轮再分析】\n${fit(a2, 1000)}`,
+            '基于以上三轮结果，输出面向作者的最终分析报告。要求：结论明确、证据可追溯、建议可执行；不要复述内部流程。',
+            '输出结构：\n一、结论\n二、方向下的全篇规律（带原文证据）\n三、两轮仿写对照说明了什么\n四、具体改法 / 可执行清单\n五、适用边界\n2000 字以内，直接输出报告。',
+          ),
       maxTokens: MAX_TOKENS,
       temperature: 0.3,
     });

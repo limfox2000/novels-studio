@@ -10,6 +10,7 @@ import {
   Loader2,
   RotateCcw,
   ScanText,
+  Sparkles,
   Square,
   Upload,
   X,
@@ -18,6 +19,7 @@ import { Button } from '../ui/Button';
 import { IconButton } from '../ui/IconButton';
 import { useEditorRoomStore } from '../../stores/editorRoomStore';
 import { useUiStore } from '../../stores/uiStore';
+import { useWritingSkillStore } from '../../stores/writingSkillStore';
 import { stopGeneration } from '../../shared/generation';
 import type { Editor } from '../../engines/meetingEngine';
 import {
@@ -26,6 +28,7 @@ import {
   LONG_TEXT_MAX_CHARS,
   LONG_TEXT_MAX_IMPORT_BYTES,
   LONG_TEXT_STAGE_LABELS,
+  parseWritingSkillDraft,
   runLongTextAnalysis,
   type LongTextAnalysisPlan,
   type LongTextAnalysisProgress,
@@ -58,6 +61,8 @@ export function LongTextAnalysisPanel({ editor, onClose }: { editor: Editor; onC
   const [error, setError] = useState('');
   const [importError, setImportError] = useState('');
   const [copied, setCopied] = useState(false);
+  const [skillSaved, setSkillSaved] = useState('');
+  const [skillError, setSkillError] = useState('');
 
   const runningRef = useRef(false);
   const mountedRef = useRef(true);
@@ -81,6 +86,7 @@ export function LongTextAnalysisPanel({ editor, onClose }: { editor: Editor; onC
   );
   const busy = status === 'running' || status === 'stopping';
   const finalText = artifacts.final ?? '';
+  const skillDraft = useMemo(() => (finalText ? parseWritingSkillDraft(finalText) : null), [finalText]);
   const tooLong = source.length > LONG_TEXT_MAX_CHARS;
   const canStart = !!source.trim() && !!direction.trim() && !tooLong && !busy && !generating;
 
@@ -96,6 +102,8 @@ export function LongTextAnalysisPanel({ editor, onClose }: { editor: Editor; onC
     setStats(null);
     setProgress(null);
     setCopied(false);
+    setSkillSaved('');
+    setSkillError('');
     const r = await runLongTextAnalysis({
       editor,
       text: source,
@@ -141,6 +149,20 @@ export function LongTextAnalysisPanel({ editor, onClose }: { editor: Editor; onC
     setStats(null);
     setError('');
     setCopied(false);
+    setSkillSaved('');
+    setSkillError('');
+  };
+
+  /** 最终报告中的【写作技能】块 → 写作技能库（失败原因 inline 展示，重名等去管理器改名） */
+  const saveSkill = () => {
+    if (!skillDraft) return;
+    setSkillError('');
+    const r = useWritingSkillStore.getState().createSkill(skillDraft);
+    if (!r.ok) {
+      setSkillError(r.error);
+      return;
+    }
+    setSkillSaved(`已存入技能库「${skillDraft.name}」，可在正文面板 ✨ 槽位启用`);
   };
 
   const copyResult = async () => {
@@ -281,7 +303,9 @@ export function LongTextAnalysisPanel({ editor, onClose }: { editor: Editor; onC
                 data-longtext-direction
                 disabled={busy}
                 rows={3}
-                placeholder="例如：重点分析战斗场面的节奏、视角与信息释放；哪些写法可以直接复用？"
+                placeholder={
+                  '例如：重点分析战斗场面的节奏、视角与信息释放；哪些写法可以直接复用？\n也可要求整理成写作技能，如：把本文的战斗写法整理成一个全文写作 skill（方向含「技能/skill」时，最终报告会附可直接保存的技能块）'
+                }
                 className="w-full resize-none rounded-[10px] border border-slate-200 bg-slate-50 px-3 py-2 text-[12.5px] leading-[1.7] text-slate-700 transition placeholder:text-slate-400 focus:border-brand-400 focus:bg-white focus:outline-none focus:ring-4 focus:ring-brand-500/10 disabled:opacity-60"
               />
             </div>
@@ -403,10 +427,40 @@ export function LongTextAnalysisPanel({ editor, onClose }: { editor: Editor; onC
 
             {finalText && (
               <section data-longtext-result>
-                <div className="mb-1 text-[12px] font-semibold text-slate-600">最终分析结果</div>
+                <div className="mb-1 flex items-center gap-2">
+                  <span className="text-[12px] font-semibold text-slate-600">最终分析结果</span>
+                  <span className="flex-1" />
+                  {skillDraft && (
+                    <Button
+                      size="sm"
+                      variant="soft"
+                      icon={<Sparkles />}
+                      onClick={saveSkill}
+                      disabled={!!skillSaved}
+                      data-longtext-save-skill
+                    >
+                      {skillSaved ? '已保存' : '保存为写作技能'}
+                    </Button>
+                  )}
+                </div>
                 <div className="whitespace-pre-wrap rounded-[10px] border border-slate-100 bg-slate-50/70 px-3 py-2.5 text-[12.5px] leading-[1.8] text-slate-700">
                   {finalText}
                 </div>
+                {skillSaved && (
+                  <p
+                    className="mt-1 flex items-start gap-1 text-[11.5px] text-emerald-600"
+                    data-longtext-skill-saved
+                  >
+                    <Check className="mt-0.5 h-3 w-3 shrink-0" />
+                    {skillSaved}
+                  </p>
+                )}
+                {skillError && (
+                  <p className="mt-1 flex items-start gap-1 text-[11.5px] text-rose-600" data-longtext-skill-error>
+                    <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                    {skillError}
+                  </p>
+                )}
               </section>
             )}
 
