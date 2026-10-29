@@ -19,11 +19,12 @@ import {
   saveStudioWorkspace,
 } from '../stores/studioStore';
 import { extractCharactersFromBoards, sanitizeCharacters } from '../stores/characterStates';
+import { sanitizeSimProfiles } from '../stores/simProfiles';
 import { useUiStore } from '../stores/uiStore';
 import { persistActiveChapterId } from '../stores/activeChapter';
 import { syncActiveChapterScene, withChapterSceneSyncSuppressed } from '../stores/chapterSceneSync';
 import type { Edge } from '@xyflow/react';
-import type { SimBoard, SimChapter, SimNodeType, SimVolume, WorkCharacter } from '../types/sim';
+import type { SimBoard, SimChapter, SimNodeType, SimProfile, SimVolume, WorkCharacter } from '../types/sim';
 
 const ARCHIVES_KEY = 'nc2-sim-archives-v1';
 export const ARCHIVE_VERSION = 4;
@@ -32,6 +33,8 @@ export interface ArchiveGraph {
   boards?: Record<string, SimBoard>;
   /** 📇 人物库（v4；v3 及更早无此字段 → 载入时从画布节点一次性提取） */
   characters?: unknown;
+  /** 🎬 推演档案（v4 可选内嵌字段；缺失 → 按人物库自动补默认档，不升版本） */
+  simProfiles?: unknown;
   activeBoardId?: string;
   /** 保存时的当前章节（v2.32，可选；旧档无此字段 → 载入后回落到首章） */
   activeChapterId?: string;
@@ -77,6 +80,8 @@ export interface ImportArchiveResult extends LoadArchiveResult {
 interface NormalizedGraph {
   boards: Record<string, SimBoard>;
   characters: Record<string, WorkCharacter>;
+  /** 🎬 推演档案（与人物库一一对应，缺失自动补默认档） */
+  simProfiles: Record<string, SimProfile>;
   activeBoardId: string;
   activeChapterId: string;
   rules: string;
@@ -184,6 +189,8 @@ function normalizeArchive(raw: unknown, fallbackName: string, extraSteps: Archiv
   if (!hasLibrary && characters && Object.keys(characters).length) {
     steps.push({ code: 'character-library', message: `人物已迁入作品级人物库（${Object.keys(characters).length} 人）` });
   }
+  // 🎬 推演档案：旧档缺失 → 按人物库补默认档（与人物库一一对应）
+  const simProfiles = sanitizeSimProfiles(graph.simProfiles, characters);
 
   for (const c of chapters) {
     const snap = c.snapshot;
@@ -205,6 +212,7 @@ function normalizeArchive(raw: unknown, fallbackName: string, extraSteps: Archiv
     graph: {
       boards,
       characters,
+      simProfiles,
       activeBoardId,
       activeChapterId,
       rules,
@@ -239,7 +247,7 @@ export function saveLocal(): void {
   persistActiveChapterId(useUiStore.getState().activeChapterId);
   const activeChapterId = useUiStore.getState().activeChapterId ?? '';
   try {
-    const graph = { boards: s.boards, characters: s.characters, activeBoardId: s.activeBoardId, activeChapterId, rules: s.rules, outlineRules: s.outlineRules, charGenRules: s.charGenRules, mainGoal: s.mainGoal, volumes: s.volumes, chapters: s.chapters, responsibleId: s.responsibleId, cover: s.cover };
+    const graph = { boards: s.boards, characters: s.characters, simProfiles: s.simProfiles, activeBoardId: s.activeBoardId, activeChapterId, rules: s.rules, outlineRules: s.outlineRules, charGenRules: s.charGenRules, mainGoal: s.mainGoal, volumes: s.volumes, chapters: s.chapters, responsibleId: s.responsibleId, cover: s.cover };
     const list = loadArchives().filter((a) => a.name !== s.graphName);
     list.push({ name: s.graphName, savedAt: new Date().toISOString(), version: ARCHIVE_VERSION, graph });
     writeArchives(list);

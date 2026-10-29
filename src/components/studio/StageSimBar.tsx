@@ -3,9 +3,11 @@
  *  MVP 能力：开始/暂停/继续/单步/重置 + 速度 + 在场人物行为气泡 + 最近事件。
  *  人物在画布上的移动由 StudioPage 投影渲染，本组件只做控制与观战。
  *  完整设计（欲望库、推演档案、通道寻路、叙事化）见 docs/剧情推演模拟器设计.md。 */
-import { Film, Pause, Play, RotateCcw, SkipForward } from 'lucide-react';
+import { useState } from 'react';
+import { Film, Pause, Play, RotateCcw, SkipForward, SlidersHorizontal } from 'lucide-react';
 import { useSimSessionStore, SIM_SPEED_OPTIONS } from '../../stores/simSessionStore';
 import { SIM_BEHAVIOR_LABELS, type SimBehavior } from '../../engines/simRunner';
+import { SimPlayPanel } from './SimPlayPanel';
 
 /** 行为 → 气泡配色（与人物节点上的行为 chip 共用语义） */
 export const SIM_BEHAVIOR_STYLE: Record<SimBehavior, { chip: string; dot: string; icon: string }> = {
@@ -21,6 +23,7 @@ export function StageSimBar() {
   const error = useSimSessionStore((s) => s.error);
   const intervalMs = useSimSessionStore((s) => s.intervalMs);
   const store = useSimSessionStore.getState();
+  const [panelOpen, setPanelOpen] = useState(false);
 
   const started = !!session;
   const actors = session?.actors ?? [];
@@ -43,6 +46,16 @@ export function StageSimBar() {
         <span className="shrink-0 text-[12px] text-slate-400" data-sim-actor-count>
           {actors.length ? `${actors.length} 人在场` : '舞台上无人物'}
         </span>
+        <button
+          type="button"
+          data-sim-open-profile
+          onClick={() => setPanelOpen(true)}
+          className="flex h-7 shrink-0 items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 text-[12px] text-slate-600 transition hover:bg-slate-50"
+          title="查看世界模型常量与每个人物的推演档案"
+        >
+          <SlidersHorizontal className="h-3.5 w-3.5" />
+          推演档案
+        </button>
         <span className="flex-1" />
         <label className="flex shrink-0 items-center gap-1 text-[12px] text-slate-500" title="每拍间隔">
           速度
@@ -120,7 +133,7 @@ export function StageSimBar() {
                 data-sim-actor
                 data-sim-behavior={a.behavior}
                 className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] ring-1 ${style.chip}`}
-                title={`${a.name}：${SIM_BEHAVIOR_LABELS[a.behavior]}${envName ? `（${envName}）` : ''}`}
+                title={`${a.name}：${SIM_BEHAVIOR_LABELS[a.behavior]}${envName ? `（${envName}）` : ''} · 速度 ${a.profile.capabilities.speed}px/拍 · 观察力 ${a.profile.capabilities.observation}`}
               >
                 <span className="font-medium text-slate-700">{a.name}</span>
                 <span>
@@ -151,6 +164,8 @@ export function StageSimBar() {
           </ul>
         )}
       </div>
+
+      {panelOpen && <SimPlayPanel onClose={() => setPanelOpen(false)} />}
     </div>
   );
 }

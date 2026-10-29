@@ -250,6 +250,63 @@ export interface ChapterRegion {
   color?: string;
 }
 
+// ── 🎬 推演档案（SimProfile）：与人物档案物理分离的数值数据（设计文档 §6，D20） ──
+// 人物档案（WorkCharacter/CharacterState）= 叙事身份，给人看；推演档案 = 数值行为，给引擎跑。
+// 两者只通过 characterId 关联，各自 sanitize、各自脏检查；推演结果不回写人物档案。
+
+/** 基础能力（世界模型原生，固定三项，不可增量扩展；作者只调数值不定义语义） */
+export interface SimCapabilities {
+  /** 移动速度（px/拍），默认 80 */
+  speed: number;
+  /** 感知范围（px），默认 400——**预留**：当前引擎尚未消费（感知/互见在后续切片接入） */
+  perception: number;
+  /** 观察力（0-100），默认 50：张望耗时 = OBSERVE_BASE / (0.5 + observation/100) */
+  observation: number;
+}
+
+/** 欲望实例：引用（内置）定义，可逐人物启停/调初值/覆盖增长与阈值 */
+export interface SimDesireInstance {
+  defId: string;
+  /** 初始强度（0-100） */
+  intensity: number;
+  /** 每拍增长；缺省=定义默认 */
+  growthPerTick?: number;
+  /** 触发阈值；缺省=定义默认 */
+  threshold?: number;
+  enabled: boolean;
+}
+
+/** 行为实例：引用（内置）定义，可逐人物启停与调权重/耗时 */
+export interface SimBehaviorInstance {
+  defId: string;
+  enabled: boolean;
+  /** 权重（0-1 概率式；MVP 用来决定张望/休息的触发倾向） */
+  weight?: number;
+  cooldown?: number;
+  /** 耗时（拍）；缺省=定义默认（张望的缺省由观察力计算） */
+  duration?: number;
+}
+
+/** 人物推演档案：一个作品内每人物一份，创建人物时自动建立（设计文档 §6.4） */
+export interface SimProfile {
+  characterId: string;
+  capabilities: SimCapabilities;
+  /** 作品级扩展属性的初值（attrId → 值）；定义库尚未实现，当前恒为 {} */
+  attributes: Record<string, number>;
+  desires: SimDesireInstance[];
+  behaviors: SimBehaviorInstance[];
+  /** 可选：按人物状态覆盖（「重伤后」能力与欲望不同）；MVP 仅存结构，解析待状态覆盖切片 */
+  stateOverrides?: Record<
+    string,
+    {
+      capabilities?: Partial<SimCapabilities>;
+      attributes?: Record<string, number>;
+      desires?: Record<string, Partial<SimDesireInstance>>;
+      behaviors?: Record<string, Partial<SimBehaviorInstance>>;
+    }
+  >;
+}
+
 /** 🗂 卷画布（v2.29）：一张画布 = 一个卷的舞台；默认主画布收纳未分卷章节/旧单画布。
  *  `boards` 是节点的唯一权威数据源，React Flow 只渲染 activeBoardId 指向的一张。 */
 export interface SimBoard {

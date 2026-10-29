@@ -42,8 +42,13 @@ import {
   type SimNodeType,
   type SimVolume,
   type SimViewport,
+  type SimBehaviorInstance,
+  type SimCapabilities,
+  type SimDesireInstance,
+  type SimProfile,
   type WorkCharacter,
 } from '../types/sim';
+import { defaultSimProfile, sanitizeSimProfile, sanitizeSimProfiles } from './simProfiles';
 import { uid } from '../utils/id';
 import { sameStringList, sanitizeWritingSkillIds } from '../types/writingSkill';
 import { absPositionOf, isDescendantOf, sortParentsFirst } from './graphGeom';
@@ -529,6 +534,8 @@ export interface WorkspaceSnapshot {
   boards: Record<string, SimBoard>;
   /** 📇 人物库（必填：normalizeArchive 必产出、新建作品显式 {}——杜绝切作品串库） */
   characters: Record<string, WorkCharacter>;
+  /** 🎬 推演档案（可选；v4 内嵌字段不升版）：缺省 = 按人物库自动补默认档案 */
+  simProfiles?: Record<string, SimProfile>;
   activeBoardId?: string;
   graphName?: string;
   cover?: string;
@@ -604,6 +611,9 @@ interface SimState {
   boards: Record<string, SimBoard>;
   /** 📇 人物库（v3 人物库：人物身份/状态/形象唯一权威数据源；写动作必须不可变替换整个 map，否则脏检查失效） */
   characters: Record<string, WorkCharacter>;
+  /** 🎬 推演档案（与人物档案物理分离，D20）：每位人物一份，创建人物时自动建档；
+   *  只存数值行为（基础能力/欲望实例/行为列表），不碰姓名/状态/形象。写动作同样必须不可变替换。 */
+  simProfiles: Record<string, SimProfile>;
   /** 当前渲染/编辑的画布 */
   activeBoardId: string;
   graphName: string;
@@ -713,6 +723,16 @@ interface SimState {
    *  放置与章节快照引用改写指向主人物，同板重复放置保留首个 */
   mergeCharacters: (primaryId: string, otherIds: string[]) => void;
 
+  // ── 🎬 推演档案（与人物档案分离；修改在下次「开始推演」生效） ──
+  /** 改基础能力（速度/感知/观察力），数值按世界模型范围钳制 */
+  updateSimProfileCapabilities: (characterId: string, patch: Partial<SimCapabilities>) => void;
+  /** 欲望实例：启停 / 初值 / 每拍增长 / 阈值（内置定义，未知 defId 忽略） */
+  updateSimDesire: (characterId: string, defId: string, patch: Partial<Omit<SimDesireInstance, 'defId'>>) => void;
+  /** 行为实例：启停 / 权重 / 耗时 */
+  updateSimBehavior: (characterId: string, defId: string, patch: Partial<Omit<SimBehaviorInstance, 'defId'>>) => void;
+  /** 恢复默认推演档案（能力取世界模型默认、欲望与行为全启用） */
+  resetSimProfile: (characterId: string) => void;
+
   // ── 🧬 人物状态（库写；首参=人物库 id） ──
   addCharacterState: (characterId: string, opts?: AddCharacterStateOptions) => CharacterStateOpResult;
   /** 更新状态属性（stateId 缺省=首项状态）；图片替换时释放旧 key（GC 查库） */
@@ -812,7 +832,9 @@ function sameStudioContent(a: SimState, b: SimState): boolean {
     a.volumes !== b.volumes ||
     a.chapters !== b.chapters ||
     // 📇 人物库纳入脏检查：所有库写动作必须不可变替换 characters 对象，否则这里检测不到改动
-    a.characters !== b.characters
+    a.characters !== b.characters ||
+    // 🎬 推演档案独立脏检查项（改数值不触发人物档案脏写，反之亦然）
+    a.simProfiles !== b.simProfiles
   ) {
     return false;
   }
@@ -906,6 +928,7 @@ export const useStudioStore = create<SimState>()(
       // 🎬 初始就带舞台板（sanitizeBoards 也会补；这里让新建作品/刷新前也立即可见）
       boards: { [DEFAULT_BOARD_ID]: emptyBoard(DEFAULT_BOARD_ID), [STAGE_BOARD_ID]: stageBoard() },
       characters: {},
+      simProfiles: {},
       activeBoardId: DEFAULT_BOARD_ID,
       graphName: '未命名',
       cover: '',
@@ -1406,8 +1429,12 @@ export const useStudioStore = create<SimState>()(
           const placement = makeCharacterPlacement(board, characterId, character.states[0].id, opts?.pos, select);
           if (placement) boards = { ...boards, [boardId]: { ...board, nodes: placement.nodes } };
         }
-        // 库与放置同一 set() 落库：放置节点必须能立刻查到人物
-        set({ characters: { ...s.characters, [characterId]: character }, boards });
+        // 库、推演档案与放置同一 set() 落库：放置节点必须能立刻查到人物，人物也必须有推演档案（D20 自动建档）
+        set({
+          characters: { ...s.characters, [characterId]: character },
+          simProfiles: { ...s.simProfiles, [characterId]: defaultSimProfile(characterId) },
+          boards,
+        });
         return characterId;
       },
       createEnvironment: (pos, size) => get().createEnvironmentOnBoard(get().activeBoardId, pos, size) ?? '',
@@ -1636,7 +1663,10 @@ export const useStudioStore = create<SimState>()(
             edges: b.edges.filter((e) => e.source !== node.id && e.target !== node.id),
           };
         }
-        set({ characters, boards });
+        // 推演档案随人物删除（孤儿档案不静默保留）
+        const simProfiles = { ...s.simProfiles };
+        delete simProfiles[characterId];
+        set({ characters, simProfiles, boards });
         // 图片 GC 查库：只有库内再无引用的 key 才真正释放（headshot 缓存经 release 路径失效）
         void releaseCharacterImageKeys(
           removed.states.flatMap((st) => collectStateImageKeys(st)),
@@ -1722,8 +1752,51 @@ export const useStudioStore = create<SimState>()(
           });
           return { ...c, snapshot: { ...snap, entries, updatedAt: Date.now() } };
         });
-        set({ characters, boards, chapters });
+        // 推演档案：主人物保留自己的档案，被合并人物的档案随人物删除
+        // （设计文档 §6.1：被合并人物的独特欲望不迁移，面板可提示）
+        const simProfiles: Record<string, SimProfile> = {};
+        for (const [id, p] of Object.entries(s.simProfiles)) {
+          if (id === primaryId || !stateIdMaps.has(id)) simProfiles[id] = p;
+        }
+        set({ characters, simProfiles, boards, chapters });
       },
+
+      // ── 🎬 推演档案写动作：全部经 sanitize 钳制 + 不可变替换（脏检查靠引用比较） ──
+      updateSimProfileCapabilities: (characterId, patch) =>
+        set((s) => {
+          const cur = s.simProfiles[characterId];
+          if (!cur) return {};
+          const next = sanitizeSimProfile({ ...cur, capabilities: { ...cur.capabilities, ...patch } }, characterId);
+          return { simProfiles: { ...s.simProfiles, [characterId]: next } };
+        }),
+
+      updateSimDesire: (characterId, defId, patch) =>
+        set((s) => {
+          const cur = s.simProfiles[characterId];
+          if (!cur) return {};
+          const next = sanitizeSimProfile(
+            { ...cur, desires: cur.desires.map((d) => (d.defId === defId ? { ...d, ...patch } : d)) },
+            characterId,
+          );
+          return { simProfiles: { ...s.simProfiles, [characterId]: next } };
+        }),
+
+      updateSimBehavior: (characterId, defId, patch) =>
+        set((s) => {
+          const cur = s.simProfiles[characterId];
+          if (!cur) return {};
+          const next = sanitizeSimProfile(
+            { ...cur, behaviors: cur.behaviors.map((b) => (b.defId === defId ? { ...b, ...patch } : b)) },
+            characterId,
+          );
+          return { simProfiles: { ...s.simProfiles, [characterId]: next } };
+        }),
+
+      resetSimProfile: (characterId) =>
+        set((s) => {
+          if (!s.characters[characterId]) return {};
+          return { simProfiles: { ...s.simProfiles, [characterId]: defaultSimProfile(characterId) } };
+        }),
 
       // 唯一保留的 OnBoard 人物写动作：切换放置的当前状态（场景态，按放置独立 C1；stateId 对库校验）
       switchCharacterStateOnBoard: (boardId, nodeId, stateId) => {
@@ -1842,11 +1915,14 @@ export const useStudioStore = create<SimState>()(
           const characters = sanitizeCharacters(snap.characters);
           // 区域按章节当前所属画布过滤，所以 chapters 必须先于 boards 清洗
           const { boards } = sanitizeBoards(snap.boards, volumes, undefined, chapters, characters);
+          // 🎬 推演档案随人物库整体替换：只保留仍有对应人物的档案，缺失的自动补默认档
+          const simProfiles = sanitizeSimProfiles(snap.simProfiles, characters);
           const activeBoardId = snap.activeBoardId && boards[snap.activeBoardId] ? snap.activeBoardId : DEFAULT_BOARD_ID;
           return {
             ...prev,
             boards,
             characters,
+            simProfiles,
             activeBoardId,
             ...(snap.graphName !== undefined ? { graphName: snap.graphName } : {}),
             ...(snap.rules !== undefined ? { rules: rulesText(snap.rules) } : {}),
@@ -1930,10 +2006,14 @@ export const useStudioStore = create<SimState>()(
             : DEFAULT_BOARD_ID;
         // 规则兜底：string 直通、旧对象形态 {world,style} 拼接、损坏回空串（新增字段无需版本迁移）
         // 章节列表兜底重建；大纲生成瞬态归 null
+        const finalCharacters = characters ?? extractedCharacters;
+        // 🎬 推演档案：旧档无此字段 → 按人物库自动补默认档（不升版本，可选内嵌字段）
+        const simProfiles = sanitizeSimProfiles(p.simProfiles, finalCharacters);
         return {
           ...(merged as unknown as SimState),
           boards,
-          characters: characters ?? extractedCharacters,
+          characters: finalCharacters,
+          simProfiles,
           activeBoardId,
           rules: rulesText(merged.rules),
           outlineRules: rulesText(merged.outlineRules),
