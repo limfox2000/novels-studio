@@ -132,6 +132,10 @@ export interface EnvironmentData extends Record<string, unknown> {
   desc: string;
   /** 🔒 移动锁定：只禁止拖动/缩放，不影响改名、描述、父子归属与删除 */
   locked?: boolean;
+  /** 🏷 环境标签（统一标签内核，设计文档 §19.3）：affordance / narrative 定义 id 列表，
+   *  如 env:food（提供食物）/ env:sleep（可睡）/ env:dirty（脏乱）。缺省=无标签。
+   *  sanitize 时过滤未知定义；引擎只消费 affordance 与叙事发现，不做任何题材分支。 */
+  tags?: string[];
 }
 
 export type SimData = CharacterPlacementData | EnvironmentData;
@@ -287,10 +291,33 @@ export interface SimBehaviorInstance {
   duration?: number;
 }
 
+/** 🏷 标签实例（统一标签内核，设计文档 §19.3）：引用定义库（内置底稿 stores/simTags.ts）。
+ *  value 用于需要当前值的角色（情绪初值）；trait/affordance 标签只用 defId。 */
+export interface SimTagInstance {
+  defId: string;
+  /** 0-100（情绪初值等）；缺省=定义默认 */
+  value?: number;
+}
+
+/** 🔗 人物关系边（作品级稀疏图，设计文档 §19.3 / D25）：两人一条，标签 + 好感值。
+ *  与画布连线无关（画布 edge 表达通道）；只通过 characterId 关联人物库，随作品存档。 */
+export interface SimRelation {
+  /** 两人 characterId（写入时规范为 a < b，保证同一对只有一条） */
+  a: string;
+  b: string;
+  /** 关系标签（rel:friend / rel:enemy / rel:like）；当前每条边取首个有效标签 */
+  tags: string[];
+  /** 好感 0-100（50=中性；缺省 50）；当前引擎尚未消费，留给后续效用权重 */
+  value?: number;
+}
+
 /** 人物推演档案：一个作品内每人物一份，创建人物时自动建立（设计文档 §6.4） */
 export interface SimProfile {
   characterId: string;
   capabilities: SimCapabilities;
+  /** 🏷 人物标签（D24：推演数据，叙事层只读）：trait（西装/手枪/残疾/御剑/喜欢西装）+ emotion（恐惧/喜悦）；
+   *  属性、衣着、物品统一为 trait，不再各自成为概念。need 仍走下面的 desires（§19.3「不另起系统」）。 */
+  tags?: SimTagInstance[];
   /** 作品级扩展属性的初值（attrId → 值）；定义库尚未实现，当前恒为 {} */
   attributes: Record<string, number>;
   desires: SimDesireInstance[];

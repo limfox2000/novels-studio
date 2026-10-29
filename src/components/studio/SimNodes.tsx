@@ -23,6 +23,7 @@ import {
 } from '../../types/sim';
 import { characterActiveState } from '../../stores/characterStates';
 import { characterReferenceSummary, referenceChapterText } from '../../stores/snapshotRefs';
+import { tagDefOf } from '../../stores/simTags';
 
 /** 环境类型 → 线性图标（节点标题条用；ENV_TYPE_META.icon 的 emoji 仍供提示词/生成内容使用） */
 const ENV_ICON: Record<EnvironmentType, ComponentType<{ className?: string }>> = {
@@ -126,7 +127,10 @@ export function SimEnvironmentNode({ id, data, selected }: NodeProps) {
     <>
       {/* 选中后显示缩放柄（写 node.width/height，经 dimensions change 进 store 持久化）；锁定后隐藏；柄色随类型 */}
       <NodeResizer isVisible={selected && !locked} minWidth={ENV_MIN_W} minHeight={ENV_MIN_H} color={meta.dot} />
-      <div className={`group flex h-full w-full flex-col overflow-hidden rounded-xl border-2 shadow-md ${meta.border} ${meta.body}`}>
+      <div
+        data-env-id={id}
+        className={`group flex h-full w-full flex-col overflow-hidden rounded-xl border-2 shadow-md ${meta.border} ${meta.body}`}
+      >
         {/* 标题条：图标 + 名称 + 类型徽章 + 锁定 + 删除（悬停出现）——均只展示，编辑走属性面板；配色随类型（清淡）
             选中后拖动标题条/空白处移动环境；未选中时拖动空白处平移画布（节点由 StudioPage 设为不可拖动） */}
         <div
@@ -135,6 +139,16 @@ export function SimEnvironmentNode({ id, data, selected }: NodeProps) {
         >
           <EnvIcon className="h-3.5 w-3.5 shrink-0 text-white/90" />
           <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-white">{d.name || '未命名'}</span>
+          {/* 🏷 环境标签（世界认知池）：如 🍚 提供食物 / 🛏 可睡 / 🗑 脏乱 */}
+          {(d.tags ?? []).map((tagId) => {
+            const def = tagDefOf(tagId);
+            if (!def) return null;
+            return (
+              <span key={tagId} data-env-tag-chip={tagId} className="shrink-0 text-[11px] leading-none" title={`${def.name}：${def.desc}`}>
+                {def.icon}
+              </span>
+            );
+          })}
           <span
             className="shrink-0 whitespace-nowrap rounded-full bg-black/15 px-1.5 py-0.5 text-[11px] text-white"
             title={

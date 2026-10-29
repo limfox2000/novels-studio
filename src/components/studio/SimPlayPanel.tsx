@@ -18,16 +18,28 @@ import {
   SIM_OBSERVE_BASE,
   observeTicks,
 } from '../../stores/simProfiles';
-import { SIM_BEHAVIOR_LABELS } from '../../engines/simRunner';
-import type { SimCapabilities } from '../../types/sim';
+import { SIM_BEHAVIOR_LABELS, resolveSimMovement } from '../../engines/simRunner';
+import {
+  EMOTION_FEAR,
+  EMOTION_JOY,
+  SIM_CHARACTER_TRAITS,
+  SIM_ENV_TAGS,
+  SIM_RELATION_TAGS,
+  relationTagOf,
+  traitIdsOf,
+} from '../../stores/simTags';
+import type { SimCapabilities, SimNodeType } from '../../types/sim';
 
 type TabKey = 'world' | 'profiles';
 
 const CAP_LABEL: Record<keyof SimCapabilities, { name: string; hint: string }> = {
   speed: { name: '速度', hint: '每拍移动的最大像素；跑得快=同样的故事时间走得更远' },
-  perception: { name: '感知范围', hint: 'px；预留——当前引擎尚未消费（互见/感知在后续切片接入）' },
-  observation: { name: '观察力', hint: '张望耗时 = 基准 / (0.5 + 观察力/100)，越高越快' },
+  perception: { name: '感知范围', hint: 'px：决定能看到谁/多远的环境；也是靠近发现隐藏标签（手枪）的半径' },
+  observation: { name: '观察力', hint: '张望耗时 = 基准 / (0.5 + 观察力/100)，越高越快；张望会主动发现隐藏标签' },
 };
+
+const envOf = (n: SimNodeType): { name: string; tags: string[] } | null =>
+  n.data.kind === 'environment' ? { name: n.data.name || '未命名环境', tags: n.data.tags ?? [] } : null;
 
 /** 通用滑杆行（值 + 范围 + 单位），dataKey 供 E2E 定位 */
 function SlideRow({
@@ -81,6 +93,7 @@ export function SimPlayPanel({ onClose }: { onClose: () => void }) {
   const [tab, setTab] = useState<TabKey>('world');
   const characters = useStudioStore((s) => s.characters);
   const simProfiles = useStudioStore((s) => s.simProfiles);
+  const relations = useStudioStore((s) => s.relations);
   const boards = useStudioStore((s) => s.boards);
   const session = useSimSessionStore((s) => s.session);
   const stageBoard = boards[STAGE_BOARD_ID];
@@ -90,6 +103,10 @@ export function SimPlayPanel({ onClose }: { onClose: () => void }) {
         .filter((n) => n.data.kind === 'character')
         .map((n) => (n.data.kind === 'character' ? n.data.characterId : ''))
         .filter(Boolean),
+    [stageBoard],
+  );
+  const stageEnvs = useMemo(
+    () => (stageBoard?.nodes ?? []).filter((n) => n.data.kind === 'environment'),
     [stageBoard],
   );
   const library = useMemo(() => Object.values(characters), [characters]);
@@ -129,7 +146,7 @@ export function SimPlayPanel({ onClose }: { onClose: () => void }) {
           <div className="min-w-0 flex-1">
             <div className="text-[15px] font-semibold leading-6 text-slate-800">推演档案</div>
             <p className="mt-0.5 text-[12px] leading-relaxed text-slate-500">
-              与人物档案分离：姓名/状态/形象仍在人物库，这里只有<b>基础能力 / 欲望 / 行为</b>。
+              与人物档案分离：姓名/状态/形象仍在人物库，这里只有<b>基础能力 / 标签 / 欲望 / 行为 / 关系</b>。
               改动在下次「开始推演」生效（推演中的会话按开始时的档案运行）。
             </p>
           </div>
@@ -193,6 +210,56 @@ export function SimPlayPanel({ onClose }: { onClose: () => void }) {
                 </p>
               </section>
 
+              {/* 🏷 环境标签：世界认知池（冰箱/床/垃圾）——引擎只消费 affordance 与叙事发现 */}
+              <section className="rounded-xl border border-slate-200 p-3" data-sim-env-tags>
+                <h3 className="text-[12.5px] font-semibold text-slate-700">
+                  环境标签 <span className="font-normal text-slate-400">（世界认知池 · 下次开始推演生效）</span>
+                </h3>
+                <p className="mt-0.5 text-[11.5px] leading-relaxed text-slate-400">
+                  给舞台环境挂标签补足世界所需元素：🍚 冰箱/饭桌提供食物（饥饿→进食）、🛏 床/沙发可睡（疲劳→睡一觉）、🗑 脏乱只进叙述。
+                </p>
+                {stageEnvs.length === 0 ? (
+                  <p className="mt-2 text-[11.5px] text-slate-400">舞台上还没有环境。先「＋环境」再挂标签。</p>
+                ) : (
+                  <div className="mt-2 space-y-1">
+                    {stageEnvs.map((n) => {
+                      const env = envOf(n);
+                      if (!env) return null;
+                      return (
+                        <div
+                          key={n.id}
+                          data-sim-env-row={n.id}
+                          className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg bg-slate-50/70 px-2 py-1.5"
+                        >
+                          <span className="min-w-0 flex-1 truncate text-[12px] text-slate-700">
+                            {env.name}
+                            {n.data.kind === 'environment' && (
+                              <span className="ml-1 text-[10.5px] text-slate-400">{n.data.etype}</span>
+                            )}
+                          </span>
+                          {SIM_ENV_TAGS.map((def) => (
+                            <label key={def.id} className="flex cursor-pointer items-center gap-1 text-[11px] text-slate-500" title={def.desc}>
+                              <input
+                                type="checkbox"
+                                data-sim-env-tag={`${n.id}:${def.id}`}
+                                checked={env.tags.includes(def.id)}
+                                onChange={(e) =>
+                                  useStudioStore
+                                    .getState()
+                                    .toggleEnvironmentTag(STAGE_BOARD_ID, n.id, def.id, e.target.checked)
+                                }
+                                className="h-3 w-3 accent-brand-600"
+                              />
+                              {def.icon} {def.name}
+                            </label>
+                          ))}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
+
               {/* 世界模型默认常量 */}
               <section className="rounded-xl border border-slate-200 p-3">
                 <h3 className="text-[12.5px] font-semibold text-slate-700">
@@ -229,10 +296,11 @@ export function SimPlayPanel({ onClose }: { onClose: () => void }) {
                 <h3 className="text-[12.5px] font-semibold text-slate-700">引擎接入状态</h3>
                 <div className="mt-1.5 grid gap-1 text-[11.5px] leading-relaxed sm:grid-cols-2">
                   <p className="text-emerald-700">
-                    ✓ 已接入：移动速度 · 观察力→张望耗时 · 欲望初值/增长/阈值 · 行为启停/权重/耗时
+                    ✓ 已接入：移动速度 · 观察力→张望耗时 · 需求初值/增长/阈值 · 行为启停/权重/耗时 ·
+                    感知范围（标签可见性） · 标签反应/情绪衰减 · 环境 affordance · 关系边
                   </p>
                   <p className="text-slate-400">
-                    预留：感知范围（互见） · 扩展属性 · 状态覆盖 · 通道寻路 · 交互与互斥 · 叙事化
+                    预留：状态覆盖 · 通道寻路/飞行通行 · 时间相位 · 扩展属性 · 叙事化与剧情脚本
                   </p>
                 </div>
               </section>
@@ -335,6 +403,67 @@ export function SimPlayPanel({ onClose }: { onClose: () => void }) {
                       <p className="mt-1.5 text-[11px] text-slate-400">
                         张望耗时 ≈ <b className="text-slate-600">{observeTicks(profile.capabilities.observation)}</b> 拍（由观察力推算；
                         行为里可覆盖）
+                      </p>
+                    </section>
+
+                    {/* 🏷 人物标签（统一标签内核 §19）：属性/衣着/物品统一为 trait */}
+                    <section className="rounded-xl border border-slate-200 p-3" data-sim-profile-tags>
+                      <h3 className="text-[12.5px] font-semibold text-slate-700">
+                        标签 <span className="font-normal text-slate-400">（trait · 属性/衣着/物品统一为标签）</span>
+                      </h3>
+                      <div className="mt-2 grid gap-1 sm:grid-cols-2">
+                        {SIM_CHARACTER_TRAITS.map((def) => {
+                          const on = (profile.tags ?? []).some((t) => t.defId === def.id);
+                          return (
+                            <label
+                              key={def.id}
+                              className="flex cursor-pointer items-start gap-1.5 rounded-lg bg-slate-50/70 px-2 py-1 text-[11.5px] text-slate-600"
+                              title={def.desc}
+                            >
+                              <input
+                                type="checkbox"
+                                data-sim-tag-toggle={def.id}
+                                checked={on}
+                                onChange={(e) =>
+                                  useStudioStore.getState().toggleSimProfileTag(selected.id, def.id, e.target.checked)
+                                }
+                                className="mt-0.5 h-3 w-3 shrink-0 accent-brand-600"
+                              />
+                              <span className="min-w-0">
+                                <span className="font-medium text-slate-700">
+                                  {def.icon} {def.name}
+                                </span>
+                                <span className="block leading-snug text-slate-400">{def.desc}</span>
+                              </span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                      <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px] text-slate-400">
+                        <span>
+                          移动模式：
+                          <b className="text-slate-600" data-sim-move-mode>
+                            {(() => {
+                              const mv = resolveSimMovement(traitIdsOf(profile.tags), profile.capabilities.speed);
+                              return !mv.movable ? '不可移动（撤销 walk）' : mv.mode === 'fly' ? `飞行 ×1.6（${mv.speed}px/拍）` : `步行（${mv.speed}px/拍）`;
+                            })()}
+                          </b>
+                        </span>
+                        {actor && (
+                          <>
+                            <span className="text-slate-300">·</span>
+                            <span className="rounded-full bg-white px-1.5 text-[10.5px] tabular-nums text-rose-600 ring-1 ring-rose-200" data-sim-emotion-live={EMOTION_FEAR}>
+                              😨 恐惧 {Math.round(actor.emotions[EMOTION_FEAR] ?? 0)}
+                            </span>
+                            <span className="rounded-full bg-white px-1.5 text-[10.5px] tabular-nums text-amber-600 ring-1 ring-amber-200" data-sim-emotion-live={EMOTION_JOY}>
+                              😊 喜悦 {Math.round(actor.emotions[EMOTION_JOY] ?? 0)}
+                            </span>
+                          </>
+                        )}
+                      </div>
+                      <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
+                        反应由标签定义：西装（总是可见）→ 喜欢西装的人喜悦并靠近；手枪（隐藏，靠近或张望才发现）→ 恐惧并远离；
+                        残疾撤销移动；御剑授予飞行。
                       </p>
                     </section>
 
@@ -518,7 +647,53 @@ export function SimPlayPanel({ onClose }: { onClose: () => void }) {
                         })}
                       </div>
                       <p className="mt-1.5 text-[11px] text-slate-400">
-                        探索由「好奇达到阈值」触发、休息由「疲劳达到阈值」触发、张望按权重掷骰、走动为保底动作。
+                        探索由「好奇达到阈值」触发、休息由「疲劳达到阈值」触发、进食由「饥饿达到阈值」触发、
+                        张望按权重掷骰、走动为保底动作；交谈/躲避由关系与标签反应触发。
+                      </p>
+                    </section>
+
+                    {/* 🔗 关系边（作品级）：同场决定靠近交谈或绕开 */}
+                    <section className="rounded-xl border border-slate-200 p-3" data-sim-relations>
+                      <h3 className="text-[12.5px] font-semibold text-slate-700">
+                        关系 <span className="font-normal text-slate-400">（作品级人物边 · 下次开始推演生效）</span>
+                      </h3>
+                      {library.filter((c) => c.id !== selected.id).length === 0 ? (
+                        <p className="mt-1.5 text-[11.5px] text-slate-400">人物库还没有其他人。关系只用于多人同场推演。</p>
+                      ) : (
+                        <div className="mt-2 space-y-1">
+                          {library
+                            .filter((c) => c.id !== selected.id)
+                            .map((other) => {
+                              const tag = relationTagOf(relations, selected.id, other.id) ?? '';
+                              return (
+                                <div
+                                  key={other.id}
+                                  data-sim-relation-row={other.id}
+                                  className="flex items-center gap-2 rounded-lg bg-slate-50/70 px-2 py-1 text-[12px]"
+                                >
+                                  <span className="min-w-0 flex-1 truncate text-slate-700">{other.name || '未命名'}</span>
+                                  <select
+                                    data-sim-relation-select={other.id}
+                                    value={tag}
+                                    onChange={(e) =>
+                                      useStudioStore.getState().setSimRelation(selected.id, other.id, e.target.value)
+                                    }
+                                    className="h-6 rounded-md border border-slate-200 bg-white px-1 text-[11.5px] text-slate-600 outline-none focus:border-brand-400"
+                                  >
+                                    <option value="">陌生</option>
+                                    {SIM_RELATION_TAGS.map((def) => (
+                                      <option key={def.id} value={def.id}>
+                                        {def.icon} {def.name}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                              );
+                            })}
+                        </div>
+                      )}
+                      <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
+                        友善/爱慕 → 靠近并交谈；敌对 → 绕开。关系是作品级数据（随作品存档），与画布连线无关。
                       </p>
                     </section>
                   </div>

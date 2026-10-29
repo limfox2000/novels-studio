@@ -5,6 +5,7 @@
  *  人物档案只存实例（启停 + 覆盖参数），运行时三级合并「内置默认 ← 档案实例」（状态覆盖待后续切片）。
  *  设计依据：docs/剧情推演模拟器设计.md §6。 */
 import type { SimCapabilities, SimDesireInstance, SimBehaviorInstance, SimProfile } from '../types/sim';
+import { emotionInitialsOf, sanitizeProfileTags, traitIdsOf } from './simTags';
 
 // ── 世界模型默认常量（设计文档 §5.9；档案未覆盖时取这些值） ──
 
@@ -32,6 +33,8 @@ export const SIM_OBSERVE_MIN_CURIOSITY = 28;
 
 export const DESIRE_CURIOSITY = 'builtin:curiosity';
 export const DESIRE_FATIGUE = 'builtin:fatigue';
+/** 生存需求（§19 原语 2）：演示「需求 → 环境 affordance」闭环；默认值让首次推演很快就能看到进食 */
+export const DESIRE_HUNGER = 'builtin:hunger';
 
 export interface SimDesireDefMeta {
   id: string;
@@ -70,6 +73,17 @@ export const SIM_BUILTIN_DESIRES: SimDesireDefMeta[] = [
     threshold: 65,
     relief: `休息 −${SIM_REST_RELIEF}`,
   },
+  {
+    id: DESIRE_HUNGER,
+    name: '饥饿',
+    icon: '🍚',
+    category: 'physio',
+    desc: '每拍增长；达到阈值找「提供食物」的环境进食；达到 85 进入紧急层（只能先找吃的）。',
+    defaultValue: 30,
+    growthPerTick: 0.8,
+    threshold: 60,
+    relief: '进食 −65（环境标签 env:food）',
+  },
 ];
 
 export function desireDefOf(defId: string): SimDesireDefMeta | undefined {
@@ -82,6 +96,10 @@ export const BEHAVIOR_EXPLORE = 'builtin:explore';
 export const BEHAVIOR_WANDER = 'builtin:wander';
 export const BEHAVIOR_OBSERVE = 'builtin:observe';
 export const BEHAVIOR_REST = 'builtin:rest';
+/** 标签内核新增：环境 affordance 进食 / 人物社会交往 / 恐惧反应躲避 */
+export const BEHAVIOR_EAT = 'builtin:eat';
+export const BEHAVIOR_TALK = 'builtin:talk';
+export const BEHAVIOR_FLEE = 'builtin:flee';
 
 export interface SimBehaviorDefMeta {
   id: string;
@@ -134,6 +152,35 @@ export const SIM_BUILTIN_BEHAVIORS: SimBehaviorDefMeta[] = [
     drivenBy: DESIRE_FATIGUE,
     durationEditable: true,
   },
+  {
+    id: BEHAVIOR_EAT,
+    name: '进食',
+    icon: '🍽',
+    desc: '在「提供食物」的环境进食（饥饿达到阈值时触发）',
+    weight: 1,
+    duration: 2,
+    trigger: '饥饿达阈值且知道哪里有食物',
+    drivenBy: DESIRE_HUNGER,
+    durationEditable: true,
+  },
+  {
+    id: BEHAVIOR_TALK,
+    name: '交谈',
+    icon: '💬',
+    desc: '与附近的人交谈（好友/爱慕/喜欢的人靠近后触发）',
+    weight: 1,
+    duration: 2,
+    trigger: '附近有可交谈的人',
+    durationEditable: true,
+  },
+  {
+    id: BEHAVIOR_FLEE,
+    name: '躲避',
+    icon: '🏃',
+    desc: '恐惧达到阈值时远离恐惧来源（反应规则触发）',
+    weight: 1,
+    trigger: '恐惧达阈值（反应触发）',
+  },
 ];
 
 export function behaviorDefOf(defId: string): SimBehaviorDefMeta | undefined {
@@ -148,6 +195,7 @@ export function defaultSimProfile(characterId: string): SimProfile {
     characterId,
     capabilities: { ...SIM_CAPABILITY_DEFAULTS },
     attributes: {},
+    tags: [],
     desires: SIM_BUILTIN_DESIRES.map((d) => ({ defId: d.id, intensity: d.defaultValue, enabled: true })),
     behaviors: SIM_BUILTIN_BEHAVIORS.map((b) => ({
       defId: b.id,
@@ -242,6 +290,7 @@ export function sanitizeSimProfile(raw: unknown, characterId: string): SimProfil
     characterId,
     capabilities: sanitizeCapabilities(o.capabilities),
     attributes,
+    tags: sanitizeProfileTags(o.tags),
     desires,
     behaviors,
     ...(o.stateOverrides && typeof o.stateOverrides === 'object'
@@ -288,6 +337,10 @@ export interface ResolvedSimProfile {
   capabilities: SimCapabilities;
   desires: Record<string, ResolvedDesire>;
   behaviors: Record<string, ResolvedBehavior>;
+  /** 人物 trait 标签 id（感知/移动/反应；建会话时冻结） */
+  tags: string[];
+  /** 情绪初值（emotion 标签 → 0-100；运行时随事件增减、每拍衰减） */
+  emotions: Record<string, number>;
 }
 
 /** 张望耗时：观察力越高越快（设计文档 §5.5），最少 1 拍 */
@@ -315,5 +368,11 @@ export function resolveSimProfile(profile: SimProfile): ResolvedSimProfile {
       duration: inst?.duration,
     };
   }
-  return { capabilities: { ...profile.capabilities }, desires, behaviors };
+  return {
+    capabilities: { ...profile.capabilities },
+    desires,
+    behaviors,
+    tags: traitIdsOf(profile.tags),
+    emotions: emotionInitialsOf(profile.tags),
+  };
 }
