@@ -66,8 +66,16 @@ export const useSimSessionStore = create<SimSessionState>((set, get) => {
         set({ error: '找不到舞台画布：请刷新页面后重试。', running: false });
         return;
       }
-      // 推演档案 + 关系边与人物库一起传入：能力/欲望阈值/标签/关系逐人物生效（修改在下次开始推演时生效）
-      const result = createSimSession(board, studio.characters, studio.simProfiles, studio.relations);
+      // 定义库 + 推演档案 + 关系边与人物库一起传入：标签/需求/情绪/交互/关系逐人物生效
+      // （定义与档案的修改在下次开始推演时生效）
+      const result = createSimSession(
+        board,
+        studio.characters,
+        studio.simProfiles,
+        studio.relations,
+        undefined,
+        studio.simSchema,
+      );
       if ('error' in result) {
         clearTimer();
         set({ session: null, running: false, error: result.error });

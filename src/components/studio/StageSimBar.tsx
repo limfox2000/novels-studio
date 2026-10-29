@@ -7,17 +7,15 @@ import { useState } from 'react';
 import { Film, Pause, Play, RotateCcw, SkipForward, SlidersHorizontal } from 'lucide-react';
 import { useSimSessionStore, SIM_SPEED_OPTIONS } from '../../stores/simSessionStore';
 import { SIM_BEHAVIOR_LABELS, type SimBehavior } from '../../engines/simRunner';
-import { EMOTION_FEAR, EMOTION_JOY } from '../../stores/simTags';
 import { SimPlayPanel } from './SimPlayPanel';
 
-/** 行为 → 气泡配色（与人物节点上的行为 chip 共用语义） */
+/** 行为 → 气泡配色（六个内核动作，与题材无关） */
 export const SIM_BEHAVIOR_STYLE: Record<SimBehavior, { chip: string; dot: string; icon: string }> = {
   idle: { chip: 'bg-slate-100 text-slate-500 ring-slate-200', dot: '#94a3b8', icon: '⏸' },
   move: { chip: 'bg-sky-50 text-sky-700 ring-sky-200', dot: '#0ea5e9', icon: '🚶' },
   observe: { chip: 'bg-violet-50 text-violet-700 ring-violet-200', dot: '#8b5cf6', icon: '👀' },
-  rest: { chip: 'bg-amber-50 text-amber-700 ring-amber-200', dot: '#f59e0b', icon: '🛋' },
-  eat: { chip: 'bg-emerald-50 text-emerald-700 ring-emerald-200', dot: '#10b981', icon: '🍽' },
-  talk: { chip: 'bg-pink-50 text-pink-700 ring-pink-200', dot: '#ec4899', icon: '💬' },
+  interact: { chip: 'bg-emerald-50 text-emerald-700 ring-emerald-200', dot: '#10b981', icon: '🖐' },
+  social: { chip: 'bg-pink-50 text-pink-700 ring-pink-200', dot: '#ec4899', icon: '💬' },
   avoid: { chip: 'bg-rose-50 text-rose-700 ring-rose-200', dot: '#f43f5e', icon: '🏃' },
 };
 
@@ -50,6 +48,11 @@ export function StageSimBar() {
         <span className="shrink-0 text-[12px] text-slate-400" data-sim-actor-count>
           {actors.length ? `${actors.length} 人在场` : '舞台上无人物'}
         </span>
+        {started && (
+          <span className="shrink-0 text-[12px] text-slate-400" data-sim-clock={session!.clock.phaseId}>
+            第 {session!.clock.day + 1} 天 · {session!.clock.phaseName}
+          </span>
+        )}
         <button
           type="button"
           data-sim-open-profile
@@ -131,9 +134,11 @@ export function StageSimBar() {
           {actors.map((a) => {
             const style = SIM_BEHAVIOR_STYLE[a.behavior];
             const envName = a.envId ? session!.envs.find((e) => e.id === a.envId)?.name : '';
-            const fear = a.emotions[EMOTION_FEAR] ?? 0;
-            const joy = a.emotions[EMOTION_JOY] ?? 0;
-            const hunger = a.desires['builtin:hunger'] ?? 0;
+            const emotions = session!.index.emotions;
+            const needs = session!.index.needs;
+            const needText = needs.map((d) => `${d.name} ${(a.needs[d.id] ?? 0).toFixed(0)}`).join(' · ');
+            const emoText = emotions.map((d) => `${d.name} ${(a.emotions[d.id] ?? 0).toFixed(0)}`).join(' · ');
+            const hot = emotions.filter((d) => (a.emotions[d.id] ?? 0) >= (d.emotion?.breakThreshold ?? 100));
             return (
               <span
                 key={a.nodeId}
@@ -141,23 +146,18 @@ export function StageSimBar() {
                 data-sim-character-id={a.characterId}
                 data-sim-behavior={a.behavior}
                 className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] ring-1 ${style.chip}`}
-                title={`${a.name}：${SIM_BEHAVIOR_LABELS[a.behavior]}${envName ? `（${envName}）` : ''} · 速度 ${a.speed}px/拍 · 观察力 ${a.profile.capabilities.observation} · 饥饿 ${hunger.toFixed(0)} · 恐惧 ${fear.toFixed(0)} · 喜悦 ${joy.toFixed(0)}${a.movable ? '' : ' · 不可移动'}`}
+                title={`${a.name}：${SIM_BEHAVIOR_LABELS[a.behavior]}${envName ? `（${envName}）` : ''} · 速度 ${a.speed}px/拍 · 观察力 ${a.profile.capabilities.observation}${needText ? ` · ${needText}` : ''}${emoText ? ` · ${emoText}` : ''}${a.movable ? '' : ' · 不可移动'}`}
               >
                 <span className="font-medium text-slate-700">{a.name}</span>
                 <span>
                   {style.icon} {SIM_BEHAVIOR_LABELS[a.behavior]}
                 </span>
                 {envName && <span className="opacity-70">· {envName}</span>}
-                {fear >= 30 && (
-                  <span data-sim-emotion="fear" title={`恐惧 ${fear.toFixed(0)}`}>
-                    😨
+                {hot.map((d) => (
+                  <span key={d.id} data-sim-emotion={d.id} title={`${d.name} ${(a.emotions[d.id] ?? 0).toFixed(0)}`}>
+                    {d.icon ?? '•'}
                   </span>
-                )}
-                {joy >= 30 && (
-                  <span data-sim-emotion="joy" title={`喜悦 ${joy.toFixed(0)}`}>
-                    😊
-                  </span>
-                )}
+                ))}
               </span>
             );
           })}
@@ -168,7 +168,7 @@ export function StageSimBar() {
       <div className="max-h-[96px] overflow-y-auto px-3 py-1.5" data-sim-events>
         {events.length === 0 ? (
           <p className="text-[12px] text-slate-400">
-            把环境与人物放到舞台上，点「开始推演」——人物会自己走动、张望、休息。
+            把环境与人物放到舞台上，点「开始推演」——人物会按定义库的标签与需求行动；定义库为空时只会走动/张望。
           </p>
         ) : (
           <ul className="space-y-0.5">

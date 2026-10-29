@@ -20,12 +20,21 @@ import {
 } from '../stores/studioStore';
 import { extractCharactersFromBoards, sanitizeCharacters } from '../stores/characterStates';
 import { sanitizeSimProfiles } from '../stores/simProfiles';
-import { sanitizeRelations } from '../stores/simTags';
+import { indexSimSchema, inspectSimSchema, sanitizeRelations } from '../stores/simSchema';
 import { useUiStore } from '../stores/uiStore';
 import { persistActiveChapterId } from '../stores/activeChapter';
 import { syncActiveChapterScene, withChapterSceneSyncSuppressed } from '../stores/chapterSceneSync';
 import type { Edge } from '@xyflow/react';
-import type { SimBoard, SimChapter, SimNodeType, SimProfile, SimRelation, SimVolume, WorkCharacter } from '../types/sim';
+import type {
+  SimBoard,
+  SimChapter,
+  SimNodeType,
+  SimProfile,
+  SimRelation,
+  SimSchema,
+  SimVolume,
+  WorkCharacter,
+} from '../types/sim';
 
 const ARCHIVES_KEY = 'nc2-sim-archives-v1';
 export const ARCHIVE_VERSION = 4;
@@ -36,6 +45,8 @@ export interface ArchiveGraph {
   characters?: unknown;
   /** 🎬 推演档案（v4 可选内嵌字段；缺失 → 按人物库自动补默认档，不升版本） */
   simProfiles?: unknown;
+  /** 🏷 推演定义库（可选内嵌字段；缺失 → 空定义库，旧标签随之丢弃，不升版本） */
+  simSchema?: unknown;
   /** 🔗 人物关系边（v4 可选内嵌字段；缺失 → 空数组，不升版本） */
   relations?: unknown;
   activeBoardId?: string;
@@ -85,7 +96,9 @@ interface NormalizedGraph {
   characters: Record<string, WorkCharacter>;
   /** 🎬 推演档案（与人物库一一对应，缺失自动补默认档） */
   simProfiles: Record<string, SimProfile>;
-  /** 🔗 人物关系边（作品级；缺失=空） */
+  /** 🏷 推演定义库（缺失=空） */
+  simSchema: SimSchema;
+  /** 🔗 人物关系边（作品级有向；缺失=空） */
   relations: SimRelation[];
   activeBoardId: string;
   activeChapterId: string;
@@ -164,11 +177,16 @@ function normalizeArchive(raw: unknown, fallbackName: string, extraSteps: Archiv
   // 📇 人物库：v4 直读；v3 及更早无 characters → 从画布节点一次性提取（见文件头注释）
   const hasLibrary = !!graph.characters && typeof graph.characters === 'object' && !Array.isArray(graph.characters);
   const knownCharacters = hasLibrary ? sanitizeCharacters(graph.characters) : undefined;
+  // 🏷 定义库：旧档缺失 → 空；必须先清洗，后续 boards/profiles/relations 都按它过滤
+  const simSchemaInspection = inspectSimSchema(graph.simSchema);
+  const simSchema = simSchemaInspection.schema;
+  const schemaIndex = indexSimSchema(simSchema);
+  if (simSchemaInspection.dropped > 0) warnings.push(`已过滤 ${simSchemaInspection.dropped} 条无效推演定义`);
 
   let boards: Record<string, SimBoard>;
   let characters: Record<string, WorkCharacter>;
   if (hasBoards) {
-    ({ boards, characters } = sanitizeBoards(graph.boards, volumes, undefined, chapters, knownCharacters));
+    ({ boards, characters } = sanitizeBoards(graph.boards, volumes, undefined, chapters, knownCharacters, simSchema));
   } else {
     // 旧归档：单画布 nodes/edges 迁进默认主画布，旧卷补空画布
     const nodes = graph.nodes ?? [];
@@ -177,7 +195,7 @@ function normalizeArchive(raw: unknown, fallbackName: string, extraSteps: Archiv
     }
     // 先提取人物（characterId=旧 node.id），再带库清洗节点（无法兼容的旧人物数据直接丢弃）
     const preCharacters = knownCharacters ?? extractCharactersFromBoards([{ nodes }]).characters;
-    const clean = sanitizeSimNodes(nodes, (graph.edges as Edge[] | undefined) ?? [], preCharacters);
+    const clean = sanitizeSimNodes(nodes, (graph.edges as Edge[] | undefined) ?? [], preCharacters, schemaIndex);
     if (!clean.nodes.length && nodes.length) {
       return fail(`「${name}」存档与当前创作台节点形态不兼容（已过滤 ${nodes.length} 个节点）`, fromVersion);
     }
@@ -188,6 +206,7 @@ function normalizeArchive(raw: unknown, fallbackName: string, extraSteps: Archiv
       { nodes: clean.nodes, edges: clean.edges },
       chapters,
       preCharacters,
+      simSchema,
     ));
     steps.push({ code: 'single-canvas', message: '旧单画布存档已迁入默认主画布' });
   }
@@ -195,9 +214,9 @@ function normalizeArchive(raw: unknown, fallbackName: string, extraSteps: Archiv
     steps.push({ code: 'character-library', message: `人物已迁入作品级人物库（${Object.keys(characters).length} 人）` });
   }
   // 🎬 推演档案：旧档缺失 → 按人物库补默认档（与人物库一一对应）
-  const simProfiles = sanitizeSimProfiles(graph.simProfiles, characters);
+  const simProfiles = sanitizeSimProfiles(graph.simProfiles, characters, schemaIndex);
   // 🔗 关系边：旧档缺失 → 空数组；悬空/未知标签过滤
-  const relations = sanitizeRelations(graph.relations, characters);
+  const relations = sanitizeRelations(graph.relations, characters, schemaIndex);
 
   for (const c of chapters) {
     const snap = c.snapshot;
@@ -219,6 +238,7 @@ function normalizeArchive(raw: unknown, fallbackName: string, extraSteps: Archiv
     graph: {
       boards,
       characters,
+      simSchema,
       simProfiles,
       relations,
       activeBoardId,
@@ -255,7 +275,7 @@ export function saveLocal(): void {
   persistActiveChapterId(useUiStore.getState().activeChapterId);
   const activeChapterId = useUiStore.getState().activeChapterId ?? '';
   try {
-    const graph = { boards: s.boards, characters: s.characters, simProfiles: s.simProfiles, relations: s.relations, activeBoardId: s.activeBoardId, activeChapterId, rules: s.rules, outlineRules: s.outlineRules, charGenRules: s.charGenRules, mainGoal: s.mainGoal, volumes: s.volumes, chapters: s.chapters, responsibleId: s.responsibleId, cover: s.cover };
+    const graph = { boards: s.boards, characters: s.characters, simSchema: s.simSchema, simProfiles: s.simProfiles, relations: s.relations, activeBoardId: s.activeBoardId, activeChapterId, rules: s.rules, outlineRules: s.outlineRules, charGenRules: s.charGenRules, mainGoal: s.mainGoal, volumes: s.volumes, chapters: s.chapters, responsibleId: s.responsibleId, cover: s.cover };
     const list = loadArchives().filter((a) => a.name !== s.graphName);
     list.push({ name: s.graphName, savedAt: new Date().toISOString(), version: ARCHIVE_VERSION, graph });
     writeArchives(list);

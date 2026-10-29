@@ -7,10 +7,13 @@ import {
   ReactFlowProvider,
   Background,
   BackgroundVariant,
+  ConnectionMode,
   Controls,
   MiniMap,
   useReactFlow,
+  type Connection,
   type Edge,
+  type EdgeChange,
 } from '@xyflow/react';
 import {
   useStudioStore,
@@ -42,6 +45,7 @@ import { ENV_TYPE_META, genderOf } from '../../types/sim';
 import { DEFAULT_STATE_ID } from '../../stores/characterStates';
 import { genRandomCharacter } from '../../engines/studioEngine';
 import { GENDER_STYLE, simNodeTypes } from './SimNodes';
+import { SimPortalEdge } from './SimPortalEdge';
 import { SimInspector } from './SimInspector';
 import { EditorRoomPanel } from './EditorRoomPanel';
 import { OutlineManager, VolumesDialog } from './OutlineManager';
@@ -90,6 +94,9 @@ import {
 // 人物节点渲染前没有实测尺寸：落点居中/避让按经验尺寸估算（宽取人名最大宽，高取头像+人名）
 const CHAR_NOMINAL_SIZE = { w: 144, h: 104 };
 
+/** 推演通道边（环境 ↔ 环境）：画布连线 = 门/路径，推演引擎据此寻路 */
+const simEdgeTypes = { portal: SimPortalEdge };
+
 function StudioCanvas() {
   const storeNodes = useActiveNodes();
   const activeBoard = useActiveBoard();
@@ -125,6 +132,33 @@ function StudioCanvas() {
   const onNodesChange = useStudioStore((s) => s.onNodesChange);
   const onEdgesChange = useStudioStore((s) => s.onEdgesChange);
   const setBoardViewport = useStudioStore((s) => s.setBoardViewport);
+  // 🚪 环境 ↔ 环境连线 = 推演通道（门/路径）；只允许环境之间、不重复、推演中冻结
+  const onConnect = useCallback(
+    (c: Connection) => {
+      if (simSession) return;
+      const st = useStudioStore.getState();
+      const board = st.boards[st.activeBoardId];
+      if (!board || !c.source || !c.target || c.source === c.target) return;
+      const kindOf = (nid: string) => board.nodes.find((n) => n.id === nid)?.data.kind;
+      if (kindOf(c.source) !== 'environment' || kindOf(c.target) !== 'environment') return;
+      const dup = board.edges.some(
+        (e) => (e.source === c.source && e.target === c.target) || (e.source === c.target && e.target === c.source),
+      );
+      if (dup) return;
+      const edge: Edge = {
+        id: `portal-${c.source}-${c.target}-${Date.now().toString(36)}`,
+        source: c.source,
+        target: c.target,
+        ...(c.sourceHandle ? { sourceHandle: c.sourceHandle } : {}),
+        ...(c.targetHandle ? { targetHandle: c.targetHandle } : {}),
+        type: 'portal',
+        data: { kind: 'portal', locked: false, traverseCost: 0, oneWay: false },
+      };
+      const changes: EdgeChange[] = [{ type: 'add', item: edge }];
+      onEdgesChange(changes);
+    },
+    [simSession, onEdgesChange],
+  );
   const regionDrawing = useUiStore((s) => s.regionDrawChapterId !== null);
   useActiveChapterId();
   // 切离舞台即暂停（会话保留，回来可继续）；离开创作台也停表，避免后台空转
@@ -229,14 +263,17 @@ function StudioCanvas() {
         edges={edges}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
+        onConnect={onConnect}
         onNodeDragStop={onNodeDragStop}
         onBeforeDelete={onBeforeDelete}
         onNodeClick={onNodeClick}
         onPaneClick={() => useUiStore.getState().setSelectedRegionId(null)}
         nodeTypes={simNodeTypes}
+        edgeTypes={simEdgeTypes}
+        connectionMode={ConnectionMode.Loose}
         deleteKeyCode={regionDrawing ? null : ['Delete', 'Backspace']}
         nodesDraggable={!regionDrawing}
-        nodesConnectable={!regionDrawing}
+        nodesConnectable={!regionDrawing && !simSession}
         elementsSelectable={!regionDrawing}
         panOnDrag={!regionDrawing}
         zoomOnScroll={!regionDrawing}

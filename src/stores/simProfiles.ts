@@ -1,11 +1,23 @@
-/** 🎬 推演档案（SimProfile）默认值 / 内置定义 / 校验 / 运行时解析。
+/** 🎬 推演档案（SimProfile）默认值 / 校验 / 运行时解析。
  *
  *  与人物档案（characterStates.ts）完全分离：这里只放「数值行为」，不碰姓名/状态/形象。
- *  作品级定义库（SimPlaySchema）尚未实现，本文件内置 MVP 的两项欲望与四个行为作为定义底稿；
- *  人物档案只存实例（启停 + 覆盖参数），运行时三级合并「内置默认 ← 档案实例」（状态覆盖待后续切片）。
- *  设计依据：docs/剧情推演模拟器设计.md §6。 */
-import type { SimCapabilities, SimDesireInstance, SimBehaviorInstance, SimProfile } from '../types/sim';
-import { emotionInitialsOf, sanitizeProfileTags, traitIdsOf } from './simTags';
+ *  **零内置内容**：需求来自作品级定义库 SimSchema（作者在设计页定义），人物档案只存实例
+ *  （启停 + 覆盖参数）。运行时合并「定义默认 ← 档案实例」。
+ *  设计依据：docs/剧情推演模拟器设计.md §6 / §19。 */
+import type {
+  SimCapabilities,
+  SimNeedInstance,
+  SimProfile,
+  SimStanceKind,
+  SimTagDef,
+} from '../types/sim';
+import {
+  emotionInitialsOf,
+  sanitizeProfileTags,
+  tagDefOf,
+  traitIdsOf,
+  type SimSchemaIndex,
+} from './simSchema';
 
 // ── 世界模型默认常量（设计文档 §5.9；档案未覆盖时取这些值） ──
 
@@ -20,189 +32,16 @@ export const SIM_CAPABILITY_RANGES = {
 
 /** 张望基准耗时（分子）：耗时 = OBSERVE_BASE / (0.5 + observation/100)，最少 1 拍 */
 export const SIM_OBSERVE_BASE = 1;
-/** 到达一个没去过的环境 → 好奇缓解量（新颖度信号） */
-export const SIM_NOVELTY_RELIEF = 25;
-/** 张望完成 → 好奇缓解量 */
-export const SIM_OBSERVE_RELIEF = 18;
-/** 休息完成 → 疲劳缓解量 */
-export const SIM_REST_RELIEF = 55;
-/** 好奇低于该值不再张望（避免张望刷屏） */
-export const SIM_OBSERVE_MIN_CURIOSITY = 28;
-
-// ── 内置欲望定义（定义库落地前的固定底稿） ──
-
-export const DESIRE_CURIOSITY = 'builtin:curiosity';
-export const DESIRE_FATIGUE = 'builtin:fatigue';
-/** 生存需求（§19 原语 2）：演示「需求 → 环境 affordance」闭环；默认值让首次推演很快就能看到进食 */
-export const DESIRE_HUNGER = 'builtin:hunger';
-
-export interface SimDesireDefMeta {
-  id: string;
-  name: string;
-  icon: string;
-  category: 'physio' | 'social' | 'cognitive' | 'emotional';
-  /** 何时增长 / 什么算满足（面板说明与后续叙事化素材） */
-  desc: string;
-  defaultValue: number;
-  growthPerTick: number;
-  threshold: number;
-  /** 缓解来源说明（面板展示） */
-  relief: string;
-}
-
-export const SIM_BUILTIN_DESIRES: SimDesireDefMeta[] = [
-  {
-    id: DESIRE_CURIOSITY,
-    name: '好奇',
-    icon: '🔍',
-    category: 'cognitive',
-    desc: '每拍增长；到达没去过的环境、张望后缓解。驱动探索与张望。',
-    defaultValue: 30,
-    growthPerTick: 0.9,
-    threshold: 45,
-    relief: `新环境 −${SIM_NOVELTY_RELIEF} · 张望 −${SIM_OBSERVE_RELIEF}`,
-  },
-  {
-    id: DESIRE_FATIGUE,
-    name: '疲劳',
-    icon: '😪',
-    category: 'physio',
-    desc: '每拍增长；达到阈值会找地方坐下休息。驱动休息。',
-    defaultValue: 10,
-    growthPerTick: 0.5,
-    threshold: 65,
-    relief: `休息 −${SIM_REST_RELIEF}`,
-  },
-  {
-    id: DESIRE_HUNGER,
-    name: '饥饿',
-    icon: '🍚',
-    category: 'physio',
-    desc: '每拍增长；达到阈值找「提供食物」的环境进食；达到 85 进入紧急层（只能先找吃的）。',
-    defaultValue: 30,
-    growthPerTick: 0.8,
-    threshold: 60,
-    relief: '进食 −65（环境标签 env:food）',
-  },
-];
-
-export function desireDefOf(defId: string): SimDesireDefMeta | undefined {
-  return SIM_BUILTIN_DESIRES.find((d) => d.id === defId);
-}
-
-// ── 内置行为定义 ──
-
-export const BEHAVIOR_EXPLORE = 'builtin:explore';
-export const BEHAVIOR_WANDER = 'builtin:wander';
-export const BEHAVIOR_OBSERVE = 'builtin:observe';
-export const BEHAVIOR_REST = 'builtin:rest';
-/** 标签内核新增：环境 affordance 进食 / 人物社会交往 / 恐惧反应躲避 */
-export const BEHAVIOR_EAT = 'builtin:eat';
-export const BEHAVIOR_TALK = 'builtin:talk';
-export const BEHAVIOR_FLEE = 'builtin:flee';
-
-export interface SimBehaviorDefMeta {
-  id: string;
-  name: string;
-  icon: string;
-  desc: string;
-  /** 默认权重；张望用它当触发概率 */
-  weight: number;
-  /** 权重是否被当前引擎消费（探索/走动/休息按阈值或保底触发，权重为预留） */
-  weightEditable?: boolean;
-  /** 触发方式简述（不消费权重时在面板展示） */
-  trigger?: string;
-  /** 默认耗时（拍）；缺省=由能力计算（张望）或不适用（移动类） */
-  duration?: number;
-  /** 由哪项欲望驱动（面板展示；wander 为保底动作） */
-  drivenBy?: string;
-  /** 是否可编辑耗时 */
-  durationEditable?: boolean;
-}
-
-export const SIM_BUILTIN_BEHAVIORS: SimBehaviorDefMeta[] = [
-  {
-    id: BEHAVIOR_EXPLORE,
-    name: '探索',
-    icon: '🧭',
-    desc: '走向没去过的环境（到达后好奇大幅缓解）',
-    weight: 1,
-    trigger: '好奇达阈值触发',
-    drivenBy: DESIRE_CURIOSITY,
-  },
-  { id: BEHAVIOR_WANDER, name: '走动', icon: '🚶', desc: '在当前环境内随意走动（好奇未达阈值时的保底动作）', weight: 1, trigger: '保底动作' },
-  {
-    id: BEHAVIOR_OBSERVE,
-    name: '张望',
-    icon: '👀',
-    desc: '停下观察四周，缓解好奇；耗时由观察力决定',
-    weight: 0.6,
-    weightEditable: true,
-    drivenBy: DESIRE_CURIOSITY,
-    durationEditable: true,
-  },
-  {
-    id: BEHAVIOR_REST,
-    name: '休息',
-    icon: '🛋',
-    desc: '坐下恢复精神（疲劳达到阈值时触发）',
-    weight: 1,
-    duration: 3,
-    trigger: '疲劳达阈值触发',
-    drivenBy: DESIRE_FATIGUE,
-    durationEditable: true,
-  },
-  {
-    id: BEHAVIOR_EAT,
-    name: '进食',
-    icon: '🍽',
-    desc: '在「提供食物」的环境进食（饥饿达到阈值时触发）',
-    weight: 1,
-    duration: 2,
-    trigger: '饥饿达阈值且知道哪里有食物',
-    drivenBy: DESIRE_HUNGER,
-    durationEditable: true,
-  },
-  {
-    id: BEHAVIOR_TALK,
-    name: '交谈',
-    icon: '💬',
-    desc: '与附近的人交谈（好友/爱慕/喜欢的人靠近后触发）',
-    weight: 1,
-    duration: 2,
-    trigger: '附近有可交谈的人',
-    durationEditable: true,
-  },
-  {
-    id: BEHAVIOR_FLEE,
-    name: '躲避',
-    icon: '🏃',
-    desc: '恐惧达到阈值时远离恐惧来源（反应规则触发）',
-    weight: 1,
-    trigger: '恐惧达阈值（反应触发）',
-  },
-];
-
-export function behaviorDefOf(defId: string): SimBehaviorDefMeta | undefined {
-  return SIM_BUILTIN_BEHAVIORS.find((b) => b.id === defId);
-}
 
 // ── 建档 / 校验 ──
 
-/** 默认推演档案：能力取世界模型默认；欲望/行为取内置定义全集并启用（设计文档 §6.1 自动创建） */
-export function defaultSimProfile(characterId: string): SimProfile {
+/** 默认推演档案：能力取世界模型默认；需求实例 = schema 中每个 need 的定义默认 */
+export function defaultSimProfile(characterId: string, index: SimSchemaIndex): SimProfile {
   return {
     characterId,
     capabilities: { ...SIM_CAPABILITY_DEFAULTS },
-    attributes: {},
     tags: [],
-    desires: SIM_BUILTIN_DESIRES.map((d) => ({ defId: d.id, intensity: d.defaultValue, enabled: true })),
-    behaviors: SIM_BUILTIN_BEHAVIORS.map((b) => ({
-      defId: b.id,
-      enabled: true,
-      ...(b.weight !== 1 ? { weight: b.weight } : {}),
-      ...(b.duration !== undefined ? { duration: b.duration } : {}),
-    })),
+    needs: index.needs.map((def) => ({ defId: def.id, enabled: true })),
   };
 }
 
@@ -230,117 +69,92 @@ function sanitizeCapabilities(raw: unknown): SimCapabilities {
   };
 }
 
-/** 单份档案校验：能力钳制、欲望/行为实例按内置定义补全（缺的补默认，未知 defId 丢弃），
- *  characterId 一律以入参为准（防止串档）。 */
-export function sanitizeSimProfile(raw: unknown, characterId: string): SimProfile {
-  const base = defaultSimProfile(characterId);
+/** 单份档案校验：能力钳制；标签/需求实例按当前 schema 过滤（未知定义丢弃），
+ *  schema 中每个 need 缺实例时补默认（新增需求自动出现在老档案里）。 */
+export function sanitizeSimProfile(raw: unknown, characterId: string, index: SimSchemaIndex): SimProfile {
   const o = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-
-  const rawDesires = Array.isArray(o.desires) ? (o.desires as unknown[]) : [];
-  const desireById = new Map<string, SimDesireInstance>();
-  for (const item of rawDesires) {
+  const rawNeeds = Array.isArray(o.needs) ? (o.needs as unknown[]) : [];
+  const byDef = new Map<string, SimNeedInstance>();
+  for (const item of rawNeeds) {
     if (!item || typeof item !== 'object') continue;
     const d = item as Record<string, unknown>;
     const defId = typeof d.defId === 'string' ? d.defId : '';
-    const def = desireDefOf(defId);
-    if (!def || desireById.has(defId)) continue;
-    desireById.set(defId, {
+    const def = tagDefOf(index, defId);
+    if (!def || def.role !== 'need' || byDef.has(defId)) continue;
+    const p = def.need!;
+    byDef.set(defId, {
       defId,
-      intensity: clampNum(d.intensity, 0, 100, def.defaultValue),
+      intensity: clampNum(d.intensity, 0, 100, p.initial),
       ...(typeof d.growthPerTick === 'number' && Number.isFinite(d.growthPerTick)
-        ? { growthPerTick: clampNum(d.growthPerTick, 0, 20, def.growthPerTick) }
+        ? { growthPerTick: clampNum(d.growthPerTick, 0, 20, p.growth) }
         : {}),
       ...(typeof d.threshold === 'number' && Number.isFinite(d.threshold)
-        ? { threshold: clampNum(d.threshold, 0, 100, def.threshold) }
+        ? { threshold: clampNum(d.threshold, 0, 100, p.threshold) }
+        : {}),
+      ...(typeof d.emergency === 'number' && Number.isFinite(d.emergency)
+        ? { emergency: clampNum(d.emergency, 0, 100, p.emergency) }
         : {}),
       enabled: d.enabled !== false,
     });
   }
-  // 内置定义全集补全：缺实例的人物视为启用默认（新增内置欲望自动出现在老档案里）
-  const desires = SIM_BUILTIN_DESIRES.map((def) => desireById.get(def.id) ?? base.desires.find((x) => x.defId === def.id)!);
-
-  const rawBehaviors = Array.isArray(o.behaviors) ? (o.behaviors as unknown[]) : [];
-  const behaviorById = new Map<string, SimBehaviorInstance>();
-  for (const item of rawBehaviors) {
-    if (!item || typeof item !== 'object') continue;
-    const b = item as Record<string, unknown>;
-    const defId = typeof b.defId === 'string' ? b.defId : '';
-    const def = behaviorDefOf(defId);
-    if (!def || behaviorById.has(defId)) continue;
-    behaviorById.set(defId, {
-      defId,
-      enabled: b.enabled !== false,
-      ...(typeof b.weight === 'number' && Number.isFinite(b.weight) ? { weight: clampNum(b.weight, 0, 1, def.weight) } : {}),
-      ...(typeof b.duration === 'number' && Number.isFinite(b.duration) ? { duration: Math.round(clampNum(b.duration, 1, 20, def.duration ?? 1)) } : {}),
-    });
-  }
-  const behaviors = SIM_BUILTIN_BEHAVIORS.map(
-    (def) => behaviorById.get(def.id) ?? base.behaviors.find((x) => x.defId === def.id)!,
+  const needs = index.needs.map(
+    (def) => byDef.get(def.id) ?? ({ defId: def.id, enabled: true } satisfies SimNeedInstance),
   );
-
-  // 属性初值：定义库未实现，只保留合法的数字键值（当前恒空）
-  const attributes: Record<string, number> = {};
-  if (o.attributes && typeof o.attributes === 'object') {
-    for (const [k, v] of Object.entries(o.attributes as Record<string, unknown>)) {
-      if (typeof v === 'number' && Number.isFinite(v)) attributes[k] = v;
-    }
-  }
 
   return {
     characterId,
     capabilities: sanitizeCapabilities(o.capabilities),
-    attributes,
-    tags: sanitizeProfileTags(o.tags),
-    desires,
-    behaviors,
-    ...(o.stateOverrides && typeof o.stateOverrides === 'object'
-      ? { stateOverrides: o.stateOverrides as SimProfile['stateOverrides'] }
-      : {}),
+    tags: sanitizeProfileTags(o.tags, index),
+    needs,
   };
 }
 
-/** 全量校验：只保留人物库中仍有记录的档案；**每位人物都保证有一份**（旧人物/缺失自动补默认档）。
- *  返回新 map（调用方与 characters 一起落库，保持「一人一档」）。 */
+/** 全量校验：只保留人物库中仍有记录的档案；**每位人物都保证有一份**（旧人物/缺失自动补默认档）。 */
 export function sanitizeSimProfiles(
   raw: unknown,
   characters: Record<string, { id: string }>,
+  index: SimSchemaIndex,
 ): Record<string, SimProfile> {
   const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const out: Record<string, SimProfile> = {};
   for (const characterId of Object.keys(characters)) {
     const candidate = src[characterId];
-    // 支持两种历史形态：按 id 键的对象 / 数组（以 characterId 字段为准）
     let val: unknown = candidate;
     if (val === undefined && Array.isArray(src)) val = (src as unknown[]).find((x) => (x as SimProfile | undefined)?.characterId === characterId);
-    out[characterId] = sanitizeSimProfile(val, characterId);
+    out[characterId] = sanitizeSimProfile(val, characterId, index);
   }
   return out;
 }
 
-// ── 运行时解析：内置默认 ← 档案实例（状态覆盖待后续切片） ──
+// ── 运行时解析：定义默认 ← 档案实例 ──
 
-export interface ResolvedDesire {
+export interface ResolvedNeed {
+  def: SimTagDef;
+  /** 初始值（运行时随需求增长/缓解变化） */
   value: number;
   growth: number;
   threshold: number;
+  emergency: number;
   enabled: boolean;
+  relievers: { novelty?: number; observe?: number; social?: number };
 }
 
-export interface ResolvedBehavior {
-  enabled: boolean;
-  weight: number;
-  /** undefined = 由能力计算（张望）或不适用（移动类） */
-  duration?: number;
+export interface ResolvedEmotion {
+  def: SimTagDef;
+  value: number;
+  decay: number;
+  breakThreshold: number;
+  clearThreshold: number;
+  stance: SimStanceKind | 'none';
 }
 
 export interface ResolvedSimProfile {
   capabilities: SimCapabilities;
-  desires: Record<string, ResolvedDesire>;
-  behaviors: Record<string, ResolvedBehavior>;
-  /** 人物 trait 标签 id（感知/移动/反应；建会话时冻结） */
-  tags: string[];
-  /** 情绪初值（emotion 标签 → 0-100；运行时随事件增减、每拍衰减） */
-  emotions: Record<string, number>;
+  /** defId → 需求（遍历顺序由 index.needs 决定，天然按 id 排序） */
+  needs: Record<string, ResolvedNeed>;
+  emotions: Record<string, ResolvedEmotion>;
+  /** 人物 trait 标签 id（感知/移动/反应；建会话时冻结，已排序） */
+  traits: string[];
 }
 
 /** 张望耗时：观察力越高越快（设计文档 §5.5），最少 1 拍 */
@@ -348,31 +162,38 @@ export function observeTicks(observation: number): number {
   return Math.max(1, Math.round(SIM_OBSERVE_BASE / (0.5 + Math.max(0, Math.min(100, observation)) / 100)));
 }
 
-export function resolveSimProfile(profile: SimProfile): ResolvedSimProfile {
-  const desires: Record<string, ResolvedDesire> = {};
-  for (const def of SIM_BUILTIN_DESIRES) {
-    const inst = profile.desires.find((d) => d.defId === def.id);
-    desires[def.id] = {
-      value: inst?.intensity ?? def.defaultValue,
-      growth: inst?.growthPerTick ?? def.growthPerTick,
-      threshold: inst?.threshold ?? def.threshold,
+export function resolveSimProfile(profile: SimProfile, index: SimSchemaIndex): ResolvedSimProfile {
+  const needs: Record<string, ResolvedNeed> = {};
+  for (const def of index.needs) {
+    const inst = profile.needs.find((n) => n.defId === def.id);
+    const p = def.need!;
+    needs[def.id] = {
+      def,
+      value: clampNum(inst?.intensity, 0, 100, p.initial),
+      growth: clampNum(inst?.growthPerTick, 0, 20, p.growth),
+      threshold: clampNum(inst?.threshold, 0, 100, p.threshold),
+      emergency: clampNum(inst?.emergency, 0, 100, p.emergency),
       enabled: inst?.enabled !== false,
+      relievers: { ...(p.relievers ?? {}) },
     };
   }
-  const behaviors: Record<string, ResolvedBehavior> = {};
-  for (const def of SIM_BUILTIN_BEHAVIORS) {
-    const inst = profile.behaviors.find((b) => b.defId === def.id);
-    behaviors[def.id] = {
-      enabled: inst?.enabled !== false,
-      weight: inst?.weight ?? def.weight,
-      duration: inst?.duration,
+  const emotions: Record<string, ResolvedEmotion> = {};
+  const initials = emotionInitialsOf(profile.tags, index);
+  for (const def of index.emotions) {
+    const p = def.emotion!;
+    emotions[def.id] = {
+      def,
+      value: clampNum(initials[def.id], 0, 100, p.initial),
+      decay: p.decay,
+      breakThreshold: p.breakThreshold,
+      clearThreshold: p.clearThreshold,
+      stance: p.stance ?? 'none',
     };
   }
   return {
     capabilities: { ...profile.capabilities },
-    desires,
-    behaviors,
-    tags: traitIdsOf(profile.tags),
-    emotions: emotionInitialsOf(profile.tags),
+    needs,
+    emotions,
+    traits: traitIdsOf(profile.tags, index),
   };
 }

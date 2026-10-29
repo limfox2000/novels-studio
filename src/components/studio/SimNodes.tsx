@@ -5,7 +5,7 @@
  *  v2.18：环境按类型取清淡配色与图标（ENV_TYPE_META——房间/建筑/社区/城镇/区域/床/物品），物品不是容器。
  *  当前阶段仅创建/摆位/嵌套；连线语义随规则系统需求定义（暂无 Handle）。 */
 import type { ComponentType } from 'react';
-import { NodeResizer, type NodeProps } from '@xyflow/react';
+import { Handle, NodeResizer, Position, type NodeProps } from '@xyflow/react';
 import { BedDouble, Blocks, Building2, DoorOpen, Landmark, Lock, LockOpen, Map, Package, X } from 'lucide-react';
 import { useStudioStore, ENV_MIN_W, ENV_MIN_H } from '../../stores/studioStore';
 import { CharacterAvatar } from './CharacterAvatar';
@@ -23,7 +23,6 @@ import {
 } from '../../types/sim';
 import { characterActiveState } from '../../stores/characterStates';
 import { characterReferenceSummary, referenceChapterText } from '../../stores/snapshotRefs';
-import { tagDefOf } from '../../stores/simTags';
 
 /** 环境类型 → 线性图标（节点标题条用；ENV_TYPE_META.icon 的 emoji 仍供提示词/生成内容使用） */
 const ENV_ICON: Record<EnvironmentType, ComponentType<{ className?: string }>> = {
@@ -123,10 +122,30 @@ export function SimEnvironmentNode({ id, data, selected }: NodeProps) {
   const meta = ENV_TYPE_META[d.etype];
   const EnvIcon = ENV_ICON[d.etype];
   const locked = d.locked === true;
+  // 🏷 环境标签定义读作品级定义库（节点只存标签 id）
+  const tagDefs = useStudioStore((s) => s.simSchema.tags);
   return (
     <>
       {/* 选中后显示缩放柄（写 node.width/height，经 dimensions change 进 store 持久化）；锁定后隐藏；柄色随类型 */}
       <NodeResizer isVisible={selected && !locked} minWidth={ENV_MIN_W} minHeight={ENV_MIN_H} color={meta.dot} />
+      {/* 🚪 通道连接点：四边中点；ConnectionMode.Loose 下任意两个环境连接点都能连成通道 */}
+      {(
+        [
+          { pos: Position.Top, key: 'top' },
+          { pos: Position.Right, key: 'right' },
+          { pos: Position.Bottom, key: 'bottom' },
+          { pos: Position.Left, key: 'left' },
+        ] as const
+      ).map(({ pos, key }) => (
+        <Handle
+          key={key}
+          id={key}
+          type="source"
+          position={pos}
+          data-sim-portal-handle={key}
+          className="!h-2 !w-2 !border-0 !bg-slate-300/70 transition-colors hover:!bg-brand-500"
+        />
+      ))}
       <div
         data-env-id={id}
         className={`group flex h-full w-full flex-col overflow-hidden rounded-xl border-2 shadow-md ${meta.border} ${meta.body}`}
@@ -141,11 +160,16 @@ export function SimEnvironmentNode({ id, data, selected }: NodeProps) {
           <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-white">{d.name || '未命名'}</span>
           {/* 🏷 环境标签（世界认知池）：如 🍚 提供食物 / 🛏 可睡 / 🗑 脏乱 */}
           {(d.tags ?? []).map((tagId) => {
-            const def = tagDefOf(tagId);
+            const def = tagDefs.find((t) => t.id === tagId);
             if (!def) return null;
             return (
-              <span key={tagId} data-env-tag-chip={tagId} className="shrink-0 text-[11px] leading-none" title={`${def.name}：${def.desc}`}>
-                {def.icon}
+              <span
+                key={tagId}
+                data-env-tag-chip={tagId}
+                className="shrink-0 text-[11px] leading-none"
+                title={def.desc ? `${def.name}：${def.desc}` : def.name}
+              >
+                {def.icon ?? '🏷'}
               </span>
             );
           })}

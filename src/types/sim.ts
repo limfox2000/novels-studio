@@ -132,9 +132,9 @@ export interface EnvironmentData extends Record<string, unknown> {
   desc: string;
   /** 🔒 移动锁定：只禁止拖动/缩放，不影响改名、描述、父子归属与删除 */
   locked?: boolean;
-  /** 🏷 环境标签（统一标签内核，设计文档 §19.3）：affordance / narrative 定义 id 列表，
-   *  如 env:food（提供食物）/ env:sleep（可睡）/ env:dirty（脏乱）。缺省=无标签。
-   *  sanitize 时过滤未知定义；引擎只消费 affordance 与叙事发现，不做任何题材分支。 */
+  /** 🏷 环境标签（统一标签内核，设计文档 §19.3）：引用作品级定义库（SimSchema）中 scope=env 的
+   *  affordance / narrative 定义 id。缺省=无标签；sanitize 时过滤未知定义。
+   *  内核零内置内容：具体有哪些标签完全由作者在设计页定义。 */
   tags?: string[];
 }
 
@@ -254,6 +254,148 @@ export interface ChapterRegion {
   color?: string;
 }
 
+// ── 🎬 推演世界模型定义库（SimSchema）：作品级数据，内核零内置内容（设计文档 §19） ──
+// 上一版把讨论里随手举的例子（西装/手枪/食物/友善…）写进了产品代码；现在全部删除：
+// 引擎只认六种原语，标签/需求/情绪/affordance/反应/关系全部是作者定义的作品数据。
+// 新作品 schema 为空，舞台照样能跑（走动/张望），但不会出现任何题材内容。
+
+/** 标签载体：人物 / 环境（关系另有 SimRelationDef，语义字段不同） */
+export type SimTagScope = 'character' | 'env';
+/** 标签角色：trait=属性/物品/能力，need=需求，emotion=情绪，affordance=环境交互，narrative=纯叙述 */
+export type SimTagRole = 'trait' | 'need' | 'emotion' | 'affordance' | 'narrative';
+/** 可感知性（感知原语）：always=一眼看到；near=进入感知范围；concealed=靠近或张望才发现 */
+export type SimTagVisibility = 'always' | 'near' | 'concealed';
+/** 立场（反应/关系原语）：approach=靠近，avoid=远离，talk=靠近并交谈 */
+export type SimStanceKind = 'approach' | 'avoid' | 'talk';
+
+/** 需求参数（need 角色）：0-100 标尺 + 每拍增长 + 阈值 + 紧急阈值 + 非 affordance 缓解来源 */
+export interface SimNeedParams {
+  /** 初值（0-100） */
+  initial: number;
+  /** 每拍增长（0-20） */
+  growth: number;
+  /** 达到后主动满足 */
+  threshold: number;
+  /** 达到后进入紧急层（100=不设紧急层） */
+  emergency: number;
+  /** 无环境交互时的缓解来源与每次缓解量（新颖度/张望/社交） */
+  relievers?: Partial<Record<'novelty' | 'observe' | 'social', number>>;
+}
+
+/** 情绪参数（emotion 角色）：0-100 + 每拍衰减；达到 breakThreshold 触发 stance，低于 clearThreshold 清除 */
+export interface SimEmotionParams {
+  initial: number;
+  decay: number;
+  breakThreshold: number;
+  clearThreshold: number;
+  /** 情绪自身驱动的立场（反应规则未指定 stance 时使用） */
+  stance?: SimStanceKind | 'none';
+}
+
+/** 环境交互参数（affordance 角色）：满足哪项需求、耗时、缓解量、可用次数、可用时段 */
+export interface SimAffordanceParams {
+  /** 引用 role=need 的标签 id */
+  needId: string;
+  /** 每次缓解量（0-100） */
+  relief: number;
+  /** 耗时（拍） */
+  duration: number;
+  /** 可用次数（运行时每个环境独立计数；缺省=不限） */
+  uses?: number;
+  /** 仅在这些时间相位可用（空/缺省=全天） */
+  activePhases?: string[];
+}
+
+export interface SimNarrativeParams {
+  /** 首次注意/进入时的事件文案（{env} 替换为环境名） */
+  discoverText?: string;
+}
+
+/** 标签定义（作品级） */
+export interface SimTagDef {
+  /** 作品内唯一 id（≤64，不含空白；创建后不建议改） */
+  id: string;
+  name: string;
+  icon?: string;
+  scope: SimTagScope;
+  role: SimTagRole;
+  desc?: string;
+  /** trait：可感知性 */
+  visibility?: SimTagVisibility;
+  /** trait：撤销的能力（仅识别 move:walk） */
+  revokes?: string[];
+  /** trait：授予的移动模式 */
+  grantsMove?: { mode: 'walk' | 'fly'; speedMultiplier: number };
+  /** need 参数 */
+  need?: SimNeedParams;
+  /** emotion 参数 */
+  emotion?: SimEmotionParams;
+  /** affordance 参数（scope=env） */
+  affordance?: SimAffordanceParams;
+  /** narrative 参数（scope=env） */
+  narrative?: SimNarrativeParams;
+}
+
+/** 反应规则（原语 6）：观察到 triggerTag（+自身满足 selfTag）→ 情绪Δ/需求Δ/立场 + 事件文案 */
+export interface SimReactionDef {
+  id: string;
+  /** 触发载体：观察到的人物标签（actor）或进入/看见的环境标签（env） */
+  triggerScope: 'actor' | 'env';
+  triggerTag: string;
+  /** 观察者自身必须携带的 trait（如「喜欢某类人」才起反应） */
+  selfTag?: string;
+  emotion?: { defId: string; delta: number };
+  need?: { defId: string; delta: number };
+  stance?: { kind: SimStanceKind; emotionRef?: string };
+  /** 事件文案（{target}/{env} 模板）；缺省用系统泛化文案 */
+  text?: string;
+  /** 同类规则再次触发的最小间隔（拍，0-120） */
+  cooldown?: number;
+  /** 越大越优先（-100~100） */
+  priority?: number;
+}
+
+/** 关系定义（作品级）：关系标签的语义——stance + 数值门槛 + 社交距离/耗时 */
+export interface SimRelationDef {
+  id: string;
+  name: string;
+  icon?: string;
+  desc?: string;
+  /** 同场时的立场：approach/avoid/talk/none */
+  stance: SimStanceKind | 'none';
+  /** 越大越优先（多标签时取第一个有效 stance） */
+  priority?: number;
+  /** 关系数值门槛（缺省 0/100） */
+  minValue?: number;
+  maxValue?: number;
+  /** talk 立场耗时（拍，缺省 2） */
+  talkDuration?: number;
+  /** talk 立场直接交谈距离（缺省引擎常量） */
+  talkDistance?: number;
+}
+
+/** 时间相位（0-1 归一化一天内的半开区间 [from,to)） */
+export interface SimTimePhase {
+  id: string;
+  name: string;
+  from: number;
+  to: number;
+}
+
+/** 时间维度：一天多少拍 + 相位表；缺省=单相「全天」 */
+export interface SimTimeDef {
+  ticksPerDay: number;
+  phases: SimTimePhase[];
+}
+
+/** 🎬 作品级推演定义库：空对象=零内容（新作品默认） */
+export interface SimSchema {
+  tags: SimTagDef[];
+  reactions: SimReactionDef[];
+  relations: SimRelationDef[];
+  time?: SimTimeDef;
+}
+
 // ── 🎬 推演档案（SimProfile）：与人物档案物理分离的数值数据（设计文档 §6，D20） ──
 // 人物档案（WorkCharacter/CharacterState）= 叙事身份，给人看；推演档案 = 数值行为，给引擎跑。
 // 两者只通过 characterId 关联，各自 sanitize、各自脏检查；推演结果不回写人物档案。
@@ -262,52 +404,45 @@ export interface ChapterRegion {
 export interface SimCapabilities {
   /** 移动速度（px/拍），默认 80 */
   speed: number;
-  /** 感知范围（px），默认 400——**预留**：当前引擎尚未消费（感知/互见在后续切片接入） */
+  /** 感知范围（px），默认 400 */
   perception: number;
   /** 观察力（0-100），默认 50：张望耗时 = OBSERVE_BASE / (0.5 + observation/100) */
   observation: number;
 }
 
-/** 欲望实例：引用（内置）定义，可逐人物启停/调初值/覆盖增长与阈值 */
-export interface SimDesireInstance {
+/** 需求实例：引用 schema 中 role=need 的定义，可逐人物启停/调初值/覆盖增长与阈值 */
+export interface SimNeedInstance {
   defId: string;
-  /** 初始强度（0-100） */
-  intensity: number;
+  /** 初值（0-100）；缺省=定义默认 */
+  intensity?: number;
   /** 每拍增长；缺省=定义默认 */
   growthPerTick?: number;
   /** 触发阈值；缺省=定义默认 */
   threshold?: number;
+  /** 紧急阈值；缺省=定义默认 */
+  emergency?: number;
   enabled: boolean;
 }
 
-/** 行为实例：引用（内置）定义，可逐人物启停与调权重/耗时 */
-export interface SimBehaviorInstance {
-  defId: string;
-  enabled: boolean;
-  /** 权重（0-1 概率式；MVP 用来决定张望/休息的触发倾向） */
-  weight?: number;
-  cooldown?: number;
-  /** 耗时（拍）；缺省=定义默认（张望的缺省由观察力计算） */
-  duration?: number;
-}
-
-/** 🏷 标签实例（统一标签内核，设计文档 §19.3）：引用定义库（内置底稿 stores/simTags.ts）。
- *  value 用于需要当前值的角色（情绪初值）；trait/affordance 标签只用 defId。 */
+/** 🏷 标签实例（统一标签内核，设计文档 §19.3）：引用定义库中 scope=character 的 trait/emotion。
+ *  value 只对 emotion 有意义（情绪初值/当前覆盖）；trait 只用 defId。 */
 export interface SimTagInstance {
   defId: string;
   /** 0-100（情绪初值等）；缺省=定义默认 */
   value?: number;
 }
 
-/** 🔗 人物关系边（作品级稀疏图，设计文档 §19.3 / D25）：两人一条，标签 + 好感值。
- *  与画布连线无关（画布 edge 表达通道）；只通过 characterId 关联人物库，随作品存档。 */
+/** 🔗 人物关系边（作品级有向图，设计文档 §19.3 / D25）：from 对 to 的看法（标签 + 好感值）。
+ *  与画布连线无关（画布 edge 表达通道）；只通过 characterId 关联人物库，随作品存档。
+ *  反向看法是另一条边——A 对 B 友善，不代表 B 对 A 友善。 */
 export interface SimRelation {
-  /** 两人 characterId（写入时规范为 a < b，保证同一对只有一条） */
-  a: string;
-  b: string;
-  /** 关系标签（rel:friend / rel:enemy / rel:like）；当前每条边取首个有效标签 */
+  /** 人物 characterId */
+  from: string;
+  /** 人物 characterId */
+  to: string;
+  /** 关系标签（引用 schema.relations），最多 3 条 */
   tags: string[];
-  /** 好感 0-100（50=中性；缺省 50）；当前引擎尚未消费，留给后续效用权重 */
+  /** 好感 0-100（缺省 50）；关系定义的 min/max 门槛消费它 */
   value?: number;
 }
 
@@ -315,23 +450,24 @@ export interface SimRelation {
 export interface SimProfile {
   characterId: string;
   capabilities: SimCapabilities;
-  /** 🏷 人物标签（D24：推演数据，叙事层只读）：trait（西装/手枪/残疾/御剑/喜欢西装）+ emotion（恐惧/喜悦）；
-   *  属性、衣着、物品统一为 trait，不再各自成为概念。need 仍走下面的 desires（§19.3「不另起系统」）。 */
+  /** 🏷 人物标签（trait + emotion 实例）；need 走下面的 needs */
   tags?: SimTagInstance[];
-  /** 作品级扩展属性的初值（attrId → 值）；定义库尚未实现，当前恒为 {} */
-  attributes: Record<string, number>;
-  desires: SimDesireInstance[];
-  behaviors: SimBehaviorInstance[];
-  /** 可选：按人物状态覆盖（「重伤后」能力与欲望不同）；MVP 仅存结构，解析待状态覆盖切片 */
-  stateOverrides?: Record<
-    string,
-    {
-      capabilities?: Partial<SimCapabilities>;
-      attributes?: Record<string, number>;
-      desires?: Record<string, Partial<SimDesireInstance>>;
-      behaviors?: Record<string, Partial<SimBehaviorInstance>>;
-    }
-  >;
+  /** 需求实例（schema 中每个 need 定义一条） */
+  needs: SimNeedInstance[];
+}
+
+/** 🚪 画布通道（环境↔环境连线）的数据：显式空间拓扑 */
+export interface SimPortalData extends Record<string, unknown> {
+  kind?: 'portal';
+  name?: string;
+  /** 锁闭（锁住的门/断掉的路：寻路不可过） */
+  locked?: boolean;
+  /** 穿过额外耗时（拍，0-10） */
+  traverseCost?: number;
+  /** 单向通道（只能 from→to） */
+  oneWay?: boolean;
+  /** 路点（画布绝对坐标）；缺省取两端环境中心中点 */
+  waypoint?: { x: number; y: number };
 }
 
 /** 🗂 卷画布（v2.29）：一张画布 = 一个卷的舞台；默认主画布收纳未分卷章节/旧单画布。

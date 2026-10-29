@@ -40,18 +40,31 @@ import {
   type SimChapter,
   type SimData,
   type SimNodeType,
+  type SimPortalData,
   type SimVolume,
   type SimViewport,
-  type SimBehaviorInstance,
   type SimCapabilities,
-  type SimDesireInstance,
+  type SimNeedInstance,
   type SimProfile,
+  type SimReactionDef,
   type SimRelation,
-  type SimTagInstance,
+  type SimRelationDef,
+  type SimSchema,
+  type SimTagDef,
   type WorkCharacter,
 } from '../types/sim';
 import { defaultSimProfile, sanitizeSimProfile, sanitizeSimProfiles } from './simProfiles';
-import { sanitizeEnvTags, sanitizeProfileTags, sanitizeRelationTags, sanitizeRelations, tagDefOf } from './simTags';
+import {
+  EMPTY_SIM_SCHEMA,
+  indexSimSchema,
+  inspectSimSchema,
+  sanitizeEnvTags,
+  sanitizeRelationTags,
+  sanitizeRelations,
+  sanitizeSimSchema,
+  tagDefOf,
+  type SimSchemaIndex,
+} from './simSchema';
 import { uid } from '../utils/id';
 import { sameStringList, sanitizeWritingSkillIds } from '../types/writingSkill';
 import { absPositionOf, isDescendantOf, sortParentsFirst } from './graphGeom';
@@ -328,6 +341,7 @@ export function sanitizeSimNodes(
   nodes: SimNodeType[],
   edges: Edge[],
   characters: Record<string, WorkCharacter>,
+  index: SimSchemaIndex,
 ): { nodes: SimNodeType[]; edges: Edge[]; dropped: number } {
   // 先按 id 去重：多画布存档合并/损坏缓存可能出现重复 id，React Flow 会因此错乱
   const seenNodeIds = new Set<string>();
@@ -364,8 +378,8 @@ export function sanitizeSimNodes(
     const etype = (ENV_TYPES as readonly string[]).includes(pickStr(d.etype)) ? (pickStr(d.etype) as EnvironmentType) : 'building';
     const data: EnvironmentData = { kind: 'environment', name: pickStr(d.name), etype, desc: pickStr(d.desc) };
     if (d.locked === true) data.locked = true;
-    // 🏷 环境标签（§19）：未知定义过滤；缺失不落字段（旧档兼容）
-    const envTags = sanitizeEnvTags(d.tags);
+    // 🏷 环境标签（§19）：按当前作品定义库过滤未知定义；缺失不落字段（旧档兼容）
+    const envTags = sanitizeEnvTags(d.tags, index);
     if (envTags.length) data.tags = envTags;
     const w = typeof clean.width === 'number' && clean.width >= ENV_MIN_W ? clean.width : ENV_DEFAULT_W;
     const h = typeof clean.height === 'number' && clean.height >= ENV_MIN_H ? clean.height : ENV_DEFAULT_H;
@@ -386,15 +400,35 @@ export function sanitizeSimNodes(
     }
     return n;
   });
+  // 🚪 画布连线 = 环境通道（portal）：两端都必须是环境节点；同一对只留一条（无向），
+  //    单向/锁闭/耗时/路点做数值与布尔规范化（引擎寻路直接消费）。
+  const finalById = new Map(cleaned.map((n) => [n.id, n]));
   const keptEdges: Edge[] = [];
-  const seen = new Set<string>();
+  const seenPairs = new Set<string>();
   for (const e of edges) {
     if (!e || !e.source || !e.target || e.source === e.target) continue;
-    if (!byId.has(e.source) || !byId.has(e.target)) continue;
-    const key = `${e.source}→${e.target}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    keptEdges.push(e);
+    const s = finalById.get(e.source);
+    const t = finalById.get(e.target);
+    if (!s || !t || s.data.kind !== 'environment' || t.data.kind !== 'environment') continue;
+    const pair = e.source < e.target ? `${e.source}\u0000${e.target}` : `${e.target}\u0000${e.source}`;
+    if (seenPairs.has(pair)) continue;
+    seenPairs.add(pair);
+    const raw = (e.data ?? {}) as Record<string, unknown>;
+    const data: SimPortalData = { kind: 'portal' };
+    const name = pickStr(raw.name).trim().slice(0, 40);
+    if (name) data.name = name;
+    if (raw.locked === true) data.locked = true;
+    if (typeof raw.traverseCost === 'number' && Number.isFinite(raw.traverseCost)) {
+      data.traverseCost = Math.min(10, Math.max(0, Math.round(raw.traverseCost)));
+    }
+    if (raw.oneWay === true) data.oneWay = true;
+    if (raw.waypoint && typeof raw.waypoint === 'object') {
+      const wp = raw.waypoint as Record<string, unknown>;
+      if (typeof wp.x === 'number' && Number.isFinite(wp.x) && typeof wp.y === 'number' && Number.isFinite(wp.y)) {
+        data.waypoint = { x: wp.x, y: wp.y };
+      }
+    }
+    keptEdges.push({ ...e, type: 'portal', data });
   }
   return { nodes: sortParentsFirst(cleaned), edges: keptEdges, dropped: nodes.length - fixed.length };
 }
@@ -412,7 +446,9 @@ export function sanitizeBoards(
   legacy?: { nodes?: unknown; edges?: unknown },
   chapters?: SimChapter[],
   knownCharacters?: Record<string, WorkCharacter>,
+  schema: SimSchema = EMPTY_SIM_SCHEMA,
 ): { boards: Record<string, SimBoard>; characters: Record<string, WorkCharacter> } {
+  const schemaIndex = indexSimSchema(schema);
   const volumeIds = new Set(volumes.map((v) => v.id));
   type RawBoard = {
     id: string;
@@ -516,7 +552,7 @@ export function sanitizeBoards(
   const chapterToBoard = chapters ? buildChapterBoardMap(chapters, volumes) : undefined;
   const out: Record<string, SimBoard> = {};
   for (const [id, g] of groups) {
-    const s = sanitizeSimNodes(g.nodes, g.edges, characters);
+    const s = sanitizeSimNodes(g.nodes, g.edges, characters, schemaIndex);
     const viewport = sanitizeViewport(g.viewport);
     out[id] = {
       id,
@@ -542,6 +578,8 @@ export interface WorkspaceSnapshot {
   characters: Record<string, WorkCharacter>;
   /** 🎬 推演档案（可选；v4 内嵌字段不升版）：缺省 = 按人物库自动补默认档案 */
   simProfiles?: Record<string, SimProfile>;
+  /** 🏷 推演定义库（可选）：缺省 = 空定义库（旧档/新建作品），所有旧标签随之丢弃 */
+  simSchema?: unknown;
   /** 🔗 人物关系边（可选；v4 内嵌字段不升版）：缺省 = 无关系 */
   relations?: unknown;
   activeBoardId?: string;
@@ -614,15 +652,26 @@ export type SnapshotError =
 export type SnapshotResult = { ok: true; snapshot: ChapterSnapshot } | { ok: false; error: SnapshotError };
 export type SnapshotMutationResult = { ok: true } | { ok: false; error: SnapshotError };
 
+/** 定义库写入结果：ok=false 时 errors 说明为何没写入（编辑器直接展示） */
+export interface SchemaApplyResult {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+  /** 导入/载入时被自动丢弃的条数 */
+  dropped?: number;
+}
+
 interface SimState {
   /** 🗂 全部卷画布（节点=放置/环境的唯一权威数据源） */
   boards: Record<string, SimBoard>;
   /** 📇 人物库（v3 人物库：人物身份/状态/形象唯一权威数据源；写动作必须不可变替换整个 map，否则脏检查失效） */
   characters: Record<string, WorkCharacter>;
   /** 🎬 推演档案（与人物档案物理分离，D20）：每位人物一份，创建人物时自动建档；
-   *  只存数值行为（基础能力/欲望实例/行为列表），不碰姓名/状态/形象。写动作同样必须不可变替换。 */
+   *  只存数值行为（基础能力/标签/需求实例），不碰姓名/状态/形象。写动作同样必须不可变替换。 */
   simProfiles: Record<string, SimProfile>;
-  /** 🔗 人物关系边（作品级稀疏图，D25）：两人一条「带标签边」，与画布连线无关；写动作必须不可变替换 */
+  /** 🏷 作品级推演定义库（内核零内容；新作品为空，所有题材定义由作者在设计页添加） */
+  simSchema: SimSchema;
+  /** 🔗 人物关系边（作品级有向稀疏图，D25）：from 对 to 的看法，与画布连线无关；写动作必须不可变替换 */
   relations: SimRelation[];
   /** 当前渲染/编辑的画布 */
   activeBoardId: string;
@@ -736,18 +785,36 @@ interface SimState {
   // ── 🎬 推演档案（与人物档案分离；修改在下次「开始推演」生效） ──
   /** 改基础能力（速度/感知/观察力），数值按世界模型范围钳制 */
   updateSimProfileCapabilities: (characterId: string, patch: Partial<SimCapabilities>) => void;
-  /** 欲望实例：启停 / 初值 / 每拍增长 / 阈值（内置定义，未知 defId 忽略） */
-  updateSimDesire: (characterId: string, defId: string, patch: Partial<Omit<SimDesireInstance, 'defId'>>) => void;
-  /** 行为实例：启停 / 权重 / 耗时 */
-  updateSimBehavior: (characterId: string, defId: string, patch: Partial<Omit<SimBehaviorInstance, 'defId'>>) => void;
-  /** 恢复默认推演档案（能力取世界模型默认、欲望与行为全启用） */
+  /** 需求实例：启停 / 初值 / 每拍增长 / 阈值 / 紧急阈值（未知 defId 忽略） */
+  updateSimNeed: (characterId: string, defId: string, patch: Partial<Omit<SimNeedInstance, 'defId'>>) => void;
+  /** 恢复默认推演档案（能力取世界模型默认、需求取定义默认） */
   resetSimProfile: (characterId: string) => void;
   /** 🏷 人物标签启停（trait/emotion；未知定义忽略——C2 准入） */
   toggleSimProfileTag: (characterId: string, defId: string, on: boolean) => void;
   /** 🏷 环境标签启停（affordance/narrative；写指定画布的环境节点） */
   toggleEnvironmentTag: (boardId: string, nodeId: string, defId: string, on: boolean) => void;
-  /** 🔗 设置人物关系（tagId='' 删除；同一对只保留一条，规范 a<b） */
-  setSimRelation: (aId: string, bId: string, tagId: string) => void;
+  /** 🔗 设置 from 对 to 的关系（tags 空数组=删除；有向，同一对只保留一条） */
+  setSimRelation: (from: string, to: string, tags: string[], value?: number) => void;
+
+  // ── 🏷 推演定义库（设计页） ──
+  /** 新增/覆盖标签定义（校验失败不写入，返回原因） */
+  upsertSchemaTag: (def: SimTagDef) => SchemaApplyResult;
+  /** 删除标签定义 + 级联清理所有引用（反应/环境标签/人物标签/需求实例/affordance） */
+  deleteSchemaTag: (id: string) => void;
+  upsertSchemaReaction: (def: SimReactionDef) => SchemaApplyResult;
+  deleteSchemaReaction: (id: string) => void;
+  upsertSchemaRelationDef: (def: SimRelationDef) => SchemaApplyResult;
+  deleteSchemaRelationDef: (id: string) => void;
+  /** 时间维度：一天多少拍 + 相位表（undefined=恢复单相全天） */
+  setSimTime: (time: SimSchema['time']) => void;
+  /** 整库导入（JSON 对象/字符串）：非法定义自动丢弃并返回错误/警告 */
+  replaceSimSchema: (raw: unknown) => SchemaApplyResult;
+  /** 导出 JSON（2 空格缩进） */
+  exportSimSchema: () => string;
+  /** 把定义库里新增的需求补进全部人物档案（只补缺，不覆盖） */
+  syncSchemaToProfiles: () => number;
+  /** 🚪 通道（环境↔环境连线）锁闭开关 */
+  toggleSimPortalLock: (boardId: string, edgeId: string, locked: boolean) => void;
 
   // ── 🧬 人物状态（库写；首参=人物库 id） ──
   addCharacterState: (characterId: string, opts?: AddCharacterStateOptions) => CharacterStateOpResult;
@@ -851,6 +918,8 @@ function sameStudioContent(a: SimState, b: SimState): boolean {
     a.characters !== b.characters ||
     // 🎬 推演档案独立脏检查项（改数值不触发人物档案脏写，反之亦然）
     a.simProfiles !== b.simProfiles ||
+    // 🏷 推演定义库独立脏检查项
+    a.simSchema !== b.simSchema ||
     // 🔗 关系边独立脏检查项
     a.relations !== b.relations
   ) {
@@ -869,6 +938,29 @@ function sameStudioContent(a: SimState, b: SimState): boolean {
     for (let i = 0; i < ba.edges.length; i++) if (!sameEdgeContent(ba.edges[i], bb.edges[i])) return false;
   }
   return true;
+}
+
+/** 🏷 定义库变更后的级联清洗：schema 先定，再按新定义重洗人物档案/关系/画布（环境标签与通道）。
+ *  删除定义时所有悬空引用在这里被清掉——顺序不能反（先洗 schema 再洗实例）。 */
+function schemaCascade(
+  schema: SimSchema,
+  characters: Record<string, WorkCharacter>,
+  simProfiles: Record<string, SimProfile>,
+  relations: SimRelation[],
+  boards: Record<string, SimBoard>,
+): Pick<SimState, 'simSchema' | 'simProfiles' | 'relations' | 'boards'> {
+  const index = indexSimSchema(schema);
+  const nextBoards: Record<string, SimBoard> = {};
+  for (const [bid, b] of Object.entries(boards)) {
+    const r = sanitizeSimNodes(b.nodes, b.edges, characters, index);
+    nextBoards[bid] = { ...b, nodes: r.nodes, edges: r.edges };
+  }
+  return {
+    simSchema: schema,
+    simProfiles: sanitizeSimProfiles(simProfiles, characters, index),
+    relations: sanitizeRelations(relations, characters, index),
+    boards: nextBoards,
+  };
 }
 
 /** 手动保存：所有变更只留在内存并标记未保存，用户点「保存」或 Ctrl/Cmd+S 时才写 localStorage */
@@ -947,6 +1039,8 @@ export const useStudioStore = create<SimState>()(
       boards: { [DEFAULT_BOARD_ID]: emptyBoard(DEFAULT_BOARD_ID), [STAGE_BOARD_ID]: stageBoard() },
       characters: {},
       simProfiles: {},
+      // 内核零内容：新作品定义库为空，推演只有走动/张望；题材内容全部由作者在设计页添加
+      simSchema: EMPTY_SIM_SCHEMA,
       relations: [],
       activeBoardId: DEFAULT_BOARD_ID,
       graphName: '未命名',
@@ -1451,7 +1545,10 @@ export const useStudioStore = create<SimState>()(
         // 库、推演档案与放置同一 set() 落库：放置节点必须能立刻查到人物，人物也必须有推演档案（D20 自动建档）
         set({
           characters: { ...s.characters, [characterId]: character },
-          simProfiles: { ...s.simProfiles, [characterId]: defaultSimProfile(characterId) },
+          simProfiles: {
+            ...s.simProfiles,
+            [characterId]: defaultSimProfile(characterId, indexSimSchema(s.simSchema)),
+          },
           boards,
         });
         return characterId;
@@ -1685,7 +1782,7 @@ export const useStudioStore = create<SimState>()(
         // 推演档案随人物删除（孤儿档案不静默保留）；关系边同理（悬空关系一律清理）
         const simProfiles = { ...s.simProfiles };
         delete simProfiles[characterId];
-        const relations = s.relations.filter((r) => r.a !== characterId && r.b !== characterId);
+        const relations = s.relations.filter((r) => r.from !== characterId && r.to !== characterId);
         set({ characters, simProfiles, relations, boards });
         // 图片 GC 查库：只有库内再无引用的 key 才真正释放（headshot 缓存经 release 路径失效）
         void releaseCharacterImageKeys(
@@ -1783,11 +1880,12 @@ export const useStudioStore = create<SimState>()(
           s.relations
             .map((r) => ({
               ...r,
-              a: stateIdMaps.has(r.a) ? primaryId : r.a,
-              b: stateIdMaps.has(r.b) ? primaryId : r.b,
+              from: stateIdMaps.has(r.from) ? primaryId : r.from,
+              to: stateIdMaps.has(r.to) ? primaryId : r.to,
             }))
-            .filter((r) => r.a !== r.b),
+            .filter((r) => r.from !== r.to),
           characters,
+          indexSimSchema(s.simSchema),
         );
         set({ characters, simProfiles, relations, boards, chapters });
       },
@@ -1797,28 +1895,24 @@ export const useStudioStore = create<SimState>()(
         set((s) => {
           const cur = s.simProfiles[characterId];
           if (!cur) return {};
-          const next = sanitizeSimProfile({ ...cur, capabilities: { ...cur.capabilities, ...patch } }, characterId);
-          return { simProfiles: { ...s.simProfiles, [characterId]: next } };
-        }),
-
-      updateSimDesire: (characterId, defId, patch) =>
-        set((s) => {
-          const cur = s.simProfiles[characterId];
-          if (!cur) return {};
           const next = sanitizeSimProfile(
-            { ...cur, desires: cur.desires.map((d) => (d.defId === defId ? { ...d, ...patch } : d)) },
+            { ...cur, capabilities: { ...cur.capabilities, ...patch } },
             characterId,
+            indexSimSchema(s.simSchema),
           );
           return { simProfiles: { ...s.simProfiles, [characterId]: next } };
         }),
 
-      updateSimBehavior: (characterId, defId, patch) =>
+      updateSimNeed: (characterId, defId, patch) =>
         set((s) => {
           const cur = s.simProfiles[characterId];
-          if (!cur) return {};
+          const index = indexSimSchema(s.simSchema);
+          if (!cur || tagDefOf(index, defId)?.role !== 'need') return {};
+          if (!cur.needs.some((n) => n.defId === defId)) return {};
           const next = sanitizeSimProfile(
-            { ...cur, behaviors: cur.behaviors.map((b) => (b.defId === defId ? { ...b, ...patch } : b)) },
+            { ...cur, needs: cur.needs.map((n) => (n.defId === defId ? { ...n, ...patch } : n)) },
             characterId,
+            index,
           );
           return { simProfiles: { ...s.simProfiles, [characterId]: next } };
         }),
@@ -1826,19 +1920,25 @@ export const useStudioStore = create<SimState>()(
       resetSimProfile: (characterId) =>
         set((s) => {
           if (!s.characters[characterId]) return {};
-          return { simProfiles: { ...s.simProfiles, [characterId]: defaultSimProfile(characterId) } };
+          return {
+            simProfiles: {
+              ...s.simProfiles,
+              [characterId]: defaultSimProfile(characterId, indexSimSchema(s.simSchema)),
+            },
+          };
         }),
 
       toggleSimProfileTag: (characterId, defId, on) =>
         set((s) => {
           const cur = s.simProfiles[characterId];
-          const def = tagDefOf(defId);
+          const index = indexSimSchema(s.simSchema);
+          const def = tagDefOf(index, defId);
           if (!cur || !def || def.scope !== 'character' || def.role === 'need') return {};
           const has = (cur.tags ?? []).some((t) => t.defId === defId);
           if (has === on) return {};
-          const raw: SimTagInstance[] = (cur.tags ?? []).filter((t) => t.defId !== defId);
+          const raw = (cur.tags ?? []).filter((t) => t.defId !== defId);
           if (on) raw.push({ defId });
-          const next = sanitizeSimProfile({ ...cur, tags: raw }, characterId);
+          const next = sanitizeSimProfile({ ...cur, tags: raw }, characterId, index);
           return { simProfiles: { ...s.simProfiles, [characterId]: next } };
         }),
 
@@ -1846,10 +1946,11 @@ export const useStudioStore = create<SimState>()(
         const s = get();
         const b = s.boards[boardId];
         const node = b?.nodes.find((n) => n.id === nodeId);
-        const def = tagDefOf(defId);
+        const index = indexSimSchema(s.simSchema);
+        const def = tagDefOf(index, defId);
         if (!b || !node || node.data.kind !== 'environment' || !def || def.scope !== 'env') return;
-        const cur = sanitizeEnvTags(node.data.tags);
-        const tags = sanitizeEnvTags(on ? [...cur, defId] : cur.filter((t) => t !== defId));
+        const cur = sanitizeEnvTags((node.data as EnvironmentData).tags, index);
+        const tags = sanitizeEnvTags(on ? [...cur, defId] : cur.filter((t) => t !== defId), index);
         const data: EnvironmentData = { ...(node.data as EnvironmentData) };
         if (tags.length) data.tags = tags;
         else delete data.tags;
@@ -1858,21 +1959,143 @@ export const useStudioStore = create<SimState>()(
         });
       },
 
-      setSimRelation: (aId, bId, tagId) =>
+      setSimRelation: (from, to, tags, value) =>
         set((s) => {
-          if (aId === bId || !s.characters[aId] || !s.characters[bId]) return {};
-          const pair = (r: SimRelation) =>
-            (r.a === aId && r.b === bId) || (r.a === bId && r.b === aId);
-          const rest = s.relations.filter((r) => !pair(r));
-          const tags = sanitizeRelationTags(tagId ? [tagId] : []);
-          const [x, y] = aId < bId ? [aId, bId] : [bId, aId];
-          const next = sanitizeRelations(tags.length ? [...rest, { a: x, b: y, tags }] : rest, s.characters);
+          if (from === to || !s.characters[from] || !s.characters[to]) return {};
+          const index = indexSimSchema(s.simSchema);
+          const rest = s.relations.filter((r) => !(r.from === from && r.to === to));
+          const clean = sanitizeRelationTags(tags, index);
+          const next = sanitizeRelations(
+            clean.length ? [...rest, { from, to, tags: clean, ...(value !== undefined ? { value } : {}) }] : rest,
+            s.characters,
+            index,
+          );
           // 内容未变不换引用，避免无操作也标脏
-          if (next.length === s.relations.length && next.every((r, i) => {
-            const old = s.relations[i];
-            return old && old.a === r.a && old.b === r.b && old.tags[0] === r.tags[0];
-          })) return {};
+          const same = (a: SimRelation, b: SimRelation) =>
+            a.from === b.from && a.to === b.to && a.value === b.value && a.tags.join(',') === b.tags.join(',');
+          if (next.length === s.relations.length && next.every((r, i) => same(r, s.relations[i]))) return {};
           return { relations: next };
+        }),
+
+      // ── 🏷 推演定义库写动作（设计页）：先校验 → 再级联清洗实例 ──
+      upsertSchemaTag: (def) => {
+        const s = get();
+        const tags = s.simSchema.tags.filter((t) => t.id !== def.id).concat(def);
+        const r = inspectSimSchema({ ...s.simSchema, tags });
+        if (r.errors.length || !r.schema.tags.some((t) => t.id === def.id)) {
+          return { ok: false, errors: r.errors.length ? r.errors : ['标签定义无效（检查 id/载体/角色/引用）'], warnings: r.warnings };
+        }
+        set(schemaCascade(r.schema, s.characters, s.simProfiles, s.relations, s.boards));
+        return { ok: true, errors: [], warnings: r.warnings };
+      },
+
+      deleteSchemaTag: (id) =>
+        set((s) => {
+          if (!s.simSchema.tags.some((t) => t.id === id)) return {};
+          // 先摘掉直接引用该标签的反应，剩下的悬空引用（affordance 指向被删需求等）由 inspect 丢弃
+          const reactions = s.simSchema.reactions.filter(
+            (r) => r.triggerTag !== id && r.selfTag !== id && r.emotion?.defId !== id && r.need?.defId !== id,
+          );
+          const schema = sanitizeSimSchema({
+            ...s.simSchema,
+            tags: s.simSchema.tags.filter((t) => t.id !== id),
+            reactions,
+          });
+          return schemaCascade(schema, s.characters, s.simProfiles, s.relations, s.boards);
+        }),
+
+      upsertSchemaReaction: (def) => {
+        const s = get();
+        const reactions = s.simSchema.reactions.filter((r) => r.id !== def.id).concat(def);
+        const r = inspectSimSchema({ ...s.simSchema, reactions });
+        if (r.errors.length || !r.schema.reactions.some((x) => x.id === def.id)) {
+          return { ok: false, errors: r.errors.length ? r.errors : ['反应规则无效（检查触发标签/引用）'], warnings: r.warnings };
+        }
+        set(schemaCascade(r.schema, s.characters, s.simProfiles, s.relations, s.boards));
+        return { ok: true, errors: [], warnings: r.warnings };
+      },
+
+      deleteSchemaReaction: (id) =>
+        set((s) => {
+          if (!s.simSchema.reactions.some((r) => r.id === id)) return {};
+          const schema = sanitizeSimSchema({ ...s.simSchema, reactions: s.simSchema.reactions.filter((r) => r.id !== id) });
+          return schemaCascade(schema, s.characters, s.simProfiles, s.relations, s.boards);
+        }),
+
+      upsertSchemaRelationDef: (def) => {
+        const s = get();
+        const relations = s.simSchema.relations.filter((r) => r.id !== def.id).concat(def);
+        const r = inspectSimSchema({ ...s.simSchema, relations });
+        if (r.errors.length || !r.schema.relations.some((x) => x.id === def.id)) {
+          return { ok: false, errors: r.errors.length ? r.errors : ['关系定义无效'], warnings: r.warnings };
+        }
+        set(schemaCascade(r.schema, s.characters, s.simProfiles, s.relations, s.boards));
+        return { ok: true, errors: [], warnings: r.warnings };
+      },
+
+      deleteSchemaRelationDef: (id) =>
+        set((s) => {
+          if (!s.simSchema.relations.some((r) => r.id === id)) return {};
+          const schema = sanitizeSimSchema({
+            ...s.simSchema,
+            relations: s.simSchema.relations.filter((r) => r.id !== id),
+          });
+          // 人物关系实例上的该标签由 cascade 清洗掉
+          return schemaCascade(schema, s.characters, s.simProfiles, s.relations, s.boards);
+        }),
+
+      setSimTime: (time) =>
+        set((s) => {
+          const draft: SimSchema = { ...s.simSchema };
+          if (time === undefined) delete draft.time;
+          else draft.time = time;
+          const r = inspectSimSchema(draft);
+          if (r.errors.length) return {};
+          return schemaCascade(r.schema, s.characters, s.simProfiles, s.relations, s.boards);
+        }),
+
+      replaceSimSchema: (raw) => {
+        const s = get();
+        let value: unknown = raw;
+        if (typeof raw === 'string') {
+          try {
+            value = JSON.parse(raw);
+          } catch {
+            return { ok: false, errors: ['JSON 解析失败'], warnings: [] };
+          }
+        }
+        const r = inspectSimSchema(value);
+        set(schemaCascade(r.schema, s.characters, s.simProfiles, s.relations, s.boards));
+        return { ok: r.errors.length === 0, errors: r.errors, warnings: r.warnings, dropped: r.dropped };
+      },
+
+      exportSimSchema: () => JSON.stringify(get().simSchema, null, 2),
+
+      syncSchemaToProfiles: () => {
+        const s = get();
+        const index = indexSimSchema(s.simSchema);
+        let added = 0;
+        const simProfiles: Record<string, SimProfile> = {};
+        for (const [id, p] of Object.entries(s.simProfiles)) {
+          const next = sanitizeSimProfile(p, id, index);
+          added += next.needs.filter((n) => !p.needs.some((x) => x.defId === n.defId)).length;
+          simProfiles[id] = next;
+        }
+        if (added) set({ simProfiles });
+        return added;
+      },
+
+      toggleSimPortalLock: (boardId, edgeId, locked) =>
+        set((s) => {
+          const b = s.boards[boardId];
+          if (!b) return {};
+          if (!b.edges.some((e) => e.id === edgeId)) return {};
+          const edges = b.edges.map((e) =>
+            e.id === edgeId
+              ? { ...e, data: { ...(e.data as SimPortalData), kind: 'portal' as const, ...(locked ? { locked: true } : { locked: false }) } }
+              : e,
+          );
+          return setBoardNodes(s, boardId, b.nodes, edges);
         }),
 
       // 唯一保留的 OnBoard 人物写动作：切换放置的当前状态（场景态，按放置独立 C1；stateId 对库校验）
@@ -1969,7 +2192,7 @@ export const useStudioStore = create<SimState>()(
         const characters = result.newCharacters.length
           ? { ...s.characters, ...Object.fromEntries(result.newCharacters.map((c) => [c.id, c])) }
           : s.characters;
-        const clean = sanitizeSimNodes(result.nodes, result.edges, characters);
+        const clean = sanitizeSimNodes(result.nodes, result.edges, characters, indexSimSchema(s.simSchema));
         const selectedIds = selectResult ? new Set(Object.values(result.idMap)) : null;
         const nodes = selectedIds
           ? clean.nodes.map((n) => (selectedIds.has(n.id) ? { ...n, selected: true } : n))
@@ -1990,17 +2213,21 @@ export const useStudioStore = create<SimState>()(
           const chapters = snap.chapters !== undefined ? sanitizeChapters(snap.chapters) : prev.chapters;
           // 人物库整体替换（杜绝切作品串库）；缺失视为空库（新建作品/旧快照）
           const characters = sanitizeCharacters(snap.characters);
+          // 🏷 定义库必须最先清洗：环境标签/人物标签/关系/affordance 都要按新定义过滤
+          const simSchema = sanitizeSimSchema(snap.simSchema);
+          const schemaIndex = indexSimSchema(simSchema);
           // 区域按章节当前所属画布过滤，所以 chapters 必须先于 boards 清洗
-          const { boards } = sanitizeBoards(snap.boards, volumes, undefined, chapters, characters);
+          const { boards } = sanitizeBoards(snap.boards, volumes, undefined, chapters, characters, simSchema);
           // 🎬 推演档案随人物库整体替换：只保留仍有对应人物的档案，缺失的自动补默认档
-          const simProfiles = sanitizeSimProfiles(snap.simProfiles, characters);
+          const simProfiles = sanitizeSimProfiles(snap.simProfiles, characters, schemaIndex);
           // 🔗 关系边同样整体替换（悬空/未知标签过滤）
-          const relations = sanitizeRelations(snap.relations, characters);
+          const relations = sanitizeRelations(snap.relations, characters, schemaIndex);
           const activeBoardId = snap.activeBoardId && boards[snap.activeBoardId] ? snap.activeBoardId : DEFAULT_BOARD_ID;
           return {
             ...prev,
             boards,
             characters,
+            simSchema,
             simProfiles,
             relations,
             activeBoardId,
@@ -2071,6 +2298,8 @@ export const useStudioStore = create<SimState>()(
         // （characterId=旧 node.id，历史快照/图片 key 天然继续有效；分叉镜像首见保留——用户豁免无迁移向导）
         const hasLibrary = !!p.characters && typeof p.characters === 'object';
         const characters = hasLibrary ? sanitizeCharacters(p.characters) : undefined;
+        // 🏷 定义库：旧档无字段 → 空定义库；必须先于 boards/profiles/relations 清洗
+        const simSchema = sanitizeSimSchema(p.simSchema);
         // ⚠ 只能用持久化数据里的 boards：merged 已并入 current 的默认空 boards，
         // 拿它当新格式会把旧档顶层 nodes/edges 当成「已有画布」而丢掉（旧档迁移必须走 legacy 参数）
         const { boards, characters: extractedCharacters } = sanitizeBoards(
@@ -2079,6 +2308,7 @@ export const useStudioStore = create<SimState>()(
           { nodes: legacyNodes, edges: legacyEdges },
           chapters,
           characters,
+          simSchema,
         );
         const activeBoardId =
           typeof merged.activeBoardId === 'string' && boards[merged.activeBoardId]
@@ -2088,13 +2318,15 @@ export const useStudioStore = create<SimState>()(
         // 章节列表兜底重建；大纲生成瞬态归 null
         const finalCharacters = characters ?? extractedCharacters;
         // 🎬 推演档案：旧档无此字段 → 按人物库自动补默认档（不升版本，可选内嵌字段）
-        const simProfiles = sanitizeSimProfiles(p.simProfiles, finalCharacters);
+        const simSchemaIndex = indexSimSchema(simSchema);
+        const simProfiles = sanitizeSimProfiles(p.simProfiles, finalCharacters, simSchemaIndex);
         // 🔗 关系边：旧档无此字段 → 空数组；悬空关系清理
-        const relations = sanitizeRelations(p.relations, finalCharacters);
+        const relations = sanitizeRelations(p.relations, finalCharacters, simSchemaIndex);
         return {
           ...(merged as unknown as SimState),
           boards,
           characters: finalCharacters,
+          simSchema,
           simProfiles,
           relations,
           activeBoardId,
