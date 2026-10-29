@@ -68,20 +68,20 @@ export interface CharacterImageCrop {
 
 /** 人物状态的大图与圆形头像引用：图片本体在浏览器 IndexedDB，状态里只存轻量元数据。 */
 export interface CharacterStateImage {
-  /** IndexedDB key：charimg:<nodeId>:<stateId>:<nonce> */
+  /** IndexedDB key：charimg:<characterId>:<stateId>:<nonce>（旧数据以 node.id 建库，旧 key 原样有效） */
   key: string;
   width: number;
   height: number;
   /** AI 生成时的尺寸预设；上传原图时为 'original' */
   preset: CharacterImagePreset | 'original';
-  /** IndexedDB key：charhead:<nodeId>:<stateId>:<nonce>；undefined=未裁切，画布显示性别剪影 */
+  /** IndexedDB key：charhead:<characterId>:<stateId>:<nonce>；undefined=未裁切，画布显示性别剪影 */
   headKey?: string;
   /** 头部裁切区域；只有存在 headKey 时才有意义 */
   crop?: CharacterImageCrop;
 }
 
 /** 🧬 人物状态（v2.30）：同一人物随剧情变化的一套属性。
- *  人名/性别跨状态稳定，留在 CharacterData 顶层；其余属性与人物形象都属于状态。
+ *  人名/性别跨状态稳定，留在 WorkCharacter 顶层；其余属性与人物形象都属于状态。
  *  旧版平铺字段由 sanitize 自动迁入首项「状态0」；旧 avatar/写真不迁移。 */
 export interface CharacterState {
   /** 状态 ID：人物内稳定；创建时首项固定 state0，新增用 uid。复制人物时保留 */
@@ -100,16 +100,26 @@ export interface CharacterState {
   image?: CharacterStateImage;
 }
 
-/** 人物节点：胶囊上显示 头像+人名+年龄（如「李刚 32」，永远浮在环境节点之上）；
- *  人名/性别是跨状态稳定的基础属性（性别决定无头像时的剪影与节点颜色）；其余设定（含人物形象）属于当前状态。
- *  所有属性读取必须走 stores/characterStates 的解析函数，不能直接读节点上的平铺字段（v2.30 已移除）。 */
-export interface CharacterData extends Record<string, unknown> {
-  kind: 'character';
+/** 📇 作品级人物（人物库 v3）：身份与全部状态定义只存这一份，作品内唯一。
+ *  画布节点退化为放置（CharacterPlacementData）：只决定人物出现在哪张画布、当前用哪个状态。
+ *  姓名/性别/状态的任何修改全局生效——所有卷/章的放置立即读到同一份数据。 */
+export interface WorkCharacter {
+  /** 人物库 ID，作品内唯一；与画布节点 ID 解耦 */
+  id: string;
   name: string;
   gender: CharacterGender;
-  /** 至少一项；首项=默认状态「状态0」 */
+  /** 至少一项；首项=默认状态「状态0」。状态属于人物，不属于某张画布 */
   states: CharacterState[];
-  /** 当前显示/编辑/章节生成使用的状态；非法值由 sanitize 回落首项 */
+}
+
+/** 人物节点（放置）：只保存「谁放在这里、当前显示哪个状态」——位置/父子/尺寸仍属 React Flow 节点本体。
+ *  人物属性（姓名/性别/状态/形象）一律查 SimState.characters[characterId]；本画布当前状态按放置独立（C1），
+ *  切换状态只写放置节点，不影响其它卷。同一画布内一个 characterId 最多一个放置（sanitize 去重保留首个）。 */
+export interface CharacterPlacementData extends Record<string, unknown> {
+  kind: 'character';
+  /** 指向 SimState.characters；与画布节点 ID 解耦 */
+  characterId: string;
+  /** 本画布当前使用的状态；非法值由 sanitize/解析回落首项 */
   activeStateId: string;
 }
 
@@ -124,7 +134,7 @@ export interface EnvironmentData extends Record<string, unknown> {
   locked?: boolean;
 }
 
-export type SimData = CharacterData | EnvironmentData;
+export type SimData = CharacterPlacementData | EnvironmentData;
 export type SimNodeType = Node<SimData>;
 
 /** 两类合法节点 kind（sanitize：服务器旧档案/损坏缓存中不在集合内的节点一律过滤） */
@@ -168,9 +178,9 @@ export type CastRole = 'present' | 'mentioned';
 /** 快照来源：旧手动记录 / 旧生成时自动采集 / 自动跟随当前章节场景（v2.32） */
 export type SnapshotSource = 'manual' | 'auto-outline' | 'auto-content' | 'auto-scene';
 
-/** 📸 本章名单条目：只存人物/状态引用与采集时标签，不复制完整属性（属性仍从画布解析） */
+/** 📸 本章名单条目：只存人物/状态引用与采集时标签，不复制完整属性（属性仍从人物库解析） */
 export interface ChapterSnapshotEntry {
-  /** 人物身份 node.id */
+  /** 人物身份 = 人物库 ID（characters 的键；非画布节点 ID） */
   characterId: string;
   /** 采集/手动选择的状态 id；人物内稳定 */
   stateId: string;

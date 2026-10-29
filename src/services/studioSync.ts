@@ -3,8 +3,9 @@
  * 两层本地保存（手动）：所有编辑先留在内存并标记未保存；
  *  ① 当前作品手动保存到 localStorage（zustand persist nc2-sim-v1；点「保存」/Ctrl+S 或载入存档时写入）；
  *  ② 命名存档列表（localStorage nc2-sim-archives-v1）：💾 保存按图名快照（同名覆盖），📂 打开列出/载入/删除。
- * 快照结构 v3（P2）：graph: {boards, activeBoardId, rules, outlineRules, chapters, volumes, snapshots 随 chapters}；
- * 旧快照 {nodes,edges,...} 载入时迁进默认主画布，并为旧卷补空画布；未来版本拒绝载入且不改数据。
+ * 快照结构 v4（人物库 v3）：graph: {boards, characters, activeBoardId, rules, outlineRules, chapters, volumes, snapshots 随 chapters}；
+ * v3 及更早旧快照载入时迁移：单画布 nodes/edges 迁进默认主画布、旧卷补空画布、人物从画布节点一次性提取
+ * （characterId=旧 node.id——用户豁免无迁移向导，不兼容的旧人物数据直接丢弃）；未来版本拒绝载入且不改数据。
  * 历史服务器存档未删除，如需找回可从 simgraphs/ 手动取回。
  */
 import {
@@ -17,17 +18,20 @@ import {
   DEFAULT_BOARD_ID,
   saveStudioWorkspace,
 } from '../stores/studioStore';
+import { extractCharactersFromBoards, sanitizeCharacters } from '../stores/characterStates';
 import { useUiStore } from '../stores/uiStore';
 import { persistActiveChapterId } from '../stores/activeChapter';
 import { syncActiveChapterScene, withChapterSceneSyncSuppressed } from '../stores/chapterSceneSync';
 import type { Edge } from '@xyflow/react';
-import type { SimBoard, SimChapter, SimNodeType, SimVolume } from '../types/sim';
+import type { SimBoard, SimChapter, SimNodeType, SimVolume, WorkCharacter } from '../types/sim';
 
 const ARCHIVES_KEY = 'nc2-sim-archives-v1';
-export const ARCHIVE_VERSION = 3;
+export const ARCHIVE_VERSION = 4;
 
 export interface ArchiveGraph {
   boards?: Record<string, SimBoard>;
+  /** 📇 人物库（v4；v3 及更早无此字段 → 载入时从画布节点一次性提取） */
+  characters?: unknown;
   activeBoardId?: string;
   /** 保存时的当前章节（v2.32，可选；旧档无此字段 → 载入后回落到首章） */
   activeChapterId?: string;
@@ -72,6 +76,7 @@ export interface ImportArchiveResult extends LoadArchiveResult {
 
 interface NormalizedGraph {
   boards: Record<string, SimBoard>;
+  characters: Record<string, WorkCharacter>;
   activeBoardId: string;
   activeChapterId: string;
   rules: string;
@@ -146,22 +151,38 @@ function normalizeArchive(raw: unknown, fallbackName: string, extraSteps: Archiv
   const responsibleId = typeof graph.responsibleId === 'string' ? graph.responsibleId : '';
   const cover = typeof graph.cover === 'string' && graph.cover.startsWith('data:image/') ? graph.cover : '';
 
+  // 📇 人物库：v4 直读；v3 及更早无 characters → 从画布节点一次性提取（见文件头注释）
+  const hasLibrary = !!graph.characters && typeof graph.characters === 'object' && !Array.isArray(graph.characters);
+  const knownCharacters = hasLibrary ? sanitizeCharacters(graph.characters) : undefined;
+
   let boards: Record<string, SimBoard>;
+  let characters: Record<string, WorkCharacter>;
   if (hasBoards) {
-    boards = sanitizeBoards(graph.boards, volumes, undefined, chapters);
+    ({ boards, characters } = sanitizeBoards(graph.boards, volumes, undefined, chapters, knownCharacters));
   } else {
     // 旧归档：单画布 nodes/edges 迁进默认主画布，旧卷补空画布
     const nodes = graph.nodes ?? [];
     if (!Array.isArray(nodes) || nodes.some((n) => !n || !n.data)) {
       return fail(`存档「${name}」数据损坏，无法载入`, fromVersion);
     }
-    const clean = sanitizeSimNodes(nodes, (graph.edges as Edge[] | undefined) ?? []);
+    // 先提取人物（characterId=旧 node.id），再带库清洗节点（无法兼容的旧人物数据直接丢弃）
+    const preCharacters = knownCharacters ?? extractCharactersFromBoards([{ nodes }]).characters;
+    const clean = sanitizeSimNodes(nodes, (graph.edges as Edge[] | undefined) ?? [], preCharacters);
     if (!clean.nodes.length && nodes.length) {
       return fail(`「${name}」存档与当前创作台节点形态不兼容（已过滤 ${nodes.length} 个节点）`, fromVersion);
     }
     if (clean.dropped > 0) warnings.push(`已过滤 ${clean.dropped} 个非法节点`);
-    boards = sanitizeBoards(undefined, volumes, { nodes: clean.nodes, edges: clean.edges }, chapters);
+    ({ boards, characters } = sanitizeBoards(
+      undefined,
+      volumes,
+      { nodes: clean.nodes, edges: clean.edges },
+      chapters,
+      preCharacters,
+    ));
     steps.push({ code: 'single-canvas', message: '旧单画布存档已迁入默认主画布' });
+  }
+  if (!hasLibrary && characters && Object.keys(characters).length) {
+    steps.push({ code: 'character-library', message: `人物已迁入作品级人物库（${Object.keys(characters).length} 人）` });
   }
 
   for (const c of chapters) {
@@ -183,6 +204,7 @@ function normalizeArchive(raw: unknown, fallbackName: string, extraSteps: Archiv
     savedAt,
     graph: {
       boards,
+      characters,
       activeBoardId,
       activeChapterId,
       rules,
@@ -217,7 +239,7 @@ export function saveLocal(): void {
   persistActiveChapterId(useUiStore.getState().activeChapterId);
   const activeChapterId = useUiStore.getState().activeChapterId ?? '';
   try {
-    const graph = { boards: s.boards, activeBoardId: s.activeBoardId, activeChapterId, rules: s.rules, outlineRules: s.outlineRules, charGenRules: s.charGenRules, mainGoal: s.mainGoal, volumes: s.volumes, chapters: s.chapters, responsibleId: s.responsibleId, cover: s.cover };
+    const graph = { boards: s.boards, characters: s.characters, activeBoardId: s.activeBoardId, activeChapterId, rules: s.rules, outlineRules: s.outlineRules, charGenRules: s.charGenRules, mainGoal: s.mainGoal, volumes: s.volumes, chapters: s.chapters, responsibleId: s.responsibleId, cover: s.cover };
     const list = loadArchives().filter((a) => a.name !== s.graphName);
     list.push({ name: s.graphName, savedAt: new Date().toISOString(), version: ARCHIVE_VERSION, graph });
     writeArchives(list);
@@ -265,7 +287,7 @@ export function loadLocalArchive(name: string, extraSteps: ArchiveMigrationStep[
   return prep.result;
 }
 
-/** 导出当前命名存档为 v3 JSON（旧档先走同一验证/迁移路径，不修改本地存档） */
+/** 导出当前命名存档为 v4 JSON（旧档先走同一验证/迁移路径，不修改本地存档） */
 export function exportLocalArchive(name: string): { ok: true; json: string } | { ok: false; error: string } {
   const a = loadArchives().find((x) => x.name === name);
   if (!a) return { ok: false, error: `本地存档「${name}」不存在。` };

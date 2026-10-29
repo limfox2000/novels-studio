@@ -6,7 +6,7 @@
  *  - 不新增具名人物；允许无名群演，但不得给姓名、独立台词或推动剧情；
  *  - 解析不到的条目标「资料缺失」，禁止猜测补全；
  *  - 环境使用快照冻结的描述，不受画布后续修改影响。 */
-import type { ChapterRegion, ChapterSnapshot, ChapterSnapshotEntry, EnvironmentType, SimBoard, SimChapter, SimVolume } from '../types/sim';
+import type { ChapterRegion, ChapterSnapshot, ChapterSnapshotEntry, EnvironmentType, SimBoard, SimChapter, SimVolume, WorkCharacter } from '../types/sim';
 import { ENV_TYPE_LABELS } from '../types/sim';
 import { snapshotIssueLabel, snapshotStaleness, stateFingerprint } from '../stores/chapterSnapshots';
 import { resolveSnapshotEntry } from '../stores/snapshotRefs';
@@ -57,7 +57,7 @@ function envLine(e: ChapterSnapshot['envRefs'][number], withDesc: boolean): stri
   return `- ${e.name}（${type}）｜${path}${desc}`;
 }
 
-function render(snapshot: ChapterSnapshot, boards: Record<string, SimBoard>, sourceLabel: string, full: boolean): {
+function render(snapshot: ChapterSnapshot, boards: Record<string, SimBoard>, characters: Record<string, WorkCharacter>, sourceLabel: string, full: boolean): {
   text: string;
   missing: number;
   presentCount: number;
@@ -73,17 +73,20 @@ function render(snapshot: ChapterSnapshot, boards: Record<string, SimBoard>, sou
   const mentionedLines: string[] = [];
 
   for (const e of snapshot.entries) {
-    const r = resolveSnapshotEntry(e, snapshot.boardId, boards, stateFingerprint);
+    const r = resolveSnapshotEntry(e, snapshot.boardId, boards, characters, stateFingerprint);
     const name = r.ok ? r.name : e.nameAtCapture;
     const stateLabel = r.ok ? r.state.label : e.stateLabelAtCapture;
     const path = e.envPathAtCapture || '区域边缘';
     if (!r.ok) {
       missing++;
       missingNames.push(name);
-      missingLines.push(`- ${name}｜采集状态：${stateLabel}｜${path}｜资料缺失（不得猜补）`);
+      const why = r.error === 'missing-character' ? '人物已不在人物库' : '采集状态已删除';
+      missingLines.push(`- ${name}｜采集状态：${stateLabel}｜${path}｜${why}（不得猜补）`);
       continue;
     }
-    const line = `- ${name}｜${stateLabel}｜${path}${stateSummary(e, r.state, full) ? `｜${stateSummary(e, r.state, full)}` : ''}`;
+    // 人物/状态仍可读但本画布没有该放置（人物库人物可未放置 C7）：照常入名单，标注无放置
+    const unplaced = r.node ? '' : '｜本画布未放置';
+    const line = `- ${name}｜${stateLabel}｜${path}${stateSummary(e, r.state, full) ? `｜${stateSummary(e, r.state, full)}` : ''}${unplaced}`;
     if (e.role === 'present') presentLines.push(line);
     else mentionedLines.push(`${line}｜仅提及：不得写成在场或拥有现场行动`);
   }
@@ -122,18 +125,19 @@ function boardTitle(snapshotBoardId: string, boards: Record<string, SimBoard>, s
   return b ? b.id : `已删除的画布（${snapshotBoardId}）`;
 }
 
-/** 有快照时的生成舞台块。boards 用于把引用解析成当前属性；环境描述仍取冻结值。 */
+/** 有快照时的生成舞台块。boards+characters 用于把引用解析成当前属性；环境描述仍取冻结值。 */
 export function buildChapterStageBlock(
   snapshot: ChapterSnapshot,
   boards: Record<string, SimBoard>,
+  characters: Record<string, WorkCharacter>,
   opts: { sourceLabel?: string } = {},
 ): ChapterStageContext {
   const label = boardTitle(snapshot.boardId, boards, opts.sourceLabel);
-  let r = render(snapshot, boards, label, true);
+  let r = render(snapshot, boards, characters, label, true);
   let block = r.text;
   // 超长：先压缩人物属性细节与环境描述，仍超长再整体截断（保留开头在场/硬规则依赖顺序）
   if (block.length > SNAPSHOT_BLOCK_CAP) {
-    r = render(snapshot, boards, label, false);
+    r = render(snapshot, boards, characters, label, false);
     block = r.text;
   }
   let truncated = false;
@@ -179,6 +183,7 @@ export function buildChapterAgentBrief(
   chapter: SimChapter,
   boards: Record<string, SimBoard>,
   volumes: SimVolume[],
+  characters: Record<string, WorkCharacter>,
   currentRegion: ChapterRegion | undefined,
   cap = 2200,
 ): string {
@@ -192,20 +197,21 @@ export function buildChapterAgentBrief(
   }
   const board = boards[snap.boardId];
   const source = board ? boardLabel(board, volumes) : `已删除的画布（${snap.boardId}）`;
-  const stale = snapshotStaleness(snap, board, currentRegion);
+  const stale = snapshotStaleness(snap, board, currentRegion, characters);
   const issue = stale.codes.length ? stale.codes.map(snapshotIssueLabel).join('；') : '与当前画布一致';
   const present: string[] = [];
   const mentioned: string[] = [];
   const missing: string[] = [];
   for (const e of snap.entries) {
-    const r = resolveSnapshotEntry(e, snap.boardId, boards, stateFingerprint);
+    const r = resolveSnapshotEntry(e, snap.boardId, boards, characters, stateFingerprint);
     if (!r.ok) {
-      const why = r.error === 'ambiguous-character' ? '跨卷同名歧义（不得猜补）' : '资料缺失（不得猜补）';
+      const why = r.error === 'missing-character' ? '人物已不在人物库（不得猜补）' : '采集状态已删除（不得猜补）';
       missing.push(`${e.nameAtCapture}｜采集状态：${e.stateLabelAtCapture}｜${why}`);
       continue;
     }
     const path = e.envPathAtCapture || '未归属环境';
-    const line = `${r.name}｜${r.state.label}｜${path}${r.stateChanged ? '｜状态自采集后已修改' : ''}`;
+    const unplaced = r.node ? '' : '｜本画布未放置';
+    const line = `${r.name}｜${r.state.label}｜${path}${unplaced}${r.stateChanged ? '｜状态自采集后已修改' : ''}`;
     (e.role === 'present' ? present : mentioned).push(line);
   }
   const lines = [

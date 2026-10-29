@@ -1,16 +1,17 @@
-/** 🔎 跨卷查人 + 🕒 人物时间轴（P3）：纯逻辑，不引入 store，UI / 引擎 / 测试共用。
+/** 🔎 跨卷查人 + 🕒 人物时间轴（P3 · v3 人物库）：纯逻辑，不引入 store，UI / 引擎 / 测试共用。
  *
- *  查人：按规范化人名在全部画布搜索；结果保留卷/画布归属，同名多处以 ambiguous 标出，绝不合并。
+ *  查人：按人物库逐人一行（人物身份作品级）；每个人物携带其全部画布放置与章节引用数；
+ *  同名不同人（规范化后同名、characterId 不同）照常分列，ambiguous 只做提示，绝不合并。
  *  时间轴：按全局章节顺序扫描章节快照，只收集该 characterId 的出现记录；
  *  解析失败时降级显示采集时的冻结标签，不读取、不编造当前属性。 */
 import type {
   CastRole,
-  CharacterData,
   CharacterGender,
+  CharacterState,
   SimBoard,
   SimChapter,
-  SimNodeType,
   SimVolume,
+  WorkCharacter,
 } from '../types/sim';
 import { boardLabel } from './boardOps';
 import { resolveSnapshotEntry, type SnapshotResolveError } from './snapshotRefs';
@@ -20,58 +21,91 @@ export function normalizeCharacterName(s: string): string {
   return s.normalize('NFKC').replace(/\s+/g, '').toLowerCase();
 }
 
-export interface CharacterSearchHit {
+/** 人物在一张画布上的放置摘要 */
+export interface CharacterPlacementRef {
   nodeId: string;
-  /** 当前人名（空名显示「未命名」） */
-  name: string;
-  nameKey: string;
-  gender: CharacterGender;
   boardId: string;
   boardLabel: string;
   volumeId?: string;
   volumeTitle?: string;
+  /** 该放置当前显示的状态标签（按放置独立 C1） */
+  activeStateLabel: string;
+}
+
+export interface CharacterSearchHit {
+  /** 人物库 ID */
+  characterId: string;
+  /** 当前人名（空名显示「未命名」） */
+  name: string;
+  nameKey: string;
+  gender: CharacterGender;
+  /** 首项状态标签（库级当前状态） */
   activeStateLabel: string;
   stateCount: number;
-  /** 全部画布中存在同名（规范化后相同）人物 */
+  /** 全部画布上的放置（空数组=未放置，人物可只存在于库中 C7） */
+  placements: CharacterPlacementRef[];
+  placed: boolean;
+  /** 引用该人物的章节快照数 */
+  chapterRefs: number;
+  /** 全库中存在同名（规范化后相同）人物 */
   ambiguous: boolean;
   /** 同名结果数量（含自身） */
   sameNameCount: number;
 }
 
-/** 按人名跨全部画布搜索；空查询返回空数组。
- *  排序：完全匹配 → 前缀匹配 → 包含匹配，再按人名与画布标签稳定排序。 */
+/** 按人名搜索人物库（每人一行）；空查询返回空数组。
+ *  排序：完全匹配 → 前缀匹配 → 包含匹配，再按人名稳定排序。 */
 export function searchCharacters(
+  characters: Record<string, WorkCharacter>,
   boards: Record<string, SimBoard>,
   volumes: SimVolume[],
+  chapters: SimChapter[],
   query: string,
 ): CharacterSearchHit[] {
   const q = normalizeCharacterName(query);
   if (!q) return [];
 
-  const all: CharacterSearchHit[] = [];
-  for (const board of Object.values(boards)) {
-    const label = boardLabel(board, volumes);
-    const volume = board.volumeId ? volumes.find((v) => v.id === board.volumeId) : undefined;
-    for (const node of board.nodes) {
-      if (node.data.kind !== 'character') continue;
-      const data = node.data as CharacterData;
-      const name = (data.name || '未命名').trim() || '未命名';
-      const active = data.states.find((s) => s.id === data.activeStateId) ?? data.states[0];
-      all.push({
-        nodeId: node.id,
-        name,
-        nameKey: normalizeCharacterName(name),
-        gender: data.gender === 'female' ? 'female' : 'male',
-        boardId: board.id,
-        boardLabel: label,
-        ...(board.volumeId ? { volumeId: board.volumeId } : {}),
-        ...(volume ? { volumeTitle: volume.title || '未命名卷' } : {}),
-        activeStateLabel: active?.label ?? '未命名状态',
-        stateCount: data.states.length,
-        ambiguous: false,
-        sameNameCount: 1,
-      });
+  // 章节快照引用计数（按 characterId）
+  const refCount = new Map<string, number>();
+  for (const c of chapters) {
+    for (const e of c.snapshot?.entries ?? []) {
+      refCount.set(e.characterId, (refCount.get(e.characterId) ?? 0) + 1);
     }
+  }
+
+  const all: CharacterSearchHit[] = [];
+  for (const character of Object.values(characters)) {
+    const name = (character.name || '未命名').trim() || '未命名';
+    const placements: CharacterPlacementRef[] = [];
+    for (const board of Object.values(boards)) {
+      for (const node of board.nodes) {
+        if (node.data.kind !== 'character' || node.data.characterId !== character.id) continue;
+        const label = boardLabel(board, volumes);
+        const volume = board.volumeId ? volumes.find((v) => v.id === board.volumeId) : undefined;
+        const active = character.states.find((s) => s.id === node.data.activeStateId) ?? character.states[0];
+        placements.push({
+          nodeId: node.id,
+          boardId: board.id,
+          boardLabel: label,
+          ...(board.volumeId ? { volumeId: board.volumeId } : {}),
+          ...(volume ? { volumeTitle: volume.title || '未命名卷' } : {}),
+          activeStateLabel: active?.label ?? '未命名状态',
+        });
+      }
+    }
+    all.push({
+      characterId: character.id,
+      name,
+      nameKey: normalizeCharacterName(name),
+      gender: character.gender,
+      activeStateLabel: character.states[0]?.label ?? '未命名状态',
+      stateCount: character.states.length,
+      placements,
+      placed: placements.length > 0,
+      chapterRefs: refCount.get(character.id) ?? 0,
+      ambiguous: false,
+      sameNameCount: 1,
+    });
   }
 
   const nameCount = new Map<string, number>();
@@ -88,8 +122,7 @@ export function searchCharacters(
     (a, b) =>
       rank(a) - rank(b) ||
       a.name.localeCompare(b.name, 'zh-Hans-CN') ||
-      a.boardLabel.localeCompare(b.boardLabel, 'zh-Hans-CN') ||
-      a.nodeId.localeCompare(b.nodeId),
+      a.characterId.localeCompare(b.characterId),
   );
   return hits;
 }
@@ -132,20 +165,19 @@ export const TIMELINE_CHANGE_LABEL: Record<TimelineChange, string> = {
 
 export const TIMELINE_RESOLUTION_LABEL: Record<TimelineResolution, string> = {
   ok: '可解析',
-  'missing-board': '来源画布缺失',
   'missing-character': '人物缺失',
   'missing-state': '状态缺失',
-  'ambiguous-character': '跨卷同名歧义',
 };
 
 /** 人物在全部章节快照中的出现记录（全局章节顺序）。
- *  只匹配 characterId；解析走 resolveSnapshotEntry（精确优先，唯一跨画布回退，歧义不猜）。 */
+ *  只匹配 characterId（人物库 ID）；解析走 resolveSnapshotEntry（库直查 + 放置可空）。 */
 export function characterTimeline(
   chapters: SimChapter[],
   boards: Record<string, SimBoard>,
   volumes: SimVolume[],
+  characters: Record<string, WorkCharacter>,
   characterId: string,
-  fingerprintOf: (state: CharacterData['states'][number]) => string,
+  fingerprintOf: (state: CharacterState) => string,
 ): CharacterTimelineRow[] {
   const rows: CharacterTimelineRow[] = [];
   chapters.forEach((chapter, chapterIndex) => {
@@ -153,7 +185,7 @@ export function characterTimeline(
     if (!snap) return;
     const entry = snap.entries.find((e) => e.characterId === characterId);
     if (!entry) return;
-    const r = resolveSnapshotEntry(entry, snap.boardId, boards, fingerprintOf);
+    const r = resolveSnapshotEntry(entry, snap.boardId, boards, characters, fingerprintOf);
     const sourceBoard = boards[snap.boardId];
     const chapterVolume = chapter.volumeId ? volumes.find((v) => v.id === chapter.volumeId) : undefined;
     const prev = rows[rows.length - 1];
@@ -187,16 +219,10 @@ export function characterTimeline(
   return rows;
 }
 
-/** 当前画布里该 ID 的人物（用于时间轴标题）；全画布唯一才返回，避免同名/复制混淆 */
+/** 人物库直查（用于时间轴标题/详情）；未命中返回 undefined */
 export function findCharacterById(
-  boards: Record<string, SimBoard>,
+  characters: Record<string, WorkCharacter>,
   characterId: string,
-): (SimNodeType & { data: CharacterData }) | undefined {
-  const hits = Object.values(boards)
-    .flatMap((b) => b.nodes)
-    .filter(
-      (n): n is SimNodeType & { data: CharacterData } =>
-        n.data.kind === 'character' && n.id === characterId,
-    );
-  return hits.length === 1 ? hits[0] : undefined;
+): WorkCharacter | undefined {
+  return characters[characterId];
 }

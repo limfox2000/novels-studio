@@ -202,6 +202,7 @@ export function Bookshelf({ onClose }: { onClose: () => void }) {
     if ((nodeCount > 0 || dirty) && !window.confirm(tip)) return;
     useStudioStore.getState().replaceState({
       boards: { [DEFAULT_BOARD_ID]: emptyBoard(DEFAULT_BOARD_ID) },
+      characters: {},
       activeBoardId: DEFAULT_BOARD_ID,
       rules: '',
       outlineRules: '',

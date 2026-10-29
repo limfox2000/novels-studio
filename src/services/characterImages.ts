@@ -12,7 +12,7 @@ import {
   type CharacterImageCrop,
   type CharacterImagePreset,
   type CharacterStateImage,
-  type SimBoard,
+  type WorkCharacter,
 } from '../types/sim';
 
 export const CHARACTER_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
@@ -187,14 +187,15 @@ export async function cropHeadshot(fullDataUrl: string, crop: CharacterImageCrop
   }
 }
 
-/** 写入新大图；每次换图生成新 key，复制状态之间的旧引用不会被覆盖 */
+/** 写入新大图；每次换图生成新 key，复制状态之间的旧引用不会被覆盖。
+ *  characterId=人物库 ID（旧数据以 node.id 建库，key 格式相同、首段语义为 characterId）。 */
 export async function saveFullImage(
-  nodeId: string,
+  characterId: string,
   stateId: string,
   prepared: PreparedCharacterImage,
   preset: CharacterImagePreset | 'original',
 ): Promise<{ image: CharacterStateImage; dataUrl: string }> {
-  const key = newCharacterImageKey(nodeId, stateId);
+  const key = newCharacterImageKey(characterId, stateId);
   await localImgSet(key, prepared.dataUrl);
   return {
     image: { key, width: prepared.width, height: prepared.height, preset },
@@ -204,14 +205,14 @@ export async function saveFullImage(
 
 /** 生成并写入新头像；返回带 headKey/crop 的形象元数据 */
 export async function saveHeadshot(
-  nodeId: string,
+  characterId: string,
   stateId: string,
   image: CharacterStateImage,
   crop: CharacterImageCrop,
   fullDataUrl: string,
 ): Promise<{ image: CharacterStateImage; dataUrl: string }> {
   const dataUrl = await cropHeadshot(fullDataUrl, crop);
-  const headKey = newCharacterHeadKey(nodeId, stateId);
+  const headKey = newCharacterHeadKey(characterId, stateId);
   await localImgSet(headKey, dataUrl);
   primeHeadshot(headKey, dataUrl);
   return {
@@ -298,28 +299,25 @@ export function invalidateHeadshot(key: string): void {
   headPending.delete(key);
 }
 
-/** 取得全部画布仍引用的大图/头像 key */
-export function collectReferencedImageKeys(boards: Record<string, SimBoard>): Set<string> {
+/** 取得人物库仍引用的大图/头像 key（图片归属状态，状态归属人物库——删除放置不回收） */
+export function collectReferencedImageKeys(characters: Record<string, WorkCharacter>): Set<string> {
   const refs = new Set<string>();
-  for (const board of Object.values(boards)) {
-    for (const node of board.nodes) {
-      if (node.data.kind !== 'character') continue;
-      for (const state of node.data.states) {
-        for (const key of collectStateImageKeys(state)) refs.add(key);
-      }
+  for (const character of Object.values(characters)) {
+    for (const state of character.states) {
+      for (const key of collectStateImageKeys(state)) refs.add(key);
     }
   }
   return refs;
 }
 
-/** 只删除已无任何状态引用的 key；跨卷镜像/状态继承仍引用时保留 */
+/** 只删除已无任何状态引用的 key；其它状态/复制为新的人物仍引用时保留 */
 export async function releaseCharacterImageKeys(
   keys: Array<string | undefined>,
-  boards: Record<string, SimBoard>,
+  characters: Record<string, WorkCharacter>,
 ): Promise<void> {
   const unique = [...new Set(keys.filter((k): k is string => !!k))];
   if (!unique.length) return;
-  const refs = collectReferencedImageKeys(boards);
+  const refs = collectReferencedImageKeys(characters);
   await Promise.allSettled(
     unique
       .filter((key) => !refs.has(key))

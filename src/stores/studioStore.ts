@@ -1,7 +1,9 @@
 /**
- * 创作台画布 store（v2.29 多卷画布；persist nc2-sim-v1 v2）：地图式画布。
+ * 创作台画布 store（v3 人物库；persist nc2-sim-v1 v3）：地图式画布。
  *  🗂 boards 是节点唯一权威数据源：默认主画布（main）+ 每卷一张 vol:<volumeId>；activeBoardId 决定 React Flow 渲染哪张。
- *  🧑 人物节点（人名胶囊——面上仅显示人名，基础信息/身份信息在属性面板；zIndex 恒 CHAR_ZINDEX 恒顶层）+
+ *  📇 characters 是作品级人物库（唯一权威人物数据源）：姓名/性别/状态/形象只存一份，任何一处编辑全局生效。
+ *  🧑 人物节点只是「放置」（characterId + activeStateId）：决定人物出现在哪张画布、当前用哪个状态；
+ *  当前状态按放置独立（C1）——第一卷可显示「常态」，第二卷可显示「黑化后」，互不影响。
  *  🏗 环境节点（可缩放容器：NodeResizer 写 node.width/height；可嵌套层级——镇>建筑>房间…，RF12 parentId 父子；
  *  v2.18 类型扩 床（容纳人物休息的容器）/物品（非容器标记——告知 AI 此处存在一个东西），按类型清淡配色）。
  *  节点面上**只展示不输入**：属性在左侧面板（SimInspector，顶栏 ⚙ 属性 开关、可关闭、不自动弹出——v2.4）。
@@ -9,8 +11,9 @@
  *  子节点**不设 expandParent**（否则拖动会自动撑大父容器，中心点永远出不去——v2 踩坑）；
  *  删除父环境时后代提升回根（绝对坐标展开，不丢内容）。规则系统/演进生成的连线语义随后续需求定义（edges 占位）。
  *
- *  旧档兼容：persist v2 没有 boards → merge 把顶层 nodes/edges 迁进 main，并为旧 volumes 补空画布；
- *  version 保持 2（未写 migrate 时升版本会直接丢档）。
+ *  人物语义：画布删除人物节点 = 仅移除放置（人物仍在库中）；全局删除只在人物库 UI。
+ *  旧档兼容（用户豁免，无迁移向导）：persist v2 旧档无 characters → merge 从画布节点一次性提取
+ *  （characterId=旧 node.id，镜像首见保留，分叉副本丢弃）；无法兼容的旧人物数据直接丢弃。
  */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
@@ -28,7 +31,8 @@ import {
   type CastRole,
   type ChapterRegion,
   type ChapterSnapshot,
-  type CharacterData,
+  type CharacterGender,
+  type CharacterPlacementData,
   type CharacterState,
   type EnvironmentData,
   type EnvironmentType,
@@ -38,6 +42,7 @@ import {
   type SimNodeType,
   type SimVolume,
   type SimViewport,
+  type WorkCharacter,
 } from '../types/sim';
 import { uid } from '../utils/id';
 import { sameStringList, sanitizeWritingSkillIds } from '../types/writingSkill';
@@ -63,14 +68,16 @@ import {
   type RegionRect,
 } from './chapterRegions';
 import {
+  DEFAULT_STATE_ID,
   STATE_LABEL_CAP,
-  activeCharacterState,
+  characterHasState,
   collectStateImageKeys,
-  initialCharacterData,
+  extractCharactersFromBoards,
+  newWorkCharacter,
   newStateId,
   nextStateLabel,
-  sanitizeCharacterData,
   sanitizeCharacterImage,
+  sanitizeCharacters,
   sanitizeStateAge,
   stateLabelTaken,
 } from './characterStates';
@@ -297,13 +304,17 @@ export function findChildDropPosition(
 
 // ── 载入/恢复兜底 ──
 
-/** 过滤非法 kind/缺 data 节点 → 剥 expandParent/resizing 瞬态键 → 重建数据（人物剥到仅 name；环境补尺寸默认值）→
+/** 过滤非法 kind/缺 data 节点 → 剥 expandParent/resizing 瞬态键 → 人物节点转「放置」（查库取人物）→
  *  人物 zIndex 强制顶层 →
  *  parentId 清洗（父必须存在且为 environment，且不成环）→ 清洗连线（悬空/自环/重复，静默丢弃）。
- *  dropped>0 调用方提示「已过滤 N 个非法节点」。 */
+ *  dropped>0 调用方提示「已过滤 N 个非法节点」。
+ *  人物分支：data 带合法 characterId → 直接用；旧格式（无 characterId）→ 以 node.id 查库（提取以 node.id 建库）；
+ *  characterId 不在库中（悬空放置/旧数据未提取）→ 丢弃（用户豁免：无迁移向导，不兼容旧数据可删）；
+ *  同板同 characterId 重复放置（C4）→ 保留首个。 */
 export function sanitizeSimNodes(
   nodes: SimNodeType[],
-  edges: Edge[] = [],
+  edges: Edge[],
+  characters: Record<string, WorkCharacter>,
 ): { nodes: SimNodeType[]; edges: Edge[]; dropped: number } {
   // 先按 id 去重：多画布存档合并/损坏缓存可能出现重复 id，React Flow 会因此错乱
   const seenNodeIds = new Set<string>();
@@ -314,7 +325,9 @@ export function sanitizeSimNodes(
     seenNodeIds.add(n.id);
     return true;
   });
-  const fixed = valid.map((n) => {
+  const seenCharIds = new Set<string>();
+  const fixed: SimNodeType[] = [];
+  for (const n of valid) {
     const d = n.data as unknown as Record<string, unknown>;
     // 剥离 expandParent（v2 曾误设：拖子节点会自动撑大父容器，导致无法拖出）、resizing（瞬态）、selected（选中态不持久化）
     const base = { ...n } as Record<string, unknown>;
@@ -323,9 +336,16 @@ export function sanitizeSimNodes(
     delete base.selected;
     const clean = base as unknown as SimNodeType;
     if (clean.data.kind === 'character') {
-      // v2.30 人物多状态：旧平铺字段迁入状态0；已有 states 只清洗、不覆盖（详见 characterStates.ts）
-      const data = sanitizeCharacterData(d, n.id);
-      return { ...clean, data, zIndex: CHAR_ZINDEX };
+      // v3 人物库：节点只是放置——characterId 优先取 data，旧格式回落 node.id（提取键）
+      const cid = pickStr(d.characterId).trim() || clean.id;
+      const character = characters[cid];
+      if (!character || seenCharIds.has(cid)) continue; // 悬空放置 / 同板重复（C4）
+      seenCharIds.add(cid);
+      const wanted = pickStr(d.activeStateId).trim();
+      const activeStateId = characterHasState(character, wanted) ? wanted : character.states[0].id;
+      const data: CharacterPlacementData = { kind: 'character', characterId: cid, activeStateId };
+      fixed.push({ ...clean, data, zIndex: CHAR_ZINDEX });
+      continue;
     }
     // environment：etype 不在集合内归位 building；尺寸缺失/过小回默认（旧档案/损坏缓存兜底）
     const etype = (ENV_TYPES as readonly string[]).includes(pickStr(d.etype)) ? (pickStr(d.etype) as EnvironmentType) : 'building';
@@ -333,8 +353,8 @@ export function sanitizeSimNodes(
     if (d.locked === true) data.locked = true;
     const w = typeof clean.width === 'number' && clean.width >= ENV_MIN_W ? clean.width : ENV_DEFAULT_W;
     const h = typeof clean.height === 'number' && clean.height >= ENV_MIN_H ? clean.height : ENV_DEFAULT_H;
-    return { ...clean, data, width: w, height: h, zIndex: undefined };
-  });
+    fixed.push({ ...clean, data, width: w, height: h, zIndex: undefined });
+  }
   // parentId 清洗：链上每个祖先都必须存在且是 environment，且不成环；非法则提升回根
   const byId = new Map(fixed.map((n) => [n.id, n]));
   const cleaned = fixed.map((n) => {
@@ -363,16 +383,20 @@ export function sanitizeSimNodes(
   return { nodes: sortParentsFirst(cleaned), edges: keptEdges, dropped: nodes.length - fixed.length };
 }
 
-/** 🗂 画布集合兜底（persist 恢复 + 存档载入共用）：
+/** 🗂 画布集合兜底 + 人物库兜底（persist 恢复 + 存档载入共用）：
  *  - 新格式：逐板 sanitize；卷画布 id 固定为 vol:<volumeId>，重复/错位 id 合并到固定槽；
  *  - 旧格式：legacy nodes/edges 进默认主画布；
- *  - 每个卷都保证有一张画布；无法对应卷的异常画布保留（标签显示未关联），不静默丢节点。 */
+ *  - 每个卷都保证有一张画布；无法对应卷的异常画布保留（标签显示未关联），不静默丢节点。
+ *  人物库（两遍法）：调用方已有库（v3 数据）→ 直接传入校验放置；否则先对原始节点一次性提取
+ *  （v2 旧档，characterId=旧 node.id——用户豁免无迁移向导），再带库 sanitize。
+ *  返回 {boards, characters}，调用方必须把两者一起落库（保持同一 set() 原子性）。 */
 export function sanitizeBoards(
   rawBoards: unknown,
   volumes: SimVolume[],
   legacy?: { nodes?: unknown; edges?: unknown },
   chapters?: SimChapter[],
-): Record<string, SimBoard> {
+  knownCharacters?: Record<string, WorkCharacter>,
+): { boards: Record<string, SimBoard>; characters: Record<string, WorkCharacter> } {
   const volumeIds = new Set(volumes.map((v) => v.id));
   type RawBoard = {
     id: string;
@@ -446,19 +470,27 @@ export function sanitizeBoards(
   if (!groups.has(DEFAULT_BOARD_ID)) {
     const legacyNodes = Array.isArray(legacy?.nodes) ? (legacy.nodes as SimNodeType[]) : [];
     const legacyEdges = Array.isArray(legacy?.edges) ? (legacy.edges as Edge[]) : [];
-    const s = sanitizeSimNodes(legacyNodes, legacyEdges);
-    groups.set(DEFAULT_BOARD_ID, { id: DEFAULT_BOARD_ID, nodes: s.nodes, edges: s.edges, regions: [] });
+    groups.set(DEFAULT_BOARD_ID, { id: DEFAULT_BOARD_ID, nodes: legacyNodes, edges: legacyEdges, regions: [] });
   }
   for (const v of volumes) {
     const id = volumeBoardId(v.id);
     if (!groups.has(id)) groups.set(id, { id, volumeId: v.id, nodes: [], edges: [], regions: [] });
   }
 
+  // 人物库：已有库直接用；否则从原始节点一次性提取（含 legacy 主画布路径）
+  let characters: Record<string, WorkCharacter>;
+  if (knownCharacters) {
+    characters = knownCharacters;
+  } else {
+    const extractBoards = Array.from(groups.values()).map((g) => ({ nodes: g.nodes }));
+    characters = extractCharactersFromBoards(extractBoards).characters;
+  }
+
   // 📐 区域归属：有章节表时只保留在章节当前所属画布上的区域，孤儿/错板区域丢弃
   const chapterToBoard = chapters ? buildChapterBoardMap(chapters, volumes) : undefined;
   const out: Record<string, SimBoard> = {};
   for (const [id, g] of groups) {
-    const s = sanitizeSimNodes(g.nodes, g.edges);
+    const s = sanitizeSimNodes(g.nodes, g.edges, characters);
     const viewport = sanitizeViewport(g.viewport);
     out[id] = {
       id,
@@ -472,13 +504,15 @@ export function sanitizeBoards(
       ...(viewport ? { viewport } : {}),
     };
   }
-  return out;
+  return { boards: out, characters };
 }
 
 // ── Store ──
 
 export interface WorkspaceSnapshot {
   boards: Record<string, SimBoard>;
+  /** 📇 人物库（必填：normalizeArchive 必产出、新建作品显式 {}——杜绝切作品串库） */
+  characters: Record<string, WorkCharacter>;
   activeBoardId?: string;
   graphName?: string;
   cover?: string;
@@ -492,7 +526,7 @@ export interface WorkspaceSnapshot {
 }
 
 /** 人物顶层身份补丁：人名/性别跨状态稳定，不写状态 */
-export type CharacterIdentityPatch = Partial<Pick<CharacterData, 'name' | 'gender'>>;
+export type CharacterIdentityPatch = Partial<Pick<WorkCharacter, 'name' | 'gender'>>;
 /** 状态属性补丁：只含随状态变化的字段（id/label 只能走专用动作） */
 export interface ChapterSceneSyncResult {
   ok: boolean;
@@ -523,7 +557,8 @@ export type CharacterStateError =
   | 'empty-label'
   | 'duplicate-label'
   | 'protected'
-  | 'last-state';
+  | 'last-state'
+  | 'unplaced';
 export type CharacterStateOpResult =
   | { ok: true; stateId?: string; removed?: CharacterState }
   | { ok: false; error: CharacterStateError };
@@ -533,6 +568,8 @@ export interface AddCharacterStateOptions {
   patch?: CharacterStatePatch;
   /** 默认 true：新建后立刻切到新状态，便于马上编辑 */
   activate?: boolean;
+  /** activate 的目标画布（在该板找本人物的放置切过去；缺省=当前画布） */
+  activateOnBoardId?: string;
 }
 
 export type SnapshotError =
@@ -547,8 +584,10 @@ export type SnapshotResult = { ok: true; snapshot: ChapterSnapshot } | { ok: fal
 export type SnapshotMutationResult = { ok: true } | { ok: false; error: SnapshotError };
 
 interface SimState {
-  /** 🗂 全部卷画布（唯一权威节点数据源） */
+  /** 🗂 全部卷画布（节点=放置/环境的唯一权威数据源） */
   boards: Record<string, SimBoard>;
+  /** 📇 人物库（v3 人物库：人物身份/状态/形象唯一权威数据源；写动作必须不可变替换整个 map，否则脏检查失效） */
+  characters: Record<string, WorkCharacter>;
   /** 当前渲染/编辑的画布 */
   activeBoardId: string;
   graphName: string;
@@ -641,41 +680,63 @@ interface SimState {
   /** 🎬 切章回放：只移动快照内人物，恢复父环境、绝对位置与当前状态 id */
   applyChapterScene: (chapterId: string) => ChapterSceneApplyResult;
 
+  // ── 📇 人物库（作品级） ──
+  /** 新建人物：先建库记录，可同时放置到指定画布（placeOnBoardId 缺省=不放置，人物可只存在于库中 C7）；返回人物库 id */
+  createCharacter: (opts?: {
+    name?: string;
+    gender?: CharacterGender;
+    placeOnBoardId?: string;
+    pos?: { x: number; y: number };
+    select?: boolean;
+  }) => string;
+  /** 更新人物顶层身份（人名/性别）：写库，全部画布的放置立即读到新值 */
+  updateCharacter: (characterId: string, patch: CharacterIdentityPatch) => void;
+  /** 删除人物（全局破坏性）：删库记录 + 全部画布放置 + 释放该人物全部图片；UI 需二次确认 */
+  deleteCharacter: (characterId: string) => void;
+  /** 合并人物（简单版）：主人物保留身份与全部状态；其余人物状态逐个追加（标签/ID 冲突去重），
+   *  放置与章节快照引用改写指向主人物，同板重复放置保留首个 */
+  mergeCharacters: (primaryId: string, otherIds: string[]) => void;
+
+  // ── 🧬 人物状态（库写；首参=人物库 id） ──
+  addCharacterState: (characterId: string, opts?: AddCharacterStateOptions) => CharacterStateOpResult;
+  /** 更新状态属性（stateId 缺省=首项状态）；图片替换时释放旧 key（GC 查库） */
+  updateCharacterState: (characterId: string, patch: CharacterStatePatch, stateId?: string) => CharacterStateOpResult;
+  /** 更新当前画布放置正在显示的状态（未放置→unplaced） */
+  updateActiveCharacterState: (characterId: string, patch: CharacterStatePatch) => CharacterStateOpResult;
+  /** 切换当前画布放置的状态（写放置不写库；未放置→unplaced） */
+  switchCharacterState: (characterId: string, stateId: string) => CharacterStateOpResult;
+  renameCharacterState: (characterId: string, stateId: string, label: string) => CharacterStateOpResult;
+  /** 删除状态（保护首项与最后一项；跨板清扫：所有指向被删状态的放置回落首项；释放图片） */
+  deleteCharacterState: (characterId: string, stateId: string) => CharacterStateOpResult;
+
+  // ── 放置（画布 ↔ 人物库） ──
+  /** 把库中人物放到画布（同板已有放置→复用返回既有节点 id——C4 一人一板一个放置）；可挂父环境 */
+  linkPlacement: (
+    boardId: string,
+    characterId: string,
+    pos?: { x: number; y: number },
+    parentId?: string | null,
+  ) => string | null;
+  /** 从画布移除放置（人物仍在库中；其后代提升回根层，绝对坐标展开） */
+  unlinkPlacement: (boardId: string, nodeId: string) => void;
+
   // ── 节点（当前画布） ──
-  /** 新建人物节点（pos=地图落点；缺省人物列堆叠） */
-  createCharacter: (pos?: { x: number; y: number }) => string;
   /** 新建环境节点（pos=地图落点；缺省环境列堆叠；size=初始尺寸（下限钳制，区域规划整组落地用），缺省默认尺寸；选中后可 NodeResizer 缩放） */
   createEnvironment: (pos?: { x: number; y: number }, size?: { w: number; h: number }) => string;
-  /** 更新人物顶层身份（人名/性别；仅 kind==='character' 生效） */
-  updateCharacter: (id: string, patch: CharacterIdentityPatch) => void;
   /** 更新环境节点字段（仅 kind==='environment' 生效） */
   updateEnvironment: (id: string, patch: Partial<EnvironmentData>) => void;
   /** 调整环境节点尺寸（AI 在容器内新建子节点、容器不够大时自动扩展用） */
   resizeEnvironment: (id: string, w: number, h: number) => void;
   /** 重定父级：parentId=null 提升回根（position 换算回绝对坐标），否则挂到目标环境节点下（position 换算为相对父坐标） */
   reparentNode: (childId: string, parentId: string | null) => void;
-  /** 删除节点（父环境被删时，其后代提升回根层，绝对坐标展开） */
+  /** 删除节点 = 移除放置/环境节点（人物仍在库中，不触发图片 GC——全局删除只在人物库 UI） */
   deleteNode: (id: string) => void;
 
-  // ── 🧬 人物状态（当前画布代理） ──
-  addCharacterState: (id: string, opts?: AddCharacterStateOptions) => CharacterStateOpResult;
-  updateCharacterState: (id: string, patch: CharacterStatePatch, stateId?: string) => CharacterStateOpResult;
-  updateActiveCharacterState: (id: string, patch: CharacterStatePatch) => CharacterStateOpResult;
-  switchCharacterState: (id: string, stateId: string) => CharacterStateOpResult;
-  renameCharacterState: (id: string, stateId: string, label: string) => CharacterStateOpResult;
-  deleteCharacterState: (id: string, stateId: string) => CharacterStateOpResult;
-
   // ── 节点（指定画布：编辑室跨卷落地，不切当前标签） ──
-  createCharacterOnBoard: (boardId: string, pos?: { x: number; y: number }, opts?: { select?: boolean }) => string | null;
   createEnvironmentOnBoard: (boardId: string, pos?: { x: number; y: number }, size?: { w: number; h: number }, opts?: { select?: boolean }) => string | null;
-  updateCharacterOnBoard: (boardId: string, id: string, patch: CharacterIdentityPatch) => void;
   updateEnvironmentOnBoard: (boardId: string, id: string, patch: Partial<EnvironmentData>) => void;
-  addCharacterStateOnBoard: (boardId: string, id: string, opts?: AddCharacterStateOptions) => CharacterStateOpResult;
-  updateCharacterStateOnBoard: (boardId: string, id: string, patch: CharacterStatePatch, stateId?: string) => CharacterStateOpResult;
-  updateActiveCharacterStateOnBoard: (boardId: string, id: string, patch: CharacterStatePatch) => CharacterStateOpResult;
-  switchCharacterStateOnBoard: (boardId: string, id: string, stateId: string) => CharacterStateOpResult;
-  renameCharacterStateOnBoard: (boardId: string, id: string, stateId: string, label: string) => CharacterStateOpResult;
-  deleteCharacterStateOnBoard: (boardId: string, id: string, stateId: string) => CharacterStateOpResult;
+  /** 切换指定画布放置的状态（写放置节点 activeStateId；stateId 对库校验） */
+  switchCharacterStateOnBoard: (boardId: string, nodeId: string, stateId: string) => CharacterStateOpResult;
   resizeEnvironmentOnBoard: (boardId: string, id: string, w: number, h: number) => void;
   reparentNodeOnBoard: (boardId: string, childId: string, parentId: string | null) => void;
   /** 跨卷复制（源默认=当前画布）；只写目标画布，默认不切换标签 */
@@ -733,7 +794,9 @@ function sameStudioContent(a: SimState, b: SimState): boolean {
     a.charGenRules !== b.charGenRules ||
     a.mainGoal !== b.mainGoal ||
     a.volumes !== b.volumes ||
-    a.chapters !== b.chapters
+    a.chapters !== b.chapters ||
+    // 📇 人物库纳入脏检查：所有库写动作必须不可变替换 characters 对象，否则这里检测不到改动
+    a.characters !== b.characters
   ) {
     return false;
   }
@@ -755,7 +818,7 @@ function sameStudioContent(a: SimState, b: SimState): boolean {
 /** 手动保存：所有变更只留在内存并标记未保存，用户点「保存」或 Ctrl/Cmd+S 时才写 localStorage */
 const studioPersistStorage = createManualPersistStorage<SimState>({
   contentEqual: sameStudioContent,
-  defaultVersion: 2,
+  defaultVersion: 3,
 });
 
 /** 立即保存当前工作区到 localStorage（返回是否成功） */
@@ -793,10 +856,39 @@ function setBoardNodes(
   };
 }
 
+/** 构建人物放置节点（人物列堆叠落点；select=创建即选中并清掉其它选中）。返回 null=人物不在库中 */
+function makeCharacterPlacement(
+  board: SimBoard,
+  characterId: string,
+  activeStateId: string,
+  pos: { x: number; y: number } | undefined,
+  select: boolean,
+): { nodeId: string; nodes: SimNodeType[] } | null {
+  // 缺省人物列 x=0：排在既有节点最低处下方
+  const y = board.nodes.length ? Math.max(...board.nodes.map((n) => n.position.y + (n.height ?? 150))) + 60 : 0;
+  const nodeId = uid();
+  const nodes = select ? board.nodes.map((n) => (n.selected ? { ...n, selected: false } : n)) : board.nodes;
+  return {
+    nodeId,
+    nodes: [
+      ...nodes,
+      {
+        id: nodeId,
+        type: 'character',
+        position: pos ?? { x: 0, y },
+        data: { kind: 'character', characterId, activeStateId } satisfies CharacterPlacementData,
+        zIndex: CHAR_ZINDEX,
+        selected: select,
+      },
+    ],
+  };
+}
+
 export const useStudioStore = create<SimState>()(
   persist(
     (set, get) => ({
       boards: { [DEFAULT_BOARD_ID]: emptyBoard(DEFAULT_BOARD_ID) },
+      characters: {},
       activeBoardId: DEFAULT_BOARD_ID,
       graphName: '未命名',
       cover: '',
@@ -870,6 +962,7 @@ export const useStudioStore = create<SimState>()(
           if (!boards[DEFAULT_BOARD_ID]) boards[DEFAULT_BOARD_ID] = emptyBoard(DEFAULT_BOARD_ID);
           // 卷章节回到未分卷；若旧档/异常数据还在别的板留了本章区域，一并清掉
           if (affected.size) boards = removeChapterRegions(boards, affected);
+          // 人物库不动：删除卷只删画布与放置，人物/图片归属库（不再有删卷漏 GC 的悬空图片问题）
           return {
             volumes: s.volumes.filter((v) => v.id !== id),
             chapters: s.chapters.map((c) => (c.volumeId === id ? { ...c, volumeId: '' } : c)),
@@ -1064,7 +1157,7 @@ export const useStudioStore = create<SimState>()(
         if (!board) return { ok: false, error: 'board-not-found' };
         const region = board.regions.find((r) => r.chapterId === chapterId);
         if (!region) return { ok: false, error: 'region-not-found' };
-        const snapshot = captureSnapshotPure(board, region, { source: opts?.source ?? 'manual' });
+        const snapshot = captureSnapshotPure(board, region, { source: opts?.source ?? 'manual' }, s.characters);
         set({
           chapters: s.chapters.map((c) => (c.id === chapterId ? { ...c, snapshot } : c)),
         });
@@ -1080,7 +1173,7 @@ export const useStudioStore = create<SimState>()(
         if (!board) return { ok: false, error: 'board-not-found' };
         const region = board.regions.find((r) => r.chapterId === chapterId);
         if (!region) return { ok: false, error: 'region-not-found' };
-        const snapshot = refreshSnapshotPure(prev, board, region);
+        const snapshot = refreshSnapshotPure(prev, board, region, s.characters);
         set({
           chapters: s.chapters.map((c) => (c.id === chapterId ? { ...c, snapshot } : c)),
         });
@@ -1095,12 +1188,14 @@ export const useStudioStore = create<SimState>()(
         if (snap.entries.some((e) => e.characterId === characterId)) return { ok: true };
         const board = s.boards[snap.boardId];
         if (!board) return { ok: false, error: 'board-not-found' };
-        const node = board.nodes.find((n) => n.id === characterId);
-        if (!node || node.data.kind !== 'character') return { ok: false, error: 'character-not-found' };
-        if (opts?.stateId && !node.data.states.some((st) => st.id === opts.stateId)) {
+        // 人物身份 = 人物库记录；须已放置在快照画布上（回放需要坐标/父环境）
+        if (!s.characters[characterId]) return { ok: false, error: 'character-not-found' };
+        const placed = board.nodes.find((n) => n.data.kind === 'character' && n.data.characterId === characterId);
+        if (!placed) return { ok: false, error: 'character-not-found' };
+        if (opts?.stateId && !characterHasState(s.characters[characterId], opts.stateId)) {
           return { ok: false, error: 'state-not-found' };
         }
-        const entry = manualSnapshotEntry(board, characterId, opts);
+        const entry = manualSnapshotEntry(board, s.characters, characterId, opts);
         if (!entry) return { ok: false, error: 'character-not-found' };
         const entries = [...snap.entries, entry];
         const region = snap.regions[0];
@@ -1148,12 +1243,12 @@ export const useStudioStore = create<SimState>()(
         if (!entry) return { ok: false, error: 'entry-not-found' };
         const board = s.boards[snap.boardId];
         if (!board) return { ok: false, error: 'board-not-found' };
-        const node = board.nodes.find((n) => n.id === characterId);
-        if (!node || node.data.kind !== 'character') return { ok: false, error: 'character-not-found' };
-        if (patch.stateId && !node.data.states.some((st) => st.id === patch.stateId)) {
+        const character = s.characters[characterId];
+        if (!character) return { ok: false, error: 'character-not-found' };
+        if (patch.stateId && !characterHasState(character, patch.stateId)) {
           return { ok: false, error: 'state-not-found' };
         }
-        const next = manualSnapshotEntry(board, characterId, {
+        const next = manualSnapshotEntry(board, s.characters, characterId, {
           role: patch.role ?? entry.role,
           stateId: patch.stateId ?? entry.stateId,
         });
@@ -1204,7 +1299,7 @@ export const useStudioStore = create<SimState>()(
         const region = board.regions.find((r) => r.chapterId === chapterId);
         if (!region) return { ok: false, changed: false, created: false, error: 'region-not-found' };
         const now = Date.now();
-        const fresh = captureSnapshotPure(board, region, { source: 'auto-scene', now });
+        const fresh = captureSnapshotPure(board, region, { source: 'auto-scene', now }, s.characters);
         const prev = chapter.snapshot;
         if (prev && prev.boardId === boardId && sameSnapshotScene(prev, fresh)) {
           return { ok: true, changed: false, created: false, snapshot: prev };
@@ -1264,7 +1359,7 @@ export const useStudioStore = create<SimState>()(
             error: 'board-not-found',
           };
         }
-        const r: ApplyChapterSceneResult = applyChapterScenePure(board, snapshot);
+        const r: ApplyChapterSceneResult = applyChapterScenePure(board, snapshot, s.characters);
         if (r.changed) set(setBoardNodes(s, snapshot.boardId, r.nodes));
         return {
           ok: true,
@@ -1278,34 +1373,27 @@ export const useStudioStore = create<SimState>()(
         };
       },
 
-      createCharacter: (pos) => get().createCharacterOnBoard(get().activeBoardId, pos) ?? '',
-      createEnvironment: (pos, size) => get().createEnvironmentOnBoard(get().activeBoardId, pos, size) ?? '',
-
-      createCharacterOnBoard: (boardId, pos, opts) => {
+      // ── 📇 人物库 ──
+      createCharacter: (opts) => {
         const s = get();
-        const b = s.boards[boardId];
-        if (!b) return null;
-        // 缺省人物列 x=0：排在既有节点最低处下方
-        const y = b.nodes.length ? Math.max(...b.nodes.map((n) => n.position.y + (n.height ?? 150))) + 60 : 0;
-        const id = uid();
-        const data = initialCharacterData(id);
-        const select = opts?.select ?? boardId === s.activeBoardId;
-        // 创建即选中：右侧属性面板（SimInspector）立刻可填人名——节点面上不内嵌输入框（v2.3）
-        const nodes = select ? b.nodes.map((n) => (n.selected ? { ...n, selected: false } : n)) : b.nodes;
-        set({
-          boards: {
-            ...s.boards,
-            [boardId]: {
-              ...b,
-              nodes: [
-                ...nodes,
-                { id, type: 'character', position: pos ?? { x: 0, y }, data, zIndex: CHAR_ZINDEX, selected: select },
-              ],
-            },
-          },
-        });
-        return id;
+        const characterId = uid();
+        const character = newWorkCharacter(characterId);
+        if (opts?.name) character.name = opts.name;
+        if (opts?.gender) character.gender = opts.gender;
+        let boards = s.boards;
+        const boardId = opts?.placeOnBoardId;
+        const board = boardId ? s.boards[boardId] : undefined;
+        if (boardId && board) {
+          // 创建即选中：右侧属性面板（SimInspector）立刻可填人名——节点面上不内嵌输入框
+          const select = opts?.select ?? boardId === s.activeBoardId;
+          const placement = makeCharacterPlacement(board, characterId, character.states[0].id, opts?.pos, select);
+          if (placement) boards = { ...boards, [boardId]: { ...board, nodes: placement.nodes } };
+        }
+        // 库与放置同一 set() 落库：放置节点必须能立刻查到人物
+        set({ characters: { ...s.characters, [characterId]: character }, boards });
+        return characterId;
       },
+      createEnvironment: (pos, size) => get().createEnvironmentOnBoard(get().activeBoardId, pos, size) ?? '',
 
       createEnvironmentOnBoard: (boardId, pos, size, opts) => {
         const s = get();
@@ -1335,96 +1423,48 @@ export const useStudioStore = create<SimState>()(
         return id;
       },
 
-      updateCharacter: (id, patch) => get().updateCharacterOnBoard(get().activeBoardId, id, patch),
+      updateCharacter: (characterId, patch) =>
+        set((s) => {
+          const c = s.characters[characterId];
+          if (!c) return {};
+          // 不可变替换：库写必须换新对象/新 map，否则 sameStudioContent 检测不到「未保存」
+          return { characters: { ...s.characters, [characterId]: { ...c, ...patch } } };
+        }),
       updateEnvironment: (id, patch) => get().updateEnvironmentOnBoard(get().activeBoardId, id, patch),
       resizeEnvironment: (id, w, h) => get().resizeEnvironmentOnBoard(get().activeBoardId, id, w, h),
 
-      addCharacterState: (id, opts) => get().addCharacterStateOnBoard(get().activeBoardId, id, opts),
-      updateCharacterState: (id, patch, stateId) =>
-        get().updateCharacterStateOnBoard(get().activeBoardId, id, patch, stateId),
-      updateActiveCharacterState: (id, patch) =>
-        get().updateActiveCharacterStateOnBoard(get().activeBoardId, id, patch),
-      switchCharacterState: (id, stateId) =>
-        get().switchCharacterStateOnBoard(get().activeBoardId, id, stateId),
-      renameCharacterState: (id, stateId, label) =>
-        get().renameCharacterStateOnBoard(get().activeBoardId, id, stateId, label),
-      deleteCharacterState: (id, stateId) =>
-        get().deleteCharacterStateOnBoard(get().activeBoardId, id, stateId),
-
-      updateCharacterOnBoard: (boardId, id, patch) =>
-        set((s) => {
-          const b = s.boards[boardId];
-          if (!b) return {};
-          return setBoardNodes(
-            s,
-            boardId,
-            b.nodes.map((n) =>
-              n.id === id && n.data.kind === 'character'
-                ? {
-                    ...n,
-                    data: {
-                      ...n.data,
-                      ...(patch.name !== undefined ? { name: patch.name } : {}),
-                      ...(patch.gender !== undefined ? { gender: patch.gender } : {}),
-                    },
-                  }
-                : n,
-            ),
-          );
-        }),
-
-      addCharacterStateOnBoard: (boardId, id, opts) => {
+      addCharacterState: (characterId, opts) => {
         const s = get();
-        const b = s.boards[boardId];
-        const node = b?.nodes.find((n) => n.id === id);
-        if (!b || !node || node.data.kind !== 'character') return { ok: false, error: 'not-found' };
-        const d = node.data;
-        const base = opts?.baseStateId
-          ? d.states.find((st) => st.id === opts.baseStateId)
-          : activeCharacterState(d);
+        const c = s.characters[characterId];
+        if (!c) return { ok: false, error: 'not-found' };
+        const base = opts?.baseStateId ? c.states.find((st) => st.id === opts.baseStateId) : c.states[0];
         if (!base) return { ok: false, error: 'base-not-found' };
         const rawLabel = opts?.label;
         if (rawLabel !== undefined && !rawLabel.trim()) return { ok: false, error: 'empty-label' };
-        const label = (rawLabel?.trim() || nextStateLabel(d.states)).slice(0, STATE_LABEL_CAP);
-        if (stateLabelTaken(d.states, label)) return { ok: false, error: 'duplicate-label' };
+        const label = (rawLabel?.trim() || nextStateLabel(c.states)).slice(0, STATE_LABEL_CAP);
+        if (stateLabelTaken(c.states, label)) return { ok: false, error: 'duplicate-label' };
         const stateId = newStateId();
         // 复制基准状态的全部属性（含形象/头像引用），再覆盖块中明确写出的字段；
         // image.key 带 nonce，后续换图/重裁会写新 key，不会覆盖或影响基准状态
-        const next: CharacterState = {
-          ...base,
-          ...(opts?.patch ?? {}),
-          id: stateId,
-          label,
-        };
-        const activate = opts?.activate ?? true;
-        set(
-          setBoardNodes(
-            s,
-            boardId,
-            b.nodes.map((n) =>
-              n.id === id && n.data.kind === 'character'
-                ? {
-                    ...n,
-                    data: {
-                      ...n.data,
-                      states: [...n.data.states, next],
-                      activeStateId: activate ? stateId : n.data.activeStateId,
-                    },
-                  }
-                : n,
-            ),
-          ),
-        );
+        const next: CharacterState = { ...base, ...(opts?.patch ?? {}), id: stateId, label };
+        set({ characters: { ...s.characters, [characterId]: { ...c, states: [...c.states, next] } } });
+        // activate：把（目标画布的）放置切到新状态——当前状态按放置独立（C1），只写放置不写库
+        if ((opts?.activate ?? true)) {
+          const st = get();
+          const bid = opts?.activateOnBoardId ?? st.activeBoardId;
+          const b = st.boards[bid];
+          const node = b?.nodes.find((n) => n.data.kind === 'character' && n.data.characterId === characterId);
+          if (node) get().switchCharacterStateOnBoard(bid, node.id, stateId);
+        }
         return { ok: true, stateId };
       },
 
-      updateCharacterStateOnBoard: (boardId, id, patch, stateId) => {
+      updateCharacterState: (characterId, patch, stateId) => {
         const s = get();
-        const b = s.boards[boardId];
-        const node = b?.nodes.find((n) => n.id === id);
-        if (!b || !node || node.data.kind !== 'character') return { ok: false, error: 'not-found' };
-        const targetId = stateId ?? node.data.activeStateId;
-        const target = node.data.states.find((st) => st.id === targetId);
+        const c = s.characters[characterId];
+        if (!c) return { ok: false, error: 'not-found' };
+        const targetId = stateId ?? c.states[0].id;
+        const target = c.states.find((st) => st.id === targetId);
         if (!target) return { ok: false, error: 'not-found' };
         const next: CharacterState = { ...target, ...patch };
         if ('age' in patch) {
@@ -1438,114 +1478,254 @@ export const useStudioStore = create<SimState>()(
           else delete next.image;
         }
         if ('relations' in patch && !patch.relations?.trim()) delete next.relations;
-        set(
-          setBoardNodes(
-            s,
-            boardId,
-            b.nodes.map((n) =>
-              n.id === id && n.data.kind === 'character'
-                ? {
-                    ...n,
-                    data: {
-                      ...n.data,
-                      states: n.data.states.map((st) => (st.id === targetId ? next : st)),
-                    },
-                  }
-                : n,
-            ),
-          ),
-        );
-        // 旧图/旧头像若已不再被任何画布状态引用，才真正删库（跨卷镜像/其它状态共享时保留）
+        set({
+          characters: {
+            ...s.characters,
+            [characterId]: { ...c, states: c.states.map((st) => (st.id === targetId ? next : st)) },
+          },
+        });
+        // 旧图/旧头像若已不再被库中任何状态引用，才真正删库（其它状态/复制为新的人物共享时保留）
         const kept = new Set(collectStateImageKeys(next));
         const released = collectStateImageKeys(target).filter((k) => !kept.has(k));
-        if (released.length) void releaseCharacterImageKeys(released, get().boards);
+        if (released.length) void releaseCharacterImageKeys(released, get().characters);
         return { ok: true, stateId: targetId };
       },
 
-      updateActiveCharacterStateOnBoard: (boardId, id, patch) => {
-        const node = get().boards[boardId]?.nodes.find((n) => n.id === id);
-        if (!node || node.data.kind !== 'character') return { ok: false, error: 'not-found' };
-        return get().updateCharacterStateOnBoard(boardId, id, patch, node.data.activeStateId);
+      updateActiveCharacterState: (characterId, patch) => {
+        const s = get();
+        const board = s.boards[s.activeBoardId];
+        const node = board?.nodes.find((n) => n.data.kind === 'character' && n.data.characterId === characterId);
+        if (!node || node.data.kind !== 'character') return { ok: false, error: 'unplaced' };
+        return get().updateCharacterState(characterId, patch, node.data.activeStateId);
       },
 
-      switchCharacterStateOnBoard: (boardId, id, stateId) => {
+      switchCharacterState: (characterId, stateId) => {
         const s = get();
-        const b = s.boards[boardId];
-        const node = b?.nodes.find((n) => n.id === id);
-        if (!b || !node || node.data.kind !== 'character') return { ok: false, error: 'not-found' };
-        if (!node.data.states.some((st) => st.id === stateId)) return { ok: false, error: 'not-found' };
-        set(
-          setBoardNodes(
-            s,
-            boardId,
-            b.nodes.map((n) =>
-              n.id === id && n.data.kind === 'character' ? { ...n, data: { ...n.data, activeStateId: stateId } } : n,
-            ),
-          ),
-        );
-        return { ok: true, stateId };
+        const board = s.boards[s.activeBoardId];
+        const node = board?.nodes.find((n) => n.data.kind === 'character' && n.data.characterId === characterId);
+        if (!node) return { ok: false, error: 'unplaced' };
+        return get().switchCharacterStateOnBoard(s.activeBoardId, node.id, stateId);
       },
 
-      renameCharacterStateOnBoard: (boardId, id, stateId, label) => {
+      renameCharacterState: (characterId, stateId, label) => {
         const s = get();
-        const b = s.boards[boardId];
-        const node = b?.nodes.find((n) => n.id === id);
-        if (!b || !node || node.data.kind !== 'character') return { ok: false, error: 'not-found' };
-        if (!node.data.states.some((st) => st.id === stateId)) return { ok: false, error: 'not-found' };
+        const c = s.characters[characterId];
+        if (!c) return { ok: false, error: 'not-found' };
+        if (!c.states.some((st) => st.id === stateId)) return { ok: false, error: 'not-found' };
         const nextLabel = label.trim().slice(0, STATE_LABEL_CAP);
         if (!nextLabel) return { ok: false, error: 'empty-label' };
-        if (stateLabelTaken(node.data.states, nextLabel, stateId)) return { ok: false, error: 'duplicate-label' };
+        if (stateLabelTaken(c.states, nextLabel, stateId)) return { ok: false, error: 'duplicate-label' };
+        set({
+          characters: {
+            ...s.characters,
+            [characterId]: { ...c, states: c.states.map((st) => (st.id === stateId ? { ...st, label: nextLabel } : st)) },
+          },
+        });
+        return { ok: true, stateId };
+      },
+
+      deleteCharacterState: (characterId, stateId) => {
+        const s = get();
+        const c = s.characters[characterId];
+        if (!c) return { ok: false, error: 'not-found' };
+        const index = c.states.findIndex((st) => st.id === stateId);
+        if (index < 0) return { ok: false, error: 'not-found' };
+        if (c.states.length <= 1) return { ok: false, error: 'last-state' };
+        if (index === 0) return { ok: false, error: 'protected' }; // 默认状态不可删（可改名）
+        const removed = c.states[index];
+        const states = c.states.filter((st) => st.id !== stateId);
+        // 跨板清扫：所有指向被删状态的放置回落首项（状态删除属于人物库，放置只是引用）
+        let boards: Record<string, SimBoard> | undefined;
+        const nextBoards: Record<string, SimBoard> = {};
+        for (const [bid, b] of Object.entries(s.boards)) {
+          if (!b.nodes.some((n) => n.data.kind === 'character' && n.data.characterId === characterId && n.data.activeStateId === stateId)) {
+            nextBoards[bid] = b;
+            continue;
+          }
+          boards = nextBoards;
+          nextBoards[bid] = {
+            ...b,
+            nodes: b.nodes.map((n) =>
+              n.data.kind === 'character' && n.data.characterId === characterId && n.data.activeStateId === stateId
+                ? { ...n, data: { ...n.data, activeStateId: states[0].id } }
+                : n,
+            ),
+          };
+        }
+        set({ characters: { ...s.characters, [characterId]: { ...c, states } }, ...(boards ? { boards } : {}) });
+        void releaseCharacterImageKeys(collectStateImageKeys(removed), get().characters);
+        return { ok: true, removed };
+      },
+
+      linkPlacement: (boardId, characterId, pos, parentId) => {
+        const s = get();
+        const b = s.boards[boardId];
+        const character = s.characters[characterId];
+        if (!b || !character) return null;
+        // C4 一人一板一个放置：已有放置直接复用
+        const existing = b.nodes.find((n) => n.data.kind === 'character' && n.data.characterId === characterId);
+        if (existing) return existing.id;
+        const placement = makeCharacterPlacement(b, characterId, character.states[0].id, pos, boardId === s.activeBoardId);
+        if (!placement) return null;
+        set(setBoardNodes(s, boardId, placement.nodes));
+        if (parentId) get().reparentNodeOnBoard(boardId, placement.nodeId, parentId);
+        return placement.nodeId;
+      },
+
+      unlinkPlacement: (boardId, nodeId) => {
+        const s = get();
+        const b = s.boards[boardId];
+        if (!b || !b.nodes.some((n) => n.id === nodeId)) return;
+        // 后代提升回根：按删除前的父链换算绝对坐标（towns 删掉不该连房子一起没）
+        const byId = new Map(b.nodes.map((n) => [n.id, n]));
+        const lifted = new Map(
+          b.nodes
+            .filter((n) => n.id !== nodeId && isDescendantOf(n.id, nodeId, byId))
+            .map((n) => [n.id, { ...n, parentId: undefined, position: absPositionOf(n, byId), zIndex: n.data.kind === 'character' ? CHAR_ZINDEX : undefined }]),
+        );
+        set(
+          setBoardNodes(
+            s,
+            boardId,
+            b.nodes.filter((n) => n.id !== nodeId).map((n) => lifted.get(n.id) ?? n),
+            b.edges.filter((e) => e.source !== nodeId && e.target !== nodeId),
+          ),
+        );
+      },
+
+      deleteCharacter: (characterId) => {
+        const s = get();
+        const removed = s.characters[characterId];
+        if (!removed) return;
+        const characters = { ...s.characters };
+        delete characters[characterId];
+        // 移除该人物在全部画布上的放置（C4：一板至多一个；后代照旧提升回根）
+        const boards: Record<string, SimBoard> = {};
+        for (const [bid, b] of Object.entries(s.boards)) {
+          const node = b.nodes.find((n) => n.data.kind === 'character' && n.data.characterId === characterId);
+          if (!node) {
+            boards[bid] = b;
+            continue;
+          }
+          const byId = new Map(b.nodes.map((n) => [n.id, n]));
+          const lifted = new Map(
+            b.nodes
+              .filter((n) => n.id !== node.id && isDescendantOf(n.id, node.id, byId))
+              .map((n) => [n.id, { ...n, parentId: undefined, position: absPositionOf(n, byId), zIndex: n.data.kind === 'character' ? CHAR_ZINDEX : undefined }]),
+          );
+          boards[bid] = {
+            ...b,
+            nodes: b.nodes.filter((n) => n.id !== node.id).map((n) => lifted.get(n.id) ?? n),
+            edges: b.edges.filter((e) => e.source !== node.id && e.target !== node.id),
+          };
+        }
+        set({ characters, boards });
+        // 图片 GC 查库：只有库内再无引用的 key 才真正释放（headshot 缓存经 release 路径失效）
+        void releaseCharacterImageKeys(
+          removed.states.flatMap((st) => collectStateImageKeys(st)),
+          get().characters,
+        );
+      },
+
+      mergeCharacters: (primaryId, otherIds) => {
+        const s = get();
+        const primary = s.characters[primaryId];
+        if (!primary) return;
+        const others = otherIds
+          .map((id) => s.characters[id])
+          .filter((c): c is WorkCharacter => !!c && c.id !== primaryId);
+        if (!others.length) return;
+        // 状态追加：标签冲突追加「（2）」，ID 冲突重映射（快照引用经映射表改写）
+        const usedLabels = new Set(primary.states.map((st) => st.label));
+        const usedIds = new Set(primary.states.map((st) => st.id));
+        const appended: CharacterState[] = [];
+        const stateIdMaps = new Map<string, Record<string, string>>(); // otherId -> 旧状态 id -> 新状态 id
+        for (const o of others) {
+          const map: Record<string, string> = {};
+          for (const st of o.states) {
+            let id = st.id;
+            if (usedIds.has(id)) {
+              id = newStateId();
+              map[st.id] = id;
+            }
+            usedIds.add(id);
+            let label = (st.label.replace(/\s+/g, ' ').trim() || '状态').slice(0, STATE_LABEL_CAP);
+            let n = 2;
+            while (usedLabels.has(label)) {
+              const suffix = `（${n}）`;
+              label = `${label.slice(0, Math.max(1, STATE_LABEL_CAP - suffix.length))}${suffix}`;
+              n++;
+            }
+            usedLabels.add(label);
+            appended.push({ ...st, id, label });
+          }
+          stateIdMaps.set(o.id, map);
+        }
+        const characters: Record<string, WorkCharacter> = {};
+        for (const [id, c] of Object.entries(s.characters)) {
+          if (id === primaryId) characters[id] = { ...c, states: [...c.states, ...appended] };
+          else if (!stateIdMaps.has(id)) characters[id] = c; // others 之外的原样保留
+        }
+        // 放置改写：其余人物的放置指向主人物；同板重复保留首个（C4）
+        const boards: Record<string, SimBoard> = {};
+        for (const [bid, b] of Object.entries(s.boards)) {
+          const hasMerge = b.nodes.some((n) => n.data.kind === 'character' && stateIdMaps.has(n.data.characterId));
+          const hasPrimary = b.nodes.some((n) => n.data.kind === 'character' && n.data.characterId === primaryId);
+          if (!hasMerge) {
+            boards[bid] = b;
+            continue;
+          }
+          const kept: SimNodeType[] = [];
+          let placedSeen = hasPrimary; // 主人物已有放置时，其余放置一律不保留
+          for (const n of b.nodes) {
+            if (n.data.kind === 'character' && (n.data.characterId === primaryId || stateIdMaps.has(n.data.characterId))) {
+              if (placedSeen) continue;
+              placedSeen = true;
+              kept.push({ ...n, data: { ...n.data, characterId: primaryId } });
+              continue;
+            }
+            kept.push(n);
+          }
+          boards[bid] = { ...b, nodes: kept };
+        }
+        // 章节快照引用改写：characterId → 主人物，stateId 经重映射表；同章重复条目保留首个
+        const chapters = s.chapters.map((c) => {
+          const snap = c.snapshot;
+          if (!snap?.entries.some((e) => stateIdMaps.has(e.characterId))) return c;
+          const seen = new Set<string>();
+          const entries = snap.entries.flatMap((e) => {
+            const map = stateIdMaps.get(e.characterId);
+            if (!map) {
+              seen.add(e.characterId);
+              return [e];
+            }
+            if (seen.has(primaryId)) return []; // 主人物条目已存在，重复丢弃
+            seen.add(primaryId);
+            return [{ ...e, characterId: primaryId, stateId: map[e.stateId] ?? e.stateId }];
+          });
+          return { ...c, snapshot: { ...snap, entries, updatedAt: Date.now() } };
+        });
+        set({ characters, boards, chapters });
+      },
+
+      // 唯一保留的 OnBoard 人物写动作：切换放置的当前状态（场景态，按放置独立 C1；stateId 对库校验）
+      switchCharacterStateOnBoard: (boardId, nodeId, stateId) => {
+        const s = get();
+        const b = s.boards[boardId];
+        const node = b?.nodes.find((n) => n.id === nodeId);
+        if (!b || !node || node.data.kind !== 'character') return { ok: false, error: 'not-found' };
+        const character = s.characters[node.data.characterId];
+        if (!character || !characterHasState(character, stateId)) return { ok: false, error: 'not-found' };
         set(
           setBoardNodes(
             s,
             boardId,
             b.nodes.map((n) =>
-              n.id === id && n.data.kind === 'character'
-                ? {
-                    ...n,
-                    data: {
-                      ...n.data,
-                      states: n.data.states.map((st) => (st.id === stateId ? { ...st, label: nextLabel } : st)),
-                    },
-                  }
-                : n,
+              n.id === nodeId && n.data.kind === 'character' ? { ...n, data: { ...n.data, activeStateId: stateId } } : n,
             ),
           ),
         );
         return { ok: true, stateId };
-      },
-
-      deleteCharacterStateOnBoard: (boardId, id, stateId) => {
-        const s = get();
-        const b = s.boards[boardId];
-        const node = b?.nodes.find((n) => n.id === id);
-        if (!b || !node || node.data.kind !== 'character') return { ok: false, error: 'not-found' };
-        const index = node.data.states.findIndex((st) => st.id === stateId);
-        if (index < 0) return { ok: false, error: 'not-found' };
-        if (node.data.states.length <= 1) return { ok: false, error: 'last-state' };
-        if (index === 0) return { ok: false, error: 'protected' }; // 默认状态不可删（可改名）
-        const removed = node.data.states[index];
-        const states = node.data.states.filter((st) => st.id !== stateId);
-        set(
-          setBoardNodes(
-            s,
-            boardId,
-            b.nodes.map((n) =>
-              n.id === id && n.data.kind === 'character'
-                ? {
-                    ...n,
-                    data: {
-                      ...n.data,
-                      states,
-                      activeStateId: n.data.activeStateId === stateId ? states[0].id : n.data.activeStateId,
-                    },
-                  }
-                : n,
-            ),
-          ),
-        );
-        void releaseCharacterImageKeys(collectStateImageKeys(removed), get().boards);
-        return { ok: true, removed };
       },
 
       updateEnvironmentOnBoard: (boardId, id, patch) =>
@@ -1607,30 +1787,8 @@ export const useStudioStore = create<SimState>()(
         set(setBoardNodes(s, boardId, nodes));
       },
 
-      deleteNode: (id) => {
-        const s = get();
-        const b = s.boards[s.activeBoardId];
-        if (!b || !b.nodes.some((n) => n.id === id)) return;
-        const removedNode = b.nodes.find((n) => n.id === id);
-        const removedImageKeys =
-          removedNode?.data.kind === 'character' ? removedNode.data.states.flatMap(collectStateImageKeys) : [];
-        // 后代提升回根：按删除前的父链换算绝对坐标（ towns 删掉不该连房子一起没）
-        const byId = new Map(b.nodes.map((n) => [n.id, n]));
-        const lifted = new Map(
-          b.nodes
-            .filter((n) => n.id !== id && isDescendantOf(n.id, id, byId))
-            .map((n) => [n.id, { ...n, parentId: undefined, position: absPositionOf(n, byId), zIndex: n.data.kind === 'character' ? CHAR_ZINDEX : undefined }]),
-        );
-        set(
-          setBoardNodes(
-            s,
-            s.activeBoardId,
-            b.nodes.filter((n) => n.id !== id).map((n) => lifted.get(n.id) ?? n),
-            b.edges.filter((e) => e.source !== id && e.target !== id),
-          ),
-        );
-        if (removedImageKeys.length) void releaseCharacterImageKeys(removedImageKeys, get().boards);
-      },
+      // 删除节点 = 移除放置/环境节点；人物仍在库中，不触发图片 GC（全局删除只在人物库 UI deleteCharacter）
+      deleteNode: (id) => get().unlinkPlacement(get().activeBoardId, id),
 
       copyNodesToBoard: (opts) => {
         const s = get();
@@ -1639,8 +1797,12 @@ export const useStudioStore = create<SimState>()(
         if (!source) throw new Error('源画布不存在');
         if (!target) throw new Error('目标画布不存在');
         const { targetBoardId, sourceBoardId: _src, switchAfter, selectResult, ...planInput } = opts;
-        const result = planBoardCopy(source, target, planInput);
-        const clean = sanitizeSimNodes(result.nodes, result.edges);
+        const result = planBoardCopy(source, target, planInput, s.characters);
+        // 「复制为新」产生的新人物必须与 boards 同一 set() 落库——否则 sanitize 会把新放置当悬空丢掉
+        const characters = result.newCharacters.length
+          ? { ...s.characters, ...Object.fromEntries(result.newCharacters.map((c) => [c.id, c])) }
+          : s.characters;
+        const clean = sanitizeSimNodes(result.nodes, result.edges, characters);
         const selectedIds = selectResult ? new Set(Object.values(result.idMap)) : null;
         const nodes = selectedIds
           ? clean.nodes.map((n) => (selectedIds.has(n.id) ? { ...n, selected: true } : n))
@@ -1648,22 +1810,26 @@ export const useStudioStore = create<SimState>()(
         const nextBoard: SimBoard = { ...target, nodes, edges: clean.edges };
         set({
           boards: { ...s.boards, [targetBoardId]: nextBoard },
+          ...(characters !== s.characters ? { characters } : {}),
           ...(switchAfter ? { activeBoardId: targetBoardId } : {}),
         });
         return { ...result, nodes, edges: clean.edges };
       },
 
-      // 载入存档/新建作品：整体替换画布与作品状态；rules 等不传 = 保留现值
+      // 载入存档/新建作品：整体替换画布、人物库与作品状态；rules 等不传 = 保留现值
       replaceState: (snap) =>
         set((prev) => {
           const volumes = snap.volumes !== undefined ? sanitizeVolumes(snap.volumes) : prev.volumes;
           const chapters = snap.chapters !== undefined ? sanitizeChapters(snap.chapters) : prev.chapters;
+          // 人物库整体替换（杜绝切作品串库）；缺失视为空库（新建作品/旧快照）
+          const characters = sanitizeCharacters(snap.characters);
           // 区域按章节当前所属画布过滤，所以 chapters 必须先于 boards 清洗
-          const boards = sanitizeBoards(snap.boards, volumes, undefined, chapters);
+          const { boards } = sanitizeBoards(snap.boards, volumes, undefined, chapters, characters);
           const activeBoardId = snap.activeBoardId && boards[snap.activeBoardId] ? snap.activeBoardId : DEFAULT_BOARD_ID;
           return {
             ...prev,
             boards,
+            characters,
             activeBoardId,
             ...(snap.graphName !== undefined ? { graphName: snap.graphName } : {}),
             ...(snap.rules !== undefined ? { rules: rulesText(snap.rules) } : {}),
@@ -1695,7 +1861,10 @@ export const useStudioStore = create<SimState>()(
           .map((r) => active?.nodes.find((n) => n.id === r.id))
           .filter((n): n is SimNodeType => !!n);
         if (!targets.length) return;
-        if (!window.confirm(`删除选中的 ${targets.length} 个节点？（父环境的内部节点将提升回根层）`)) return;
+        // 人物节点删除 = 仅移除放置（人物仍在库中，非破坏性）——免确认；
+        // 环境删除才是破坏性操作（含混合批量时才弹确认）
+        const hasEnv = targets.some((n) => n.data.kind === 'environment');
+        if (hasEnv && !window.confirm(`删除选中的 ${targets.length} 个节点？（父环境的内部节点将提升回根层）`)) return;
         targets.forEach((n) => get().deleteNode(n.id));
       },
       onEdgesChange: (changes) =>
@@ -1707,9 +1876,12 @@ export const useStudioStore = create<SimState>()(
     }),
     {
       name: 'nc2-sim-v1',
-      version: 2,
+      // v3：人物库（characters）。⚠ 升版本必须写 migrate 直通——没有 migrate 时 persist
+      // 会在 merge 之前丢弃整个 payload = 用户丢档（见文件头注释）
+      version: 3,
+      migrate: (s) => s as SimState,
       storage: studioPersistStorage,
-      // 本地恢复后 sanitize 兜底（画布集合/节点/连线/卷/章节）。
+      // 本地恢复后 sanitize 兜底（画布集合/节点/连线/卷/章节/人物库）。
       // 必须放 merge：persist 的 hydrate 在 create() 期间同步执行，onRehydrateStorage 回调里
       // useStudioStore 尚未初始化（TDZ），setState 抛 ReferenceError 且被 persist 静默吞掉
       merge: (persisted, current) => {
@@ -1722,9 +1894,19 @@ export const useStudioStore = create<SimState>()(
         const volumes = sanitizeVolumes(merged.volumes);
         // 区域按章节归属画布过滤，chapters 必须先于 boards 清洗
         const chapters = sanitizeChapters(merged.chapters);
+        // 📇 人物库：v3 直读；v2 旧档无 characters → 从画布节点一次性提取
+        // （characterId=旧 node.id，历史快照/图片 key 天然继续有效；分叉镜像首见保留——用户豁免无迁移向导）
+        const hasLibrary = !!p.characters && typeof p.characters === 'object';
+        const characters = hasLibrary ? sanitizeCharacters(p.characters) : undefined;
         // ⚠ 只能用持久化数据里的 boards：merged 已并入 current 的默认空 boards，
         // 拿它当新格式会把旧档顶层 nodes/edges 当成「已有画布」而丢掉（旧档迁移必须走 legacy 参数）
-        const boards = sanitizeBoards(p.boards, volumes, { nodes: legacyNodes, edges: legacyEdges }, chapters);
+        const { boards, characters: extractedCharacters } = sanitizeBoards(
+          p.boards,
+          volumes,
+          { nodes: legacyNodes, edges: legacyEdges },
+          chapters,
+          characters,
+        );
         const activeBoardId =
           typeof merged.activeBoardId === 'string' && boards[merged.activeBoardId]
             ? merged.activeBoardId
@@ -1734,6 +1916,7 @@ export const useStudioStore = create<SimState>()(
         return {
           ...(merged as unknown as SimState),
           boards,
+          characters: characters ?? extractedCharacters,
           activeBoardId,
           rules: rulesText(merged.rules),
           outlineRules: rulesText(merged.outlineRules),

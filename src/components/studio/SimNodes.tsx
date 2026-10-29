@@ -1,4 +1,4 @@
-/** 创作台节点：🧑 人物（人物卡片：圆形头像+人名+年龄，zIndex 恒顶层）+ 🏗 环境（可缩放容器，RF12 parentId 嵌套层级）。
+/** 创作台节点：🧑 人物（放置卡片：圆形头像+人名+年龄，属性读人物库 v3，zIndex 恒顶层）+ 🏗 环境（可缩放容器，RF12 parentId 嵌套层级）。
  *  节点面上**只展示不输入**：人名/环境名/类型/描述一律在左侧属性面板（SimInspector）编辑——
  *  节点内嵌输入框极易误入输入态、难拖拽（v2.3 用户反馈），现在整面都可拖拽。
  *  环境拖到别的环境节点里即成为其子节点（随父移动），拖出回根层（判定在 StudioPage onNodeDragStop）。
@@ -13,12 +13,12 @@ import {
   ENV_TYPE_LABELS,
   ENV_TYPE_META,
   genderOf,
-  type CharacterData,
   type CharacterGender,
+  type CharacterPlacementData,
   type EnvironmentData,
   type EnvironmentType,
 } from '../../types/sim';
-import { activeCharacterState } from '../../stores/characterStates';
+import { characterActiveState } from '../../stores/characterStates';
 import { characterReferenceSummary, referenceChapterText } from '../../stores/snapshotRefs';
 
 /** 环境类型 → 线性图标（节点标题条用；ENV_TYPE_META.icon 的 emoji 仍供提示词/生成内容使用） */
@@ -38,41 +38,61 @@ export const GENDER_STYLE: Record<CharacterGender, { label: string; capsule: str
   female: { label: '女', capsule: 'border-rose-300/60 bg-rose-500', text: 'text-rose-500', dot: '#f43f5e' },
 };
 
-// ── 人物节点：人物卡片（圆形头像 64×64 + 下方人名+年龄；人名色按性别区分；仅展示，编辑在属性面板；永远浮在环境之上——zIndex 由 store 恒置 CHAR_ZINDEX） ──
+// ── 人物节点：放置卡片（圆形头像 64×64 + 下方人名+年龄；人名/性别/状态读人物库——作品级身份，画布节点只是放置；
+//    永远浮在环境之上——zIndex 由 store 恒置 CHAR_ZINDEX） ──
 
 export function SimCharacterNode({ id, data }: NodeProps) {
-  const d = data as CharacterData;
-  const gender = genderOf(d.gender);
+  const d = data as CharacterPlacementData;
+  // 订阅库记录：人物属性/状态在库中修改时，所有画布的放置同步刷新
+  const character = useStudioStore((s) => s.characters[d.characterId]);
+  const gender = genderOf(character?.gender);
   const g = GENDER_STYLE[gender];
-  const state = activeCharacterState(d);
+  const state = character ? characterActiveState(character, d.activeStateId) : undefined;
+  if (!character || !state) {
+    // 悬空放置理论上被 sanitize 滤除；兜底占位，仍可移除
+    return (
+      <div className="group relative flex min-w-[84px] flex-col items-center rounded-xl px-2 pb-1.5 pt-1.5" data-character-id={d.characterId}>
+        <span className="text-xs text-slate-400">未知人物</span>
+        <button
+          onClick={() => useStudioStore.getState().deleteNode(id)}
+          className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-slate-600 text-white opacity-0 shadow transition hover:bg-rose-500 group-hover:opacity-100"
+          title="移除本放置"
+          aria-label="移除本放置"
+        >
+          <X className="h-3 w-3" />
+        </button>
+      </div>
+    );
+  }
   const ageTxt = typeof state.age === 'number' && Number.isFinite(state.age) && state.age > 0 ? ` ${state.age}` : '';
   return (
-    <div className="group relative flex min-w-[84px] flex-col items-center rounded-xl px-2 pb-1.5 pt-1.5">
+    <div className="group relative flex min-w-[84px] flex-col items-center rounded-xl px-2 pb-1.5 pt-1.5" data-character-id={d.characterId}>
       <CharacterAvatar image={state.image} gender={gender} stateId={state.id} size={64} />
       <span className={`mt-1 max-w-[128px] truncate text-xs font-semibold ${g.text}`}>
-        {d.name || '未命名'}
+        {character.name || '未命名'}
         {ageTxt && <span className="font-normal opacity-80">{ageTxt}</span>}
       </span>
-      {d.states.length > 1 && (
+      {character.states.length > 1 && (
         <span
           className="mt-0.5 max-w-[128px] truncate rounded-full bg-white/85 px-1.5 text-[10px] leading-4 text-slate-500 shadow-sm ring-1 ring-slate-200/70"
-          title={`当前状态：${state.label}（共 ${d.states.length} 个状态）`}
+          title={`当前状态：${state.label}（共 ${character.states.length} 个状态）`}
         >
           {state.label}
         </span>
       )}
       <button
         onClick={() => {
+          // C5：画布删除 = 仅移除放置。人物记录/形象保留在人物库，其它画布放置不受影响
           const s = useStudioStore.getState();
-          const ref = characterReferenceSummary(s.chapters, s.activeBoardId, id);
+          const ref = characterReferenceSummary(s.chapters, d.characterId);
           const impact = ref.count
-            ? `\n\n该人物被 ${ref.count} 章引用：${referenceChapterText(ref, 6)}。删除后这些章节在切回同步前会显示「资料缺失」；章节场景会随画布自动同步。`
+            ? `\n\n该人物被 ${ref.count} 章引用：${referenceChapterText(ref, 6)}；被移除的画布若是某章的工作画布，该章场景会随之自动同步（历史章节保留采集记录）。`
             : '';
-          if (window.confirm(`删除人物「${d.name || '未命名'}」？${impact}`)) s.deleteNode(id);
+          if (window.confirm(`把「${character.name || '未命名'}」从本画布移除？人物与形象保留在人物库，其它画布不受影响。${impact}`)) s.deleteNode(id);
         }}
         className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-slate-600 text-white opacity-0 shadow transition hover:bg-rose-500 group-hover:opacity-100"
-        title="删除本人物"
-        aria-label="删除本人物"
+        title="从本画布移除（人物保留在库）"
+        aria-label="从本画布移除"
       >
         <X className="h-3 w-3" />
       </button>

@@ -1,5 +1,5 @@
-/** 🎬 章节场景自动同步（v2.32）：当前章的名单/位置/父环境/状态跟随画布自动写入快照。
- *  - 只监听画布变化，300ms 合并；切章/保存/生成前由调用方强制同步；
+/** 🎬 章节场景自动同步（v2.32 · v3 人物库）：当前章的名单/位置/父环境/状态跟随画布自动写入快照。
+ *  - 监听画布与人物库变化（人物属性/状态修改也要刷新快照指纹），300ms 合并；切章/保存/生成前由调用方强制同步；
  *  - 只有当前章所属画布正是正在编辑的画布时才自动写，避免把别的卷的画布写进当前章；
  *  - 所有写入仍是内存更新，是否落盘由手动保存决定；
  *  - 切章回放期间 suppress，避免回放后的画布反过来覆盖目标快照。 */
@@ -61,6 +61,7 @@ export function startChapterSceneSync(): void {
   if (started) return;
   started = true;
   useStudioStore.subscribe((state, prev) => {
-    if (state.boards !== prev.boards) schedule();
+    // 人物库变化（属性/状态/形象修改）同样影响快照指纹与名单展示——一并触发
+    if (state.boards !== prev.boards || state.characters !== prev.characters) schedule();
   });
 }

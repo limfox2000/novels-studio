@@ -328,7 +328,7 @@ export function OutlineManager({ onClose }: { onClose: () => void }) {
     const snap = latest?.snapshot;
     const snapBoard = snap ? st.boards[snap.boardId] : undefined;
     const staleText = snap
-      ? snapshotIssueText(snap, snapBoard, snapBoard?.regions.find((r) => r.chapterId === sel.id))
+      ? snapshotIssueText(snap, snapBoard, snapBoard?.regions.find((r) => r.chapterId === sel.id), st.characters)
       : '';
     st.updateChapter(sel.id, { outline: '' });
     st.setOutlineBusy(sel.id);

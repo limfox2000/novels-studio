@@ -1,4 +1,4 @@
-/** 🕒 人物时间轴（P3）：只读展示一个人物在全部章节快照中的出现记录。
+/** 🕒 人物时间轴（P3 · v3 人物库）：只读展示一个人物在全部章节快照中的出现记录。
  *
  *  - 按全局章节顺序（跨卷同样适用）；
  *  - 与上一次出现对比角色/状态/画布/卷变化；
@@ -108,12 +108,13 @@ export function CharacterTimelineDialog({ characterId, onClose }: { characterId:
   const chapters = useStudioStore((s) => s.chapters);
   const boards = useStudioStore((s) => s.boards);
   const volumes = useStudioStore((s) => s.volumes);
+  const characters = useStudioStore((s) => s.characters);
   const rows = useMemo(
-    () => characterTimeline(chapters, boards, volumes, characterId, stateFingerprint),
-    [chapters, boards, volumes, characterId],
+    () => characterTimeline(chapters, boards, volumes, characters, characterId, stateFingerprint),
+    [chapters, boards, volumes, characters, characterId],
   );
-  const live = findCharacterById(boards, characterId);
-  const displayName = live ? (live.data.name || '未命名').trim() : rows[0]?.displayName || '未命名';
+  const live = findCharacterById(characters, characterId);
+  const displayName = live ? (live.name || '未命名').trim() : rows[0]?.displayName || '未命名';
   const missingCount = rows.filter((r) => r.resolution !== 'ok').length;
 
   return (
@@ -144,7 +145,7 @@ export function CharacterTimelineDialog({ characterId, onClose }: { characterId:
         )}
         {live == null && rows.length > 0 && (
           <div className="rounded-[10px] border border-amber-200 bg-amber-50/60 px-3 py-2 text-[11px] leading-relaxed text-amber-800">
-            当前画布上已找不到该人物（或其 ID 不唯一）。时间轴仅显示快照冻结标签，不会猜测补全。
+            该人物已不在人物库中。时间轴仅显示快照冻结标签，不会猜测补全。
           </div>
         )}
       </div>

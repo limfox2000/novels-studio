@@ -1,21 +1,21 @@
-/** 🧬 人物状态纯逻辑（v2.31）：迁移/解析/人物形象 key。
+/** 🧬 人物状态纯逻辑（v3 人物库）：迁移/解析/人物形象 key。
  *  不依赖 store，persist 恢复、存档载入、跨卷复制后的 sanitize 与 UI/引擎共用。
  *
  *  数据约定：
- *  - 人名/性别在 CharacterData 顶层，跨状态稳定；
+ *  - 人名/性别在 WorkCharacter 顶层，跨状态稳定；画布人物节点只是放置（characterId + activeStateId）；
  *  - 其余属性（年龄/基础信息/身份信息/关系信息/人物形象）属于 CharacterState；
- *  - states 至少一项，首项=默认状态「状态0」；activeStateId 决定当前显示/编辑/生成用哪个状态。
+ *  - states 至少一项，首项=默认状态「状态0」；当前状态由放置的 activeStateId 决定（按画布独立）。
  *  - 旧版平铺字段只在「没有可用 states」时迁入状态0；已有 states 时绝不覆盖（避免把用户改过的状态0重置）。
  *  - v2.31 起旧 avatar / portraitKey 不再迁移：形象改为每状态独立的大图 + 手动裁切头像。 */
 import { uid } from '../utils/id';
 import {
   CHARACTER_IMAGE_PRESETS,
   genderOf,
-  type CharacterData,
   type CharacterImageCrop,
   type CharacterImagePreset,
   type CharacterState,
   type CharacterStateImage,
+  type WorkCharacter,
 } from '../types/sim';
 
 export const DEFAULT_STATE_ID = 'state0';
@@ -64,22 +64,22 @@ export function collectStateImageKeys(state: CharacterState): string[] {
   return [image.key, image.headKey].filter((k): k is string => !!k);
 }
 
-/** 当前状态；activeStateId 非法时回落首项（sanitize 后必有一项） */
-export function activeCharacterState(d: CharacterData): CharacterState {
-  return d.states.find((s) => s.id === d.activeStateId) ?? d.states[0];
+/** 人物当前状态：activeStateId（来自放置，按画布独立）非法/缺省时回落首项 */
+export function characterActiveState(c: WorkCharacter, activeStateId?: string): CharacterState {
+  return c.states.find((s) => s.id === activeStateId) ?? c.states[0];
 }
 
-/** 指定状态；缺省=当前；找不到回落首项 */
-export function characterStateOf(d: CharacterData, stateId?: string): CharacterState {
-  return d.states.find((s) => s.id === (stateId ?? d.activeStateId)) ?? d.states[0];
+/** 指定状态；缺省=放置当前状态（activeStateId）；都找不到回落首项 */
+export function characterStateOf(c: WorkCharacter, stateId?: string, activeStateId?: string): CharacterState {
+  return c.states.find((s) => s.id === (stateId ?? activeStateId)) ?? c.states[0];
 }
 
-export function characterStateIndex(d: CharacterData, stateId: string): number {
-  return d.states.findIndex((s) => s.id === stateId);
+export function characterStateIndex(c: WorkCharacter, stateId: string): number {
+  return c.states.findIndex((s) => s.id === stateId);
 }
 
-export function characterHasState(d: CharacterData, stateId: string): boolean {
-  return d.states.some((s) => s.id === stateId);
+export function characterHasState(c: WorkCharacter, stateId: string): boolean {
+  return c.states.some((s) => s.id === stateId);
 }
 
 /** 状态标签是否已被占用（trim 后精确比较；ignoreId 用于重命名自身） */
@@ -170,23 +170,15 @@ function legacyState(raw: Record<string, unknown>): CharacterState {
   };
 }
 
-/** 人物数据兜底（persist / 存档 / 复制共用）：
- *  - 有合法 states：逐项清洗，缺失/重复 ID 与标签确定性修复；
- *  - 无合法 states：旧平铺字段迁入状态0；旧 avatar / 写真一律丢弃；
- *  - activeStateId 非法回落首项；名字/性别始终重建。 */
-export function sanitizeCharacterData(raw: Record<string, unknown>, nodeId: string): CharacterData {
-  const name = pickStr(raw.name);
-  const gender = genderOf(raw.gender);
+/** 从原始数据构建状态数组（恒 ≥1；确定性修复 ID/标签）——sanitizeWorkCharacter 共用 */
+function buildStates(raw: Record<string, unknown>): CharacterState[] {
   const rawStates = Array.isArray(raw.states) ? raw.states : [];
   const entries = rawStates.filter((x): x is Record<string, unknown> => !!x && typeof x === 'object');
-  if (!entries.length) {
-    const state = legacyState(raw);
-    return { kind: 'character', name, gender, states: [state], activeStateId: state.id };
-  }
+  if (!entries.length) return [legacyState(raw)];
 
   const usedIds = new Set<string>();
   const usedLabels = new Set<string>();
-  const states: CharacterState[] = entries.map((s, i) => {
+  return entries.map((s, i) => {
     const age = sanitizeStateAge(s.age);
     const relations = pickStr(s.relations);
     const image = sanitizeCharacterImage(s.image);
@@ -200,28 +192,94 @@ export function sanitizeCharacterData(raw: Record<string, unknown>, nodeId: stri
       ...(image ? { image } : {}),
     };
   });
-  const wanted = pickStr(raw.activeStateId).trim();
-  const activeStateId = states.some((s) => s.id === wanted) ? wanted : states[0].id;
-  return { kind: 'character', name, gender, states, activeStateId };
 }
 
-/** 🆕 新人物种子：空状态0；没有任何图片，画布显示性别剪影 */
-export function initialCharacterData(_nodeId: string): CharacterData {
-  const stateId = DEFAULT_STATE_ID;
+/** 🆕 新人物库记录种子：空状态0，无图片 */
+export function newWorkCharacter(id: string): WorkCharacter {
   return {
-    kind: 'character',
+    id,
     name: '',
     gender: 'male',
     states: [
       {
-        id: stateId,
+        id: DEFAULT_STATE_ID,
         label: DEFAULT_STATE_LABEL,
         basicInfo: '',
         identityInfo: '',
       },
     ],
-    activeStateId: stateId,
   };
+}
+
+/** 人物库记录兜底：状态恒 ≥1（无 states 时旧平铺字段迁入状态0），ID 由调用方决定（此处重建） */
+export function sanitizeWorkCharacter(raw: unknown): WorkCharacter | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  return {
+    id: pickStr(r.id).trim(),
+    name: pickStr(r.name),
+    gender: genderOf(r.gender),
+    states: buildStates(r),
+  };
+}
+
+/** 人物库整体兜底（persist / 存档 / replaceState 共用）：损坏条目丢弃，ID 缺失回落键名 */
+export function sanitizeCharacters(raw: unknown): Record<string, WorkCharacter> {
+  const out: Record<string, WorkCharacter> = {};
+  if (!raw || typeof raw !== 'object') return out;
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const c = sanitizeWorkCharacter(value);
+    if (!c) continue;
+    const id = c.id || key;
+    out[id] = { ...c, id };
+  }
+  return out;
+}
+
+/** 🔁 一次性提取（v2→v3，无迁移向导——用户豁免：无法兼容的旧数据直接丢弃）：
+ *  扫描全部画布的旧格式人物节点（v2.31 带 states / 更早的平铺字段），以 node.id 建立人物库。
+ *  - 同 ID 镜像（跨画布共享 node.id）：首见保留，其后分叉副本静默丢弃（按画布键序×节点序，确定性）；
+ *  - 已是放置形态的节点（data.characterId 存在）跳过——只登记引用，不重复建库；
+ *  - 幂等：v3 数据再跑一遍结果不变（放置节点带 characterId，提取出空库）。 */
+export function extractCharactersFromBoards(boards: unknown): {
+  characters: Record<string, WorkCharacter>;
+  extracted: number;
+} {
+  const characters: Record<string, WorkCharacter> = {};
+  let extracted = 0;
+  if (!boards || typeof boards !== 'object') return { characters, extracted };
+  const boardList: unknown[] = Array.isArray(boards) ? boards : Object.values(boards as Record<string, unknown>);
+  for (const b of boardList) {
+    if (!b || typeof b !== 'object') continue;
+    const nodes = (b as Record<string, unknown>).nodes;
+    if (!Array.isArray(nodes)) continue;
+    for (const n of nodes) {
+      if (!n || typeof n !== 'object') continue;
+      const rec = n as Record<string, unknown>;
+      const data = rec.data;
+      if (!data || typeof data !== 'object') continue;
+      const d = data as Record<string, unknown>;
+      if (d.kind !== 'character') continue;
+      // v3 放置形态（data.characterId 存在）不重复建库；旧格式（带 states 或平铺字段）都提取
+      if (typeof d.characterId === 'string' && d.characterId.trim()) continue;
+      const nodeId = typeof rec.id === 'string' ? rec.id.trim() : '';
+      if (!nodeId || characters[nodeId]) continue;
+      const c = sanitizeWorkCharacter(d);
+      if (!c) continue;
+      characters[nodeId] = { ...c, id: nodeId };
+      extracted += 1;
+    }
+  }
+  return { characters, extracted };
+}
+
+/** 放置 → 人物库记录（characterId 不在库中 = 悬空放置，返回 undefined 由调用方过滤/丢弃） */
+export function placementCharacter(
+  p: { characterId?: unknown },
+  characters: Record<string, WorkCharacter>,
+): WorkCharacter | undefined {
+  const id = p?.characterId;
+  return typeof id === 'string' ? characters[id] : undefined;
 }
 
 /** 新建状态的 ID（首项之外用 uid；调用方负责保证不与现有 ID 冲突） */

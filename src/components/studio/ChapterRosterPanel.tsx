@@ -57,6 +57,7 @@ export function ChapterRosterPanel({ chapter, readonly = false, onRequestClose }
   const chapters = useStudioStore((s) => s.chapters);
   const volumes = useStudioStore((s) => s.volumes);
   const boards = useStudioStore((s) => s.boards);
+  const characters = useStudioStore((s) => s.characters);
   const [open, setOpen] = useState(!readonly);
   const [timelineId, setTimelineId] = useState<string | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -71,8 +72,8 @@ export function ChapterRosterPanel({ chapter, readonly = false, onRequestClose }
     : currentRegion;
   const sourceLabel = sourceBoard ? boardLabel(sourceBoard, volumes) : snap ? `已删除的画布（${snap.boardId}）` : '';
   const stale = useMemo(
-    () => (snap ? snapshotStaleness(snap, sourceBoard, sourceRegion) : null),
-    [snap, sourceBoard, sourceRegion],
+    () => (snap ? snapshotStaleness(snap, sourceBoard, sourceRegion, characters) : null),
+    [snap, sourceBoard, sourceRegion, characters],
   );
   const boardNodes = useMemo(
     () => new Map((sourceBoard?.nodes ?? []).map((n) => [n.id, n])),
@@ -83,10 +84,10 @@ export function ChapterRosterPanel({ chapter, readonly = false, onRequestClose }
     return new Map(
       snap.entries.map((e) => [
         e.characterId,
-        resolveSnapshotEntry(e, snap.boardId, boards, stateFingerprint),
+        resolveSnapshotEntry(e, snap.boardId, boards, characters, stateFingerprint),
       ]),
     );
-  }, [snap, boards]);
+  }, [snap, boards, characters]);
 
   const grouped = useMemo(() => {
     const present: ChapterSnapshotEntry[] = [];
@@ -202,13 +203,13 @@ export function ChapterRosterPanel({ chapter, readonly = false, onRequestClose }
                     <div className="space-y-1">
                       {list.map((e) => {
                         const r = resolved.get(e.characterId);
-                        const node = r?.ok ? r.node : r && !r.ok ? r.node : undefined;
+                        const node = r?.ok ? r.node : undefined;
                         const name = r?.ok ? r.name : e.nameAtCapture;
                         const state = r?.ok ? r.state : undefined;
                         const stateLabel = state?.label ?? e.stateLabelAtCapture;
                         const path =
-                          r?.ok && sourceBoard
-                            ? envPathForCharacter(r.node, boardNodes)
+                          r?.ok && sourceBoard && node
+                            ? envPathForCharacter(node, boardNodes)
                             : e.envPathAtCapture;
                         const missing = r && !r.ok ? r.error : null;
                         const changed = r?.ok ? r.stateChanged : false;
@@ -230,14 +231,8 @@ export function ChapterRosterPanel({ chapter, readonly = false, onRequestClose }
                                   </span>
                                 )}
                                 {missing && (
-                                  <span className="rounded-full bg-rose-100 px-1 text-[9.5px] font-normal text-rose-700" title="快照引用的资料已从画布移除，生成时不会猜测补全">
-                                    {missing === 'missing-state'
-                                      ? '状态缺失'
-                                      : missing === 'missing-character'
-                                        ? '人物缺失'
-                                        : missing === 'ambiguous-character'
-                                          ? '跨卷同名歧义'
-                                          : '来源画布缺失'}
+                                  <span className="rounded-full bg-rose-100 px-1 text-[9.5px] font-normal text-rose-700" title="快照引用的人物/状态已不在人物库，生成时不会猜测补全">
+                                    {missing === 'missing-state' ? '状态缺失' : '人物缺失'}
                                   </span>
                                 )}
                                 {changed && (
