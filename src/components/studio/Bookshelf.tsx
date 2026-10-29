@@ -200,6 +200,11 @@ export function Bookshelf({ onClose }: { onClose: () => void }) {
       ? '清空当前创作台画布，重新开始？当前未保存的改动会丢失。'
       : '清空当前创作台画布，重新开始？（当前内容已在本机留存）';
     if ((nodeCount > 0 || dirty) && !window.confirm(tip)) return;
+    clearLiveWork();
+    onClose();
+  };
+  /** 清空当前作品（画布/人物库/章节/封面），并把空白作品写为本机当前进度（新建与删除作品共用） */
+  const clearLiveWork = () => {
     useStudioStore.getState().replaceState({
       boards: { [DEFAULT_BOARD_ID]: emptyBoard(DEFAULT_BOARD_ID) },
       characters: {},
@@ -216,16 +221,31 @@ export function Bookshelf({ onClose }: { onClose: () => void }) {
     useStudioStore.getState().setGraphName('未命名');
     useUiStore.getState().setActiveChapterId(null);
     persistActiveChapterId(null);
-    // 新建是显式操作：立即把空白作品写为本机当前进度，避免刷新后回到旧作品
+    // 显式清空是明确操作：立即把空白作品写为本机当前进度，避免刷新后回到旧作品
     if (!saveStudioWorkspace()) window.alert('⚠ 空白作品暂未写入本机，请检查浏览器存储空间后手动保存。');
-    onClose();
   };
   const removeArchive = (e: MouseEvent, name: string) => {
     e.stopPropagation();
-    if (window.confirm(`删除存档「${name}」？不可恢复`)) {
-      deleteLocalArchive(name);
-      setItems(listLocalArchives());
+    // 删的是「当前作品」的存档：画布还是这部作品——只删存档会让它立刻变成无删除按钮的实况卡（作品删不掉）
+    const isCurrent = name === graphName;
+    if (
+      !window.confirm(
+        isCurrent
+          ? `删除作品「${name}」？本机存档与当前画布内容一并删除，不可恢复`
+          : `删除存档「${name}」？不可恢复`,
+      )
+    ) {
+      return;
     }
+    deleteLocalArchive(name);
+    if (isCurrent) clearLiveWork();
+    setItems(listLocalArchives());
+  };
+  /** 删除「当前画布」实况卡对应的作品（尚未有同名存档）：清空画布即删除 */
+  const removeLiveWork = (e: MouseEvent) => {
+    e.stopPropagation();
+    if (!window.confirm(`删除作品「${graphName}」？当前画布内容会清空，未保存的改动会丢失，不可恢复`)) return;
+    clearLiveWork();
   };
 
   return (
@@ -295,7 +315,14 @@ export function Bookshelf({ onClose }: { onClose: () => void }) {
             className="flex items-start gap-5 overflow-x-auto px-12 py-10 snap-x [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             {!liveIsArchive && hasLive && (
-              <BookCard name={graphName} subtitle={`当前画布 · ${nodeCount} 节点`} cover={liveCover || undefined} hue={230} onOpen={onClose} />
+              <BookCard
+                name={graphName}
+                subtitle={`当前画布 · ${nodeCount} 节点`}
+                cover={liveCover || undefined}
+                hue={230}
+                onOpen={onClose}
+                onDelete={removeLiveWork}
+              />
             )}
             {items.map((a) => {
               // 当前作品对应的存档卡显示实时封面（含刚移除的空值），其余存档显示各自快照封面
