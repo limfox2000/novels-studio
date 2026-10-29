@@ -9,6 +9,9 @@ import { NodeResizer, type NodeProps } from '@xyflow/react';
 import { BedDouble, Blocks, Building2, DoorOpen, Landmark, Lock, LockOpen, Map, Package, X } from 'lucide-react';
 import { useStudioStore, ENV_MIN_W, ENV_MIN_H } from '../../stores/studioStore';
 import { CharacterAvatar } from './CharacterAvatar';
+import { useSimSessionStore } from '../../stores/simSessionStore';
+import { SIM_BEHAVIOR_LABELS } from '../../engines/simRunner';
+import { SIM_BEHAVIOR_STYLE } from './StageSimBar';
 import {
   ENV_TYPE_LABELS,
   ENV_TYPE_META,
@@ -48,6 +51,8 @@ export function SimCharacterNode({ id, data }: NodeProps) {
   const gender = genderOf(character?.gender);
   const g = GENDER_STYLE[gender];
   const state = character ? characterActiveState(character, d.activeStateId) : undefined;
+  // 🎬 推演中：订阅本放置对应的 actor 行为（无会话/未参演 → undefined，节点外观不变）
+  const simBehavior = useSimSessionStore((s) => s.session?.actors.find((a) => a.nodeId === id)?.behavior);
   if (!character || !state) {
     // 悬空放置理论上被 sanitize 滤除；兜底占位，仍可移除
     return (
@@ -78,6 +83,16 @@ export function SimCharacterNode({ id, data }: NodeProps) {
           title={`当前状态：${state.label}（共 ${character.states.length} 个状态）`}
         >
           {state.label}
+        </span>
+      )}
+      {/* 🎬 推演行为气泡：只在有会话时出现（data-sim-behavior 供 E2E 断言） */}
+      {simBehavior && (
+        <span
+          data-sim-behavior={simBehavior}
+          className={`mt-0.5 whitespace-nowrap rounded-full px-1.5 text-[10px] leading-4 shadow-sm ring-1 ${SIM_BEHAVIOR_STYLE[simBehavior].chip}`}
+          title={`推演行为：${SIM_BEHAVIOR_LABELS[simBehavior]}`}
+        >
+          {SIM_BEHAVIOR_STYLE[simBehavior].icon} {SIM_BEHAVIOR_LABELS[simBehavior]}
         </span>
       )}
       <button

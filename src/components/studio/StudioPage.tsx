@@ -25,9 +25,13 @@ import {
   volumeBoardId,
   DEFAULT_BOARD_ID,
   DEFAULT_BOARD_LABEL,
+  STAGE_BOARD_ID,
+  STAGE_BOARD_LABEL,
   ENV_DEFAULT_W,
   ENV_DEFAULT_H,
 } from '../../stores/studioStore';
+import { useSimSessionStore, pauseSimSession } from '../../stores/simSessionStore';
+import { StageSimBar } from './StageSimBar';
 import { useEditorRoomStore } from '../../stores/editorRoomStore';
 import { useEditorialStore } from '../../stores/editorialStore';
 import { useUiStore } from '../../stores/uiStore';
@@ -88,27 +92,46 @@ const CHAR_NOMINAL_SIZE = { w: 144, h: 104 };
 
 function StudioCanvas() {
   const storeNodes = useActiveNodes();
+  const activeBoard = useActiveBoard();
+  const activeBoardId = useStudioStore((s) => s.activeBoardId);
+  // 🎬 推演：只在舞台画布把会话里的人物坐标**投影**到渲染层——
+  //   绝不写回 boards（画布摆放保持不变；重置/切走即回到原位）。
+  const onStage = activeBoardId === STAGE_BOARD_ID;
+  const simSession = useSimSessionStore((s) => s.session);
+  const actorPos = useMemo(() => {
+    if (!onStage || !simSession) return null;
+    return new Map(simSession.actors.map((a) => [a.nodeId, { x: a.x, y: a.y }]));
+  }, [onStage, simSession]);
   // 环境节点：选中后才可拖动（锁定的除外）。
   // ⚠ React Flow 会给可拖动节点整个加 nopan——未选中环境若可拖动，拖动环境空白处会移动环境而不是平移画布，
   //   章节区域固定在世界坐标 → 看起来像区域和内容脱离。未选中时设为不可拖动，拖动即平移画布；
   //   点击选中后可正常拖动/缩放（缩放手柄也只在这种情况下出现）。
-  const nodes = useMemo(
-    () =>
-      storeNodes.map((n) =>
-        n.data.kind === 'environment'
-          ? { ...n, draggable: n.selected === true && n.data.locked !== true }
-          : n,
-      ),
-    [storeNodes],
-  );
+  // 推演期间整体冻结拖动：人物位置来自会话投影，环境几何是会话建世界时的快照，拖了就对不上。
+  const nodes = useMemo(() => {
+    const byId = new Map(storeNodes.map((n) => [n.id, n]));
+    return storeNodes.map((n) => {
+      if (n.data.kind === 'environment') {
+        return { ...n, draggable: !simSession && n.selected === true && n.data.locked !== true };
+      }
+      const p = actorPos?.get(n.id);
+      if (!p) return simSession ? { ...n, draggable: false } : n;
+      // actor 存绝对坐标；RF 节点位置相对父容器 → 减父链偏移
+      const parent = n.parentId ? byId.get(n.parentId) : undefined;
+      const origin = parent ? absPositionOf(parent, byId) : { x: 0, y: 0 };
+      return { ...n, position: { x: p.x - origin.x, y: p.y - origin.y }, draggable: false };
+    });
+  }, [storeNodes, actorPos, simSession]);
   const edges = useActiveEdges();
-  const activeBoard = useActiveBoard();
-  const activeBoardId = useStudioStore((s) => s.activeBoardId);
   const onNodesChange = useStudioStore((s) => s.onNodesChange);
   const onEdgesChange = useStudioStore((s) => s.onEdgesChange);
   const setBoardViewport = useStudioStore((s) => s.setBoardViewport);
   const regionDrawing = useUiStore((s) => s.regionDrawChapterId !== null);
   useActiveChapterId();
+  // 切离舞台即暂停（会话保留，回来可继续）；离开创作台也停表，避免后台空转
+  useEffect(() => {
+    if (activeBoardId !== STAGE_BOARD_ID) pauseSimSession();
+  }, [activeBoardId]);
+  useEffect(() => () => pauseSimSession(), []);
   // 属性面板开关：用户拍板不随节点点击自动弹出，由顶栏「⚙ 属性」开/关（v2.4）
   const [inspectorOpen, setInspectorOpen] = useState(false);
   // 作品书架：每次进入先见书架（着陆视图）；「打开 / 返回首页」也回到这里
@@ -263,6 +286,7 @@ function StudioCanvas() {
         </div>
       )}
       <SimInspector open={inspectorOpen} onClose={() => setInspectorOpen(false)} />
+      {!shelfOpen && onStage && <StageSimBar />}
       {!shelfOpen && (
         <SimBar inspectorOpen={inspectorOpen} onToggleInspector={() => setInspectorOpen((v) => !v)} onOpenShelf={() => setShelfOpen(true)} />
       )}
@@ -412,7 +436,7 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
     const id = volumeBoardId(v.id);
     return { id, label: v.title || '未命名卷', count: boards[id]?.nodes.length ?? 0 };
   });
-  const knownBoardIds = new Set<string>([DEFAULT_BOARD_ID, ...volumeTabs.map((t) => t.id)]);
+  const knownBoardIds = new Set<string>([DEFAULT_BOARD_ID, STAGE_BOARD_ID, ...volumeTabs.map((t) => t.id)]);
   const orphanBoards = Object.values(boards)
     .filter((b) => !knownBoardIds.has(b.id))
     .map((b) => ({ id: b.id, label: boardLabel(b, volumes), count: b.nodes.length }));
@@ -814,6 +838,22 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
               {DEFAULT_BOARD_LABEL}
               {boards[DEFAULT_BOARD_ID] && (
                 <span className="text-[10px] tabular-nums opacity-70">{boards[DEFAULT_BOARD_ID].nodes.length}</span>
+              )}
+            </button>
+            {/* 🎬 舞台：剧情推演专用画布（固定一张，不参与卷派生；推演只在这里发生） */}
+            <button
+              data-stage-board-tab
+              onClick={() => switchToBoard(STAGE_BOARD_ID)}
+              title="舞台：剧情推演专用画布——放环境与人物，点「开始推演」看人物自主走动/张望/休息（推演不修改画布摆放）"
+              className={`flex h-6 shrink-0 items-center gap-1 rounded-full border px-2.5 text-[12px] transition ${
+                activeBoardId === STAGE_BOARD_ID
+                  ? 'border-brand-500/40 bg-brand-50 font-medium text-brand-700'
+                  : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'
+              }`}
+            >
+              {STAGE_BOARD_LABEL}
+              {boards[STAGE_BOARD_ID] && (
+                <span className="text-[10px] tabular-nums opacity-70">{boards[STAGE_BOARD_ID].nodes.length}</span>
               )}
             </button>
             {volumeTabs.map((t) => (

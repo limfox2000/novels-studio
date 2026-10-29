@@ -254,6 +254,8 @@ export interface ChapterRegion {
  *  `boards` 是节点的唯一权威数据源，React Flow 只渲染 activeBoardId 指向的一张。 */
 export interface SimBoard {
   id: string;
+  /** 🎬 板类型：'stage' = 剧情推演舞台（作品内固定一张，不参与卷派生）；undefined = 默认主画布/卷画布 */
+  kind?: 'stage';
   /** 关联的卷 id；undefined = 默认主画布 */
   volumeId?: string;
   nodes: SimNodeType[];

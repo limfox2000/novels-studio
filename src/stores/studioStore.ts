@@ -49,10 +49,12 @@ import { sameStringList, sanitizeWritingSkillIds } from '../types/writingSkill';
 import { absPositionOf, isDescendantOf, sortParentsFirst } from './graphGeom';
 import {
   DEFAULT_BOARD_ID,
+  STAGE_BOARD_ID,
   emptyBoard,
   nextVolumeTitle,
   normalizeVolumeTitle,
   sanitizeViewport,
+  stageBoard,
   volumeBoardId,
 } from './boardOps';
 import { planBoardCopy, type BoardCopyInput, type BoardCopyResult } from './boardCopy';
@@ -98,9 +100,12 @@ export { absPositionOf, isDescendantOf, sortParentsFirst } from './graphGeom';
 export {
   DEFAULT_BOARD_ID,
   DEFAULT_BOARD_LABEL,
+  STAGE_BOARD_ID,
+  STAGE_BOARD_LABEL,
   boardLabel,
   emptyBoard,
   resolveBoardRef,
+  stageBoard,
   volumeBoardId,
 } from './boardOps';
 export type { BoardCopyConflict, BoardCopyMode, BoardCopyResult } from './boardCopy';
@@ -400,6 +405,7 @@ export function sanitizeBoards(
   const volumeIds = new Set(volumes.map((v) => v.id));
   type RawBoard = {
     id: string;
+    kind?: 'stage';
     volumeId?: string;
     nodes: SimNodeType[];
     edges: Edge[];
@@ -420,6 +426,9 @@ export function sanitizeBoards(
     if (!volumeId && key === DEFAULT_BOARD_ID) key = DEFAULT_BOARD_ID;
     // main 一旦带无效卷 id，按默认画布处理，避免没有默认画布
     if (key === DEFAULT_BOARD_ID) volumeId = undefined;
+    // 🎬 舞台板固定无卷：kind 以 id 为准（旧档若只存了 id 也补上）
+    const kind = key === STAGE_BOARD_ID ? ('stage' as const) : raw.kind;
+    if (kind === 'stage') volumeId = undefined;
     const cur = groups.get(key);
     if (cur) {
       cur.nodes = mergeNodes(cur.nodes, raw.nodes);
@@ -427,9 +436,11 @@ export function sanitizeBoards(
       cur.regions = cur.regions.concat(raw.regions);
       if (cur.viewport === undefined) cur.viewport = raw.viewport;
       if (volumeId) cur.volumeId = volumeId;
+      if (kind) cur.kind = kind;
     } else {
       groups.set(key, {
         id: key,
+        ...(kind ? { kind } : {}),
         ...(volumeId ? { volumeId } : {}),
         nodes: raw.nodes,
         edges: raw.edges,
@@ -476,6 +487,10 @@ export function sanitizeBoards(
     const id = volumeBoardId(v.id);
     if (!groups.has(id)) groups.set(id, { id, volumeId: v.id, nodes: [], edges: [], regions: [] });
   }
+  // 🎬 舞台板恒存在（作品内固定一张，不参与卷派生）：旧档/新作品都补齐空板
+  if (!groups.has(STAGE_BOARD_ID)) {
+    groups.set(STAGE_BOARD_ID, { id: STAGE_BOARD_ID, kind: 'stage', nodes: [], edges: [], regions: [] });
+  }
 
   // 人物库：已有库直接用；否则从原始节点一次性提取（含 legacy 主画布路径）
   let characters: Record<string, WorkCharacter>;
@@ -494,6 +509,7 @@ export function sanitizeBoards(
     const viewport = sanitizeViewport(g.viewport);
     out[id] = {
       id,
+      ...(g.kind ? { kind: g.kind } : {}),
       ...(g.volumeId ? { volumeId: g.volumeId } : {}),
       nodes: s.nodes,
       edges: s.edges,
@@ -887,7 +903,8 @@ function makeCharacterPlacement(
 export const useStudioStore = create<SimState>()(
   persist(
     (set, get) => ({
-      boards: { [DEFAULT_BOARD_ID]: emptyBoard(DEFAULT_BOARD_ID) },
+      // 🎬 初始就带舞台板（sanitizeBoards 也会补；这里让新建作品/刷新前也立即可见）
+      boards: { [DEFAULT_BOARD_ID]: emptyBoard(DEFAULT_BOARD_ID), [STAGE_BOARD_ID]: stageBoard() },
       characters: {},
       activeBoardId: DEFAULT_BOARD_ID,
       graphName: '未命名',

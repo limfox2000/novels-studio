@@ -5,6 +5,9 @@ import type { SimBoard, SimNodeType, SimVolume, SimViewport } from '../types/sim
 
 export const DEFAULT_BOARD_ID = 'main';
 export const DEFAULT_BOARD_LABEL = '默认主画布';
+/** 🎬 剧情推演舞台：作品内固定一张，与默认主画布/卷画布并列；不参与卷派生、不可删除 */
+export const STAGE_BOARD_ID = 'stage';
+export const STAGE_BOARD_LABEL = '🎬 舞台';
 
 /** 卷画布 id 固定派生：一卷一画布，迁移/存档无需额外映射表 */
 export function volumeBoardId(volumeId: string): string {
@@ -21,6 +24,11 @@ export function emptyBoard(id: string, volumeId?: string): SimBoard {
   };
 }
 
+/** 🎬 舞台板：固定 id、无卷；推演只在这里发生（docs/剧情推演模拟器设计.md §4） */
+export function stageBoard(): SimBoard {
+  return { id: STAGE_BOARD_ID, kind: 'stage', nodes: [], edges: [], regions: [] };
+}
+
 /** 卷名归一化：去引号/书名号/首尾空白，内部空白折叠——用于精确匹配与重名判定 */
 export function normalizeVolumeTitle(s: string): string {
   return s
@@ -31,6 +39,7 @@ export function normalizeVolumeTitle(s: string): string {
 
 /** 画布标签：默认主画布 / 卷标题 / 异常数据里的未关联画布 */
 export function boardLabel(board: SimBoard, volumes: SimVolume[]): string {
+  if (board.kind === 'stage' || board.id === STAGE_BOARD_ID) return STAGE_BOARD_LABEL;
   if (!board.volumeId) return DEFAULT_BOARD_LABEL;
   const v = volumes.find((x) => x.id === board.volumeId);
   return v ? v.title || '未命名卷' : `未关联卷的画布（${board.id}）`;
