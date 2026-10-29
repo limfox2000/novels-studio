@@ -1,10 +1,11 @@
-/** 🗂 跨卷复制对话框（v2.29，仅复制）：当前画布选中节点 → 另一张画布（默认主画布/其它卷）。
- *  - 保留 ID 镜像：同一人物/环境在另一卷的镜像；目标已有同 ID 时默认跳过，可改为更新数据（保留目标位置/父子）。
- *  - 复制为新：全部换新 ID，父子/内部连线/人物形象与头像一起重映射，副本独立。
+/** 🗂 跨卷复制对话框（v2.29 · v3 人物库，仅复制）：当前画布选中节点 → 另一张画布（默认主画布/其它卷）。
+ *  - 保留 ID 镜像：同一人物/环境在另一卷的镜像；人物只复制「放置」（共享人物库记录）；
+ *    目标已有同 ID 时默认跳过，可改为更新数据（保留目标位置/父子；人物放置的当前状态是场景态，不覆盖）。
+ *  - 复制为新：全部换新 ID；环境深拷贝；人物生成人物库新记录（新 characterId），形象/头像复制到新 key，副本独立演化。
  *  只写目标画布，默认不切换标签；复制落点=目标画布已保存视口的中心（无视口则原点）。 */
 import { useEffect, useMemo, useState } from 'react';
 import { Copy, Loader2 } from 'lucide-react';
-import type { SimBoard } from '../../types/sim';
+import type { SimBoard, SimNodeType, WorkCharacter } from '../../types/sim';
 import {
   useActiveBoard,
   useStudioStore,
@@ -17,17 +18,17 @@ import { Dialog } from '../ui/Dialog';
 import { Button } from '../ui/Button';
 import { Field, Select } from '../ui/Field';
 
-function nodeLabel(b: SimBoard, id: string): string {
-  const n = b.nodes.find((x) => x.id === id);
-  if (!n) return id;
+/** 节点显示名（冲突/结果列表用；人物名查人物库） */
+function labelOf(n: SimNodeType, characters: Record<string, WorkCharacter>): string {
   return n.data.kind === 'character'
-    ? `人物「${n.data.name || '未命名'}」`
+    ? `人物「${characters[n.data.characterId]?.name || '未命名'}」`
     : `环境「${n.data.name || '未命名'}」`;
 }
 
 export function CopyToVolumeDialog({ onClose }: { onClose: () => void }) {
   const boards = useStudioStore((s) => s.boards);
   const volumes = useStudioStore((s) => s.volumes);
+  const characters = useStudioStore((s) => s.characters);
   const activeBoardId = useStudioStore((s) => s.activeBoardId);
   const source = useActiveBoard();
   const copyNodesToBoard = useStudioStore((s) => s.copyNodesToBoard);
@@ -69,8 +70,8 @@ export function CopyToVolumeDialog({ onClose }: { onClose: () => void }) {
   const target = boards[targetId];
   const conflicts = useMemo(() => {
     if (!target || mode !== 'mirror') return [];
-    return copySet.nodes.filter((n) => target.nodes.some((x) => x.id === n.id)).map((n) => nodeLabel(source!, n.id));
-  }, [copySet.nodes, mode, source, target]);
+    return copySet.nodes.filter((n) => target.nodes.some((x) => x.id === n.id)).map((n) => labelOf(n, characters));
+  }, [copySet.nodes, mode, characters, target]);
 
   const run = async () => {
     if (!source || !target || busy) return;
@@ -132,8 +133,8 @@ export function CopyToVolumeDialog({ onClose }: { onClose: () => void }) {
       subtitle={
         <>
           把<b>{sourceLabel}</b>上选中的 {selectedIds.length} 个节点复制到另一张画布。
-          「保留 ID 镜像」让同一人物/环境在多个卷保持同一身份，目标已有同 ID 时默认跳过冲突节点；
-          「复制为新」生成完全独立的副本。本操作只复制，不会移动或删除源节点。
+          「保留 ID 镜像」让同一人物/环境在多个卷保持同一身份（人物共享人物库记录），目标已有同 ID 时默认跳过冲突节点；
+          「复制为新」生成完全独立的副本（人物会成为人物库中的新记录）。本操作只复制，不会移动或删除源节点。
         </>
       }
       footer={
@@ -235,7 +236,7 @@ export function CopyToVolumeDialog({ onClose }: { onClose: () => void }) {
             {mode === 'mirror' && conflict === 'skip' ? '（将跳过这些节点，继续复制缺失后代）' : ''}
           </span>
         )}
-        {mode === 'new' && <span className="mt-1 block">新 ID 会自动重映射父子关系、内部连线与每个人物状态的形象/头像。</span>}
+        {mode === 'new' && <span className="mt-1 block">新 ID 会自动重映射父子关系、内部连线、人物库新记录与每个人物状态的形象/头像。</span>}
       </div>
 
       {error && <p className="mt-2 rounded-[8px] bg-rose-50 px-3 py-2 text-[12px] text-rose-600">{error}</p>}

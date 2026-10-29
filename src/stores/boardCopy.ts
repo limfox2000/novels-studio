@@ -1,14 +1,17 @@
-/** 跨卷复制纯逻辑（v2.29）：不读写 store，便于独立断言。
+/** 跨卷复制纯逻辑（v2.29 · v3 人物库）：不读写 store，便于独立断言。
  *
- *  两种语义：
- *  - mirror：保留节点 ID，视作同一人物/环境在另一卷的镜像；目标已有同 ID 时按 conflict 更新或跳过。
- *  - new：全部节点换新 ID，父子/内部连线/人物形象与头像一起重映射，成为独立副本。
+ *  两种语义（人物身份=人物库 ID）：
+ *  - mirror：保留节点 ID，视作同一人物/环境在另一卷的镜像；人物只复制「放置」
+ *    （characterId + activeStateId，不复制状态/图片）；目标已有同 ID 时按 conflict 更新或跳过
+ *    （冲突更新只同步环境尺寸，不覆盖目标放置的当前状态——activeStateId 是场景态，按放置独立 C1）。
+ *  - new：全部节点换新 ID；环境深拷贝；人物生成新的人物库记录（新 characterId + 各状态图片 key 重写
+ *    + imageTasks 异步复制字节），成为独立副本。
  *
  *  选择环境时可选带上全部后代；未选中的祖先不会被自动带上：
  *  父在复制集 → 挂到映射后的父；父不在集但目标卷已有同 ID 环境 → 挂入该容器；
  *  否则提升为根层，用源绝对坐标，避免相对坐标落到根层后错位。 */
 import type { Edge } from '@xyflow/react';
-import type { SimBoard, SimNodeType } from '../types/sim';
+import type { SimBoard, SimNodeType, WorkCharacter } from '../types/sim';
 import { uid } from '../utils/id';
 import { newCharacterHeadKey, newCharacterImageKey } from './characterStates';
 import { absPositionOf, sortParentsFirst } from './graphGeom';
@@ -46,6 +49,8 @@ export interface BoardCopyResult {
   idMap: Record<string, string>;
   /** new 模式的人物形象/头像复制任务；由 UI 异步执行，不阻塞节点复制 */
   imageTasks: Array<{ fromKey: string; toKey: string }>;
+  /** new 模式产生的新人物库记录；调用方必须与 boards 同一 set() 落库（否则 sanitize 丢放置） */
+  newCharacters: WorkCharacter[];
 }
 
 const CHAR_Z_INDEX = 100;
@@ -56,9 +61,12 @@ function clone<T>(v: T): T {
   return v === undefined ? v : (JSON.parse(JSON.stringify(v)) as T);
 }
 
-function nodeLabel(n: SimNodeType): string {
+function nodeLabel(n: SimNodeType, characters: Record<string, WorkCharacter>): string {
   const d = n.data;
-  return d.kind === 'character' ? `人物「${d.name || '未命名'}」` : `环境「${d.name || '未命名'}」`;
+  if (d.kind === 'character') {
+    return `人物「${characters[d.characterId]?.name || '未命名'}」`;
+  }
+  return `环境「${d.name || '未命名'}」`;
 }
 
 function nodeBox(n: SimNodeType): { w: number; h: number } {
@@ -96,11 +104,13 @@ export function collectCopySet(
   return { nodes, edges };
 }
 
-/** 跨卷复制规划：返回新的目标画布 nodes/edges（不修改 source/target 入参）。 */
+/** 跨卷复制规划：返回新的目标画布 nodes/edges（不修改 source/target 入参）。
+ *  characters=源人物库（new 模式读取源人物记录建新库记录）。 */
 export function planBoardCopy(
   source: SimBoard,
   target: SimBoard,
   input: BoardCopyInput,
+  characters: Record<string, WorkCharacter> = {},
 ): BoardCopyResult {
   if (source.id === target.id) throw new Error('不能复制到同一张画布');
   const mode = input.mode;
@@ -110,7 +120,6 @@ export function planBoardCopy(
 
   const sourceById = new Map(source.nodes.map((n) => [n.id, n]));
   const sourceOrder = sortParentsFirst(copySet.nodes);
-  const copyIds = new Set(copySet.nodes.map((n) => n.id));
   const targetById = new Map(target.nodes.map((n) => [n.id, n]));
   const working = [...target.nodes];
   const report: BoardCopyReport = {
@@ -125,6 +134,37 @@ export function planBoardCopy(
   const idMap: Record<string, string> = {};
   const inserted = new Set<string>();
   const imageTasks: Array<{ fromKey: string; toKey: string }> = [];
+  const newCharacters: WorkCharacter[] = [];
+  const charIdMap = new Map<string, string>(); // 源 characterId → 新 characterId（new 模式）
+
+  // 0) new 模式：为复制集中的人物先建新库记录（每源人物一条；镜像同 characterId 共享一条新记录）
+  if (mode === 'new') {
+    for (const n of sourceOrder) {
+      if (n.data.kind !== 'character') continue;
+      const src = characters[n.data.characterId];
+      if (!src || charIdMap.has(n.data.characterId)) continue;
+      const newId = uid();
+      charIdMap.set(n.data.characterId, newId);
+      // 复制全部状态（保留 stateId），每个状态的图/头像引用改写到新人物自己的新 key
+      // （继承同一张基准图的多个状态会产生多个目标 key，由 imageTasks 分别复制）
+      const states = src.states.map((s) => {
+        if (!s.image) return { ...s };
+        const key = newCharacterImageKey(newId, s.id);
+        const headKey = s.image.headKey ? newCharacterHeadKey(newId, s.id) : undefined;
+        imageTasks.push({ fromKey: s.image.key, toKey: key });
+        if (s.image.headKey && headKey) imageTasks.push({ fromKey: s.image.headKey, toKey: headKey });
+        return {
+          ...s,
+          image: {
+            ...s.image,
+            key,
+            ...(headKey ? { headKey } : { headKey: undefined }),
+          },
+        };
+      });
+      newCharacters.push({ id: newId, name: src.name, gender: src.gender, states });
+    }
+  }
 
   // 1) 先决定每个节点的目标 id，并处理镜像冲突
   for (const n of sourceOrder) {
@@ -137,27 +177,29 @@ export function planBoardCopy(
     if (!existing) continue;
     if (existing.data.kind !== n.data.kind) {
       report.skipped++;
-      report.conflicts.push(nodeLabel(n));
-      report.warnings.push(`${nodeLabel(n)} 在目标画布同 ID 是另一类节点，已跳过`);
+      report.conflicts.push(nodeLabel(n, characters));
+      report.warnings.push(`${nodeLabel(n, characters)} 在目标画布同 ID 是另一类节点，已跳过`);
       continue;
     }
-    report.conflicts.push(nodeLabel(n));
+    report.conflicts.push(nodeLabel(n, characters));
     if (conflict === 'skip') {
       report.skipped++;
       continue;
     }
-    // 更新：同步数据与环境尺寸；保留目标画布里的位置/父子关系
-    const updated: SimNodeType = {
-      ...existing,
-      data: clone(n.data),
-      ...(n.data.kind === 'environment'
+    // 更新：镜像只同步环境尺寸/数据；人物放置的 activeStateId 是场景态，
+    // 保留目标画布里的当前状态与位置/父子关系（不复制源 activeStateId）
+    const updated: SimNodeType =
+      n.data.kind === 'environment'
         ? {
+            ...existing,
+            data: clone(n.data),
             width: n.width ?? existing.width,
             height: n.height ?? existing.height,
+            zIndex: undefined,
           }
-        : {}),
-      zIndex: n.data.kind === 'character' ? CHAR_Z_INDEX : undefined,
-    };
+        : n.data.kind === 'character' && existing.data.kind === 'character'
+          ? { ...existing, zIndex: CHAR_Z_INDEX } // 同一人物镜像：目标放置已是权威，无需改动数据
+          : existing;
     targetById.set(n.id, updated);
     const idx = working.findIndex((x) => x.id === n.id);
     if (idx >= 0) working[idx] = updated;
@@ -205,27 +247,15 @@ export function planBoardCopy(
       expandParent: _expandParent,
       ...rest
     } = raw;
-    // 复制为新：保留状态的 stateId，但每个状态的图/头像引用改写到新节点自己的新 key
-    // （继承同一张基准图的多个状态会产生多个目标 key，由 imageTasks 分别复制）
-    const data = clone(n.data);
-    if (mode === 'new' && n.data.kind === 'character' && data.kind === 'character') {
-      const srcStates = n.data.states;
-      data.states = data.states.map((s) => {
-        const src = srcStates.find((x) => x.id === s.id);
-        if (!s.image || !src?.image) return s;
-        const key = newCharacterImageKey(mappedId, s.id);
-        const headKey = src.image.headKey ? newCharacterHeadKey(mappedId, s.id) : undefined;
-        imageTasks.push({ fromKey: src.image.key, toKey: key });
-        if (src.image.headKey && headKey) imageTasks.push({ fromKey: src.image.headKey, toKey: headKey });
-        return {
-          ...s,
-          image: {
-            ...s.image,
-            key,
-            ...(headKey ? { headKey } : { headKey: undefined }),
-          },
-        };
-      });
+    // 人物：放置形态落库。mirror 保留 characterId（共享库记录，状态/图片不复制）；
+    // new 指向第 0 步生成的新库记录（activeStateId 沿用源放置——stateId 在复制时保留）
+    let data: SimNodeType['data'];
+    if (n.data.kind === 'character') {
+      const cid =
+        mode === 'new' ? (charIdMap.get(n.data.characterId) ?? n.data.characterId) : n.data.characterId;
+      data = { kind: 'character', characterId: cid, activeStateId: n.data.activeStateId };
+    } else {
+      data = clone(n.data);
     }
     const node: SimNodeType = {
       ...(rest as unknown as SimNodeType),
@@ -296,14 +326,12 @@ export function planBoardCopy(
     report.edgesAdded++;
   }
 
-  // 5) imageTasks 已在第 2 步随新节点 key 一并生成（new 模式由 UI 异步复制字节）；
-  //    mirror 保留 nodeId/stateId 与原 key，共享图片，不产生任务。
-
   return {
     nodes: sortParentsFirst(working),
     edges,
     report,
     idMap,
     imageTasks,
+    newCharacters,
   };
 }

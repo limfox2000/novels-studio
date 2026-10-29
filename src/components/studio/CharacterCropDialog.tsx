@@ -1,4 +1,4 @@
-/** ✂️ 人物头像裁切（v2.31）：在完整形象大图上拖出正方形区域，作为画布圆形头像。
+/** ✂️ 人物头像裁切（v2.31 · v3 人物库）：在完整形象大图上拖出正方形区域，作为画布圆形头像。
  *  - 裁剪框可整体拖动、四角等比缩放；坐标换算为源图像素，保存后生成 256×256 头像写入 IndexedDB。
  *  - 桌面左右布局；移动端上下布局并铺满视口；所有指针操作使用 pointer capture + touch-action:none。 */
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
@@ -50,14 +50,14 @@ function initialCrop(image: CharacterStateImage): CharacterImageCrop {
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 export function CharacterCropDialog({
-  nodeId,
+  characterId,
   stateId,
   stateLabel,
   image,
   fullDataUrl,
   onClose,
 }: {
-  nodeId: string;
+  characterId: string;
   stateId: string;
   stateLabel: string;
   image: CharacterStateImage;
@@ -214,7 +214,7 @@ export function CharacterCropDialog({
     const next: CharacterStateImage = { ...image };
     delete next.headKey;
     delete next.crop;
-    useStudioStore.getState().updateCharacterState(nodeId, { image: next }, stateId);
+    useStudioStore.getState().updateCharacterState(characterId, { image: next }, stateId);
     onClose();
   };
 
@@ -223,8 +223,8 @@ export function CharacterCropDialog({
     setBusy(true);
     setErr('');
     try {
-      const r = await saveHeadshot(nodeId, stateId, image, crop, fullDataUrl);
-      useStudioStore.getState().updateCharacterState(nodeId, { image: r.image }, stateId);
+      const r = await saveHeadshot(characterId, stateId, image, crop, fullDataUrl);
+      useStudioStore.getState().updateCharacterState(characterId, { image: r.image }, stateId);
       onClose();
     } catch (e) {
       setErr(errMsg(e));

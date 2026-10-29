@@ -84,6 +84,7 @@ export function ChapterDiffPanel({ chapter }: { chapter: SimChapter }) {
   const chapters = useStudioStore((s) => s.chapters);
   const boards = useStudioStore((s) => s.boards);
   const volumes = useStudioStore((s) => s.volumes);
+  const characters = useStudioStore((s) => s.characters);
   const [open, setOpen] = useState(false);
 
   // 切章时收起，避免沿用上一章的展开状态遮蔽新章节空态
@@ -101,17 +102,17 @@ export function ChapterDiffPanel({ chapter }: { chapter: SimChapter }) {
   );
   const changedRows = rows.length;
 
-  // 每侧条目是否在当前画布可解析（只影响标签展示，仍显示冻结名称）
+  // 每侧条目是否可解析（人物库直查；只影响标签展示，仍显示冻结名称）
   const missingIds = (snap: NonNullable<typeof curr>) => {
     const set = new Set<string>();
     for (const e of snap.entries) {
-      const r = resolveSnapshotEntry(e, snap.boardId, boards, stateFingerprint);
+      const r = resolveSnapshotEntry(e, snap.boardId, boards, characters, stateFingerprint);
       if (!r.ok) set.add(e.characterId);
     }
     return set;
   };
-  const prevMissing = useMemo(() => (prevSnap ? missingIds(prevSnap) : new Set<string>()), [prevSnap, boards]);
-  const currMissing = useMemo(() => (curr ? missingIds(curr) : new Set<string>()), [curr, boards]);
+  const prevMissing = useMemo(() => (prevSnap ? missingIds(prevSnap) : new Set<string>()), [prevSnap, boards, characters]);
+  const currMissing = useMemo(() => (curr ? missingIds(curr) : new Set<string>()), [curr, boards, characters]);
 
   const prevLabel = prevSnap ? (boards[prevSnap.boardId] ? boardLabel(boards[prevSnap.boardId], volumes) : `已删除的画布（${prevSnap.boardId}）`) : '';
   const currLabel = curr ? (boards[curr.boardId] ? boardLabel(boards[curr.boardId], volumes) : `已删除的画布（${curr.boardId}）`) : '';

@@ -19,11 +19,11 @@ import {
   ENV_DEFAULT_W,
   ENV_DEFAULT_H,
 } from '../../stores/studioStore';
-import { ENV_TYPE_LABELS, isContainerEnv, type EnvironmentData, type SimNodeType } from '../../types/sim';
+import { ENV_TYPE_LABELS, isContainerEnv, type EnvironmentData, type SimBoard, type SimNodeType, type WorkCharacter } from '../../types/sim';
 import { useUiStore } from '../../stores/uiStore';
 import { REASONING_EFFORT_LABEL } from '../../shared/qwenClient';
 import { genImage, type EditorRoomBlock, type EditorStateBlock, type ResponsibleEditor, type SimBlock, type SimImageBlock, type SimPlanBlock, type SimVolumeBlock } from '../../engines/studioEngine';
-import { activeCharacterState, characterStateIndex, DEFAULT_STATE_ID } from '../../stores/characterStates';
+import { characterActiveState, characterStateIndex, DEFAULT_STATE_ID } from '../../stores/characterStates';
 import { referenceChapterText, stateReferenceSummary } from '../../stores/snapshotRefs';
 import { SimWriteButtons } from './SimWriteButtons';
 import { localImgGet, localImgSaveFromUrl } from '../../services/localImages';
@@ -156,9 +156,21 @@ function findEnvByRef(nodes: SimNodeType[], ref: string | undefined): EnvNode[] 
 
 /** 更新目标下拉的展示名：同名环境用「所在环境」区分 */
 function nodeOptionLabel(n: SimNodeType, nodes: SimNodeType[]): string {
-  const name = n.data.name || '未命名';
+  const name = (n.data.kind === 'environment' ? n.data.name : '') || '未命名';
   const parent = n.parentId ? nodes.find((x) => x.id === n.parentId) : undefined;
   return parent && parent.data.kind === 'environment' ? `${name}（在${parent.data.name || '未命名'}内）` : name;
+}
+
+/** 库级同名人物下拉的展示名：性别/状态数/放置情况区分同名不同人 */
+function charOptionLabel(c: WorkCharacter, boards: Record<string, SimBoard>): string {
+  const name = c.name || '未命名';
+  const placed = Object.values(boards).filter((b) =>
+    b.nodes.some((x) => x.data.kind === 'character' && x.data.characterId === c.id),
+  ).length;
+  const bits = [c.gender === 'female' ? '女' : '男'];
+  if (c.states.length > 1) bits.push(`${c.states.length}个状态`);
+  bits.push(placed ? `${placed}处放置` : '未放置');
+  return `${name}（${bits.join('·')}）`;
 }
 
 function fmtK(n: number): string {
@@ -331,6 +343,7 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
   const reactFlow = useReactFlow();
   const boards = useStudioStore((s) => s.boards);
   const volumes = useStudioStore((s) => s.volumes);
+  const characters = useStudioStore((s) => s.characters);
   const activeBoardId = useStudioStore((s) => s.activeBoardId);
   const nodes = useStudioStore((s) => s.boards[s.activeBoardId]?.nodes) ?? NO_NODES;
   if (!msg.blocks?.length) return null;
@@ -382,30 +395,26 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
       return;
     }
     const board = rb.board;
-    const boardNodes = board.nodes;
     const st = useStudioStore.getState();
     const size = b.kind === 'character' ? CHAR_NOMINAL_SIZE : { w: ENV_DEFAULT_W, h: ENV_DEFAULT_H };
     // 📍「所在」：按名字/层级路径在目标画布定位父环境 → 容器内排位，创建后挂为其子节点（容器不够大则自动扩展）
-    const parentHits = b.parent ? findEnvByRef(boardNodes, b.parent) : [];
+    const parentHits = b.parent ? findEnvByRef(board.nodes, b.parent) : [];
     const parentNode = parentHits.length === 1 ? parentHits[0] : undefined;
-    const childSpot = parentNode ? findChildDropPosition(boardNodes, parentNode.id, size) : undefined;
+    const childSpot = parentNode ? findChildDropPosition(board.nodes, parentNode.id, size) : undefined;
     const pos = childSpot?.pos ?? dropPos(size, board);
     const select = board.id === activeBoardId;
-    const id =
-      b.kind === 'character'
-        ? st.createCharacterOnBoard(board.id, pos, { select })
-        : st.createEnvironmentOnBoard(board.id, pos, undefined, { select });
-    if (!id) {
-      setDoneMsg('⚠ 目标画布不存在，未落地');
-      return;
-    }
     if (b.kind === 'character') {
-      const gender = b.gender ?? 'male';
-      st.updateCharacterOnBoard(board.id, id, { name: b.name, gender });
-      // 新建人物固定先写默认状态「状态0」；新人物没有形象，画布显示性别剪影
-      st.updateCharacterStateOnBoard(
-        board.id,
-        id,
+      // 📇 v3 人物库：创建=建库记录（姓名/性别随建）+放置到「卷」画布；返回人物库 ID
+      const characterId = st.createCharacter({
+        name: b.name,
+        gender: b.gender ?? 'male',
+        placeOnBoardId: board.id,
+        pos,
+        select,
+      });
+      // 新建人物固定先写默认状态「状态0」（库级写入）；新人物没有形象，画布显示性别剪影
+      st.updateCharacterState(
+        characterId,
         {
           ...(b.age ? { age: b.age } : {}),
           basicInfo: b.basicInfo ?? '',
@@ -414,7 +423,35 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
         },
         DEFAULT_STATE_ID,
       );
-    } else st.updateEnvironmentOnBoard(board.id, id, { name: b.name, desc: b.desc ?? '', etype: b.etype ?? 'building' });
+      // 挂父环境：createCharacter 返回库 ID，放置节点要在最新画布里按 characterId 找回
+      const latest = useStudioStore.getState().boards[board.id]?.nodes ?? [];
+      const nodeId = latest.find((n) => n.data.kind === 'character' && n.data.characterId === characterId)?.id;
+      if (nodeId) {
+        if (parentNode) {
+          st.reparentNodeOnBoard(board.id, nodeId, parentNode.id);
+          if (childSpot?.grow) st.resizeEnvironmentOnBoard(board.id, parentNode.id, childSpot.grow.w, childSpot.grow.h);
+        } else {
+          const container = findContainerAt(latest, pos.x + size.w / 2, pos.y + size.h / 2, nodeId);
+          if (container) st.reparentNodeOnBoard(board.id, nodeId, container.id);
+        }
+      }
+      setDropped((prev) => new Set(prev).add(i));
+      // 明确反馈落点：在指定环境内创建成功 / 所在环境没唯一找到（退回视口落点）
+      const inParent =
+        parentNode
+          ? `，已创建在${ENV_TYPE_LABELS[parentNode.data.etype]}「${parentNode.data.name || '未命名'}」内`
+          : b.parent && parentHits.length !== 1
+            ? `（所在环境「${b.parent}」${parentHits.length > 1 ? '有多处同名' : '未找到'}，已按视口落点创建）`
+            : '';
+      setDoneMsg(`✓ 人物「${b.name}」已建入人物库并落到画布${inParent}${boardSuffix(board, rb.label)}`);
+      return;
+    }
+    const id = st.createEnvironmentOnBoard(board.id, pos, undefined, { select });
+    if (!id) {
+      setDoneMsg('⚠ 目标画布不存在，未落地');
+      return;
+    }
+    st.updateEnvironmentOnBoard(board.id, id, { name: b.name, desc: b.desc ?? '', etype: b.etype ?? 'building' });
     if (parentNode) {
       st.reparentNodeOnBoard(board.id, id, parentNode.id);
       if (childSpot?.grow) st.resizeEnvironmentOnBoard(board.id, parentNode.id, childSpot.grow.w, childSpot.grow.h);
@@ -431,15 +468,12 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
         : b.parent && parentHits.length !== 1
           ? `（所在环境「${b.parent}」${parentHits.length > 1 ? '有多处同名' : '未找到'}，已按视口落点创建）`
           : '';
-    setDoneMsg(
-      (b.kind === 'character'
-        ? `✓ 人物「${b.name}」已落为画布节点${inParent}`
-        : `✓ 环境「${b.name}」已落为画布节点${inParent}`) + boardSuffix(board, rb.label),
-    );
+    setDoneMsg(`✓ 环境「${b.name}」已落为画布节点${inParent}` + boardSuffix(board, rb.label));
   };
 
-  // ✏️ 更新已有节点：只覆盖块里写出的字段，未写字段保留原值（改名时「名字」写新名，target 仍是原名）
-  const updateExisting = (b: EditorRoomBlock, i: number, node: SimNodeType) => {
+  // ✏️ 更新已有目标：人物=人物库记录（身份写库，全部画布放置同步生效）；环境=目标画布节点。
+  // 只覆盖块里写出的字段，未写字段保留原值（改名时「名字」写新名，target 仍是原名）
+  const updateExisting = (b: EditorRoomBlock, i: number, target: SimNodeType | WorkCharacter) => {
     setDoneMsg('');
     const rb = resolveBlockBoard(b);
     if ('error' in rb) {
@@ -448,36 +482,69 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
     }
     const board = rb.board;
     const st = useStudioStore.getState();
-    const oldName = node.data.name || '未命名';
-    // 名字同样按归一化比较：仅书写差异（空格/引号）不算改名，避免「同名修改」把节点名改掉
-    const newName = b.name && b.name !== '未命名' && normNodeName(b.name) !== normNodeName(oldName) ? b.name : '';
-    if (b.kind === 'character' && node.data.kind === 'character') {
-      st.updateCharacterOnBoard(board.id, node.id, {
+    if (b.kind === 'character' && 'states' in target) {
+      const character = target;
+      const characterId = character.id;
+      const oldName = character.name || '未命名';
+      // 名字同样按归一化比较：仅书写差异（空格/引号）不算改名，避免「同名修改」把人物名改掉
+      const newName = b.name && b.name !== '未命名' && normNodeName(b.name) !== normNodeName(oldName) ? b.name : '';
+      st.updateCharacter(characterId, {
         ...(newName ? { name: newName } : {}),
         ...(b.gender ? { gender: b.gender } : {}),
       });
-      // 旧【人物设定】块只改**当前状态**；要改指定状态必须用【人物状态】
-      st.updateActiveCharacterStateOnBoard(board.id, node.id, {
-        ...(b.age ? { age: b.age } : {}),
-        ...(b.basicInfo?.trim() ? { basicInfo: b.basicInfo } : {}),
-        ...(b.identityInfo?.trim() ? { identityInfo: b.identityInfo } : {}),
-        ...(b.relations?.trim() ? { relations: b.relations } : {}),
-      });
-    } else if (b.kind === 'environment' && node.data.kind === 'environment') {
-      st.updateEnvironmentOnBoard(board.id, node.id, {
-        ...(newName ? { name: newName } : {}),
-        ...(b.etype ? { etype: b.etype } : {}),
-        ...(b.desc?.trim() ? { desc: b.desc } : {}),
-      });
-    } else return;
+      // 旧【人物设定】块只改**当前状态**；要改指定状态必须用【人物状态】。
+      // 「当前状态」=目标画布放置正在显示的状态（C1）；未放置到该画布 → 默认（首项）状态，绝不猜测挑其它状态。
+      const placement = board.nodes.find((n) => n.data.kind === 'character' && n.data.characterId === characterId);
+      const activeState = characterActiveState(
+        character,
+        placement && placement.data.kind === 'character' ? placement.data.activeStateId : undefined,
+      );
+      st.updateCharacterState(
+        characterId,
+        {
+          ...(b.age ? { age: b.age } : {}),
+          ...(b.basicInfo?.trim() ? { basicInfo: b.basicInfo } : {}),
+          ...(b.identityInfo?.trim() ? { identityInfo: b.identityInfo } : {}),
+          ...(b.relations?.trim() ? { relations: b.relations } : {}),
+        },
+        activeState.id,
+      );
+      // 📍「所在」也用于修改：人物已放置在本画布时移入指定环境（重新定父级；目标环境须唯一）
+      let moved = '';
+      if (b.parent && placement) {
+        const hits = findEnvByRef(board.nodes, b.parent);
+        const targetEnv = hits.length === 1 ? hits[0] : undefined;
+        if (targetEnv && targetEnv.id !== placement.id) {
+          st.reparentNodeOnBoard(board.id, placement.id, targetEnv.id);
+          moved = `，已移入${ENV_TYPE_LABELS[targetEnv.data.etype]}「${targetEnv.data.name || '未命名'}」`;
+        } else if (hits.length !== 1) {
+          moved = `（所在环境「${b.parent}」${hits.length > 1 ? '有多处同名' : '未找到'}，未移动归属）`;
+        }
+      }
+      setDropped((prev) => new Set(prev).add(i));
+      const renamed = newName ? ` → 「${newName}」` : '';
+      setDoneMsg(
+        `✓ 已更新人物库人物「${oldName}」${renamed}${moved}` + boardSuffix(board, rb.label),
+      );
+      return;
+    }
+    const node = target as SimNodeType;
+    if (node.data.kind !== 'environment') return;
+    const oldName = node.data.name || '未命名';
+    const newName = b.name && b.name !== '未命名' && normNodeName(b.name) !== normNodeName(oldName) ? b.name : '';
+    st.updateEnvironmentOnBoard(board.id, node.id, {
+      ...(newName ? { name: newName } : {}),
+      ...(b.etype ? { etype: b.etype } : {}),
+      ...(b.desc?.trim() ? { desc: b.desc } : {}),
+    });
     // 📍「所在」也用于修改：把节点移入指定环境（重新定父级；目标环境须唯一）
     let moved = '';
     if (b.parent) {
       const hits = findEnvByRef(board.nodes, b.parent);
-      const target = hits.length === 1 ? hits[0] : undefined;
-      if (target && target.id !== node.id) {
-        st.reparentNodeOnBoard(board.id, node.id, target.id);
-        moved = `，已移入${ENV_TYPE_LABELS[target.data.etype]}「${target.data.name || '未命名'}」`;
+      const targetEnv = hits.length === 1 ? hits[0] : undefined;
+      if (targetEnv && targetEnv.id !== node.id) {
+        st.reparentNodeOnBoard(board.id, node.id, targetEnv.id);
+        moved = `，已移入${ENV_TYPE_LABELS[targetEnv.data.etype]}「${targetEnv.data.name || '未命名'}」`;
       } else if (hits.length !== 1) {
         moved = `（所在环境「${b.parent}」${hits.length > 1 ? '有多处同名' : '未找到'}，未移动归属）`;
       }
@@ -485,12 +552,12 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
     setDropped((prev) => new Set(prev).add(i));
     const renamed = newName ? ` → 「${newName}」` : '';
     setDoneMsg(
-      `✓ 已更新${b.kind === 'character' ? '人物' : '环境'}「${oldName}」${renamed}${moved}` +
-        boardSuffix(board, rb.label),
+      `✓ 已更新环境「${oldName}」${renamed}${moved}` + boardSuffix(board, rb.label),
     );
   };
 
-  // 🧬 人物状态块落地：只操作目标画布上按名唯一匹配的已有人物（绝不创建人物；找不到/重名就禁用）
+  // 🧬 人物状态块落地：只操作**作品人物库**中按名唯一匹配的人物（绝不创建人物；找不到/重名就禁用）。
+  // 状态五操作走库（写库，该人物全部画布放置同步生效）；仅「切换」写目标画布放置（当前状态按放置独立 C1）。
   const dropState = (b: EditorStateBlock, i: number) => {
     setDoneMsg('');
     if (b.parseError) {
@@ -505,16 +572,16 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
     const board = rb.board;
     const st = useStudioStore.getState();
     const key = normNodeName(b.character);
-    const hits = key ? board.nodes.filter((n) => n.data.kind === 'character' && normNodeName(n.data.name) === key) : [];
+    const chars = Object.values(st.characters);
+    const hits = key ? chars.filter((c) => normNodeName(c.name) === key) : [];
     if (hits.length !== 1) {
       setDoneMsg(
-        `⚠ ${hits.length > 1 ? '目标画布有多个同名人物' : '目标画布上未找到该人物'}「${b.character}」，未落地`,
+        `⚠ ${hits.length > 1 ? '作品人物库有多个同名人物' : '作品人物库未找到该人物'}「${b.character}」，未落地`,
       );
       return;
     }
-    const node = hits[0];
-    if (node.data.kind !== 'character') return;
-    const d = node.data;
+    const character = hits[0];
+    const characterId = character.id;
     const err = (code: string) =>
       ({
         'not-found': '人物或状态不存在',
@@ -523,6 +590,7 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
         'duplicate-label': '人物内已有同名状态',
         protected: '默认状态（首项）不可删除',
         'last-state': '人物至少保留一个状态',
+        unplaced: '该人物未放置在目标画布，无法切换其当前状态',
       })[code] || code;
     const opErr = (r: { ok: true } | { ok: false; error: string }): string => (r.ok ? '' : err(r.error));
     const patch = {
@@ -531,19 +599,25 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
       ...(b.identityInfo !== undefined ? { identityInfo: b.identityInfo } : {}),
       ...(b.relations !== undefined ? { relations: b.relations } : {}),
     };
-    const target = b.state ? d.states.find((s) => s.label === b.state) : undefined;
-    // R5：状态块落地前提示引用影响（只提示，不阻止）
+    const target = b.state ? character.states.find((s) => s.label === b.state) : undefined;
+    // 「当前状态」=目标画布放置正在显示的状态（C1）；未放置到该画布 → 默认（首项）状态
+    const placement = board.nodes.find((n) => n.data.kind === 'character' && n.data.characterId === characterId);
+    const activeOnBoard = characterActiveState(
+      character,
+      placement && placement.data.kind === 'character' ? placement.data.activeStateId : undefined,
+    );
+    // R5：状态块落地前提示引用影响（引用全局按人物；只提示，不阻止）
     const impactTarget =
-      b.action === 'update' ? (target ?? activeCharacterState(d))
+      b.action === 'update' ? (target ?? activeOnBoard)
       : b.action === 'rename' || b.action === 'delete' ? target
       : undefined;
-    const impact = impactTarget ? stateReferenceSummary(st.chapters, board.id, node.id, impactTarget.id) : null;
+    const impact = impactTarget ? stateReferenceSummary(st.chapters, characterId, impactTarget.id) : null;
     const impactText = impact?.count
       ? `\n\n该状态被 ${impact.count} 章引用：${referenceChapterText(impact, 6)}。${b.action === 'delete' ? '删除后这些章节在切回同步前会显示「资料缺失」' : '原地修改会改变这些历史章节的生成内容'}；章节场景会随画布自动同步。`
       : '';
     if (impactText && (b.action === 'update' || b.action === 'rename')) {
       const verb = b.action === 'update' ? '修改' : '重命名';
-      if (!window.confirm(`将${verb}人物「${d.name || '未命名'}」的状态「${impactTarget!.label}」？${impactText}`)) return;
+      if (!window.confirm(`将${verb}人物「${character.name || '未命名'}」的状态「${impactTarget!.label}」？${impactText}`)) return;
     }
     let ok = false;
     let msg = '';
@@ -553,79 +627,84 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
         setDoneMsg('⚠ 新建状态缺少状态名，未落地');
         return;
       }
-      if (d.states.some((s) => s.label === label)) {
-        setDoneMsg(`⚠ 人物「${d.name || '未命名'}」已有状态「${label}」，未落地`);
+      if (character.states.some((s) => s.label === label)) {
+        setDoneMsg(`⚠ 人物「${character.name || '未命名'}」已有状态「${label}」，未落地`);
         return;
       }
-      const base = b.baseState ? d.states.find((s) => s.label === b.baseState) : activeCharacterState(d);
+      const base = b.baseState ? character.states.find((s) => s.label === b.baseState) : activeOnBoard;
       if (!base) {
         setDoneMsg(`⚠ 基准状态「${b.baseState}」不存在，未落地`);
         return;
       }
-      const r = st.addCharacterStateOnBoard(board.id, node.id, {
+      const r = st.addCharacterState(characterId, {
         label,
         baseStateId: base.id,
         patch,
         activate: true,
+        activateOnBoardId: board.id,
       });
       ok = r.ok;
       msg = ok
-        ? `✓ 人物「${d.name || '未命名'}」新建状态「${label}」（复制自「${base.label}」），已切换为当前状态`
+        ? `✓ 人物「${character.name || '未命名'}」新建状态「${label}」（复制自「${base.label}」）${placement ? '，目标画布已切换为当前状态' : ''}`
         : `⚠ 未新建状态：${opErr(r)}`;
     } else if (b.action === 'update') {
-      const targetState = target ?? activeCharacterState(d);
+      const targetState = target ?? activeOnBoard;
       if (b.state && !target) {
-        setDoneMsg(`⚠ 人物「${d.name || '未命名'}」没有状态「${b.state}」，未落地`);
+        setDoneMsg(`⚠ 人物「${character.name || '未命名'}」没有状态「${b.state}」，未落地`);
         return;
       }
-      const r = st.updateCharacterStateOnBoard(board.id, node.id, patch, targetState.id);
+      const r = st.updateCharacterState(characterId, patch, targetState.id);
       ok = r.ok;
       msg = ok
-        ? `✓ 已更新人物「${d.name || '未命名'}」状态「${targetState.label}」`
+        ? `✓ 已更新人物「${character.name || '未命名'}」状态「${targetState.label}」（库级，全部画布生效）`
         : `⚠ 未更新状态：${opErr(r)}`;
     } else if (b.action === 'switch') {
       if (!target) {
-        setDoneMsg(`⚠ 人物「${d.name || '未命名'}」没有状态「${b.state}」，未落地`);
+        setDoneMsg(`⚠ 人物「${character.name || '未命名'}」没有状态「${b.state}」，未落地`);
         return;
       }
-      const r = st.switchCharacterStateOnBoard(board.id, node.id, target.id);
+      if (!placement || placement.data.kind !== 'character') {
+        setDoneMsg(`⚠ 人物「${character.name || '未命名'}」未放置在「${rb.label}」画布，无法切换其当前状态（切换按画布放置生效）`);
+        return;
+      }
+      const r = st.switchCharacterStateOnBoard(board.id, placement.id, target.id);
       ok = r.ok;
       msg = ok
-        ? `✓ 已切换人物「${d.name || '未命名'}」到状态「${target.label}」`
+        ? `✓ 已切换人物「${character.name || '未命名'}」到状态「${target.label}」（${rb.label} 画布）`
         : `⚠ 未切换状态：${opErr(r)}`;
     } else if (b.action === 'rename') {
       if (!target) {
-        setDoneMsg(`⚠ 人物「${d.name || '未命名'}」没有状态「${b.state}」，未落地`);
+        setDoneMsg(`⚠ 人物「${character.name || '未命名'}」没有状态「${b.state}」，未落地`);
         return;
       }
       if (!b.newLabel) {
         setDoneMsg('⚠ 重命名缺少新状态名，未落地');
         return;
       }
-      if (d.states.some((s) => s.id !== target.id && s.label === b.newLabel)) {
-        setDoneMsg(`⚠ 人物「${d.name || '未命名'}」已有状态「${b.newLabel}」，未落地`);
+      if (character.states.some((s) => s.id !== target.id && s.label === b.newLabel)) {
+        setDoneMsg(`⚠ 人物「${character.name || '未命名'}」已有状态「${b.newLabel}」，未落地`);
         return;
       }
-      const r = st.renameCharacterStateOnBoard(board.id, node.id, target.id, b.newLabel);
+      const r = st.renameCharacterState(characterId, target.id, b.newLabel);
       ok = r.ok;
       msg = ok
-        ? `✓ 已将人物「${d.name || '未命名'}」状态「${target.label}」重命名为「${b.newLabel}」`
+        ? `✓ 已将人物「${character.name || '未命名'}」状态「${target.label}」重命名为「${b.newLabel}」`
         : `⚠ 未重命名状态：${opErr(r)}`;
     } else if (b.action === 'delete') {
       if (!target) {
-        setDoneMsg(`⚠ 人物「${d.name || '未命名'}」没有状态「${b.state}」，未落地`);
+        setDoneMsg(`⚠ 人物「${character.name || '未命名'}」没有状态「${b.state}」，未落地`);
         return;
       }
-      if (characterStateIndex(d, target.id) === 0) {
+      if (characterStateIndex(character, target.id) === 0) {
         setDoneMsg(`⚠ 状态「${target.label}」是默认状态（首项），不可删除`);
         return;
       }
-      if (!window.confirm(`删除人物「${d.name || '未命名'}」的状态「${target.label}」？该状态属性与形象引用会一并移除。${impactText}`)) return;
-      // 图片字节的清理由 store 统一按全画布引用计数回收
-      const r = st.deleteCharacterStateOnBoard(board.id, node.id, target.id);
+      if (!window.confirm(`删除人物「${character.name || '未命名'}」的状态「${target.label}」？该状态属性与形象引用会一并移除。${impactText}`)) return;
+      // 图片字节的清理由 store 统一按全库引用计数回收
+      const r = st.deleteCharacterState(characterId, target.id);
       ok = r.ok;
       msg = ok
-        ? `✓ 已删除人物「${d.name || '未命名'}」状态「${target.label}」`
+        ? `✓ 已删除人物「${character.name || '未命名'}」状态「${target.label}」`
         : `⚠ 未删除状态：${opErr(r)}`;
     } else {
       setDoneMsg('⚠ 未识别状态动作，未落地');
@@ -711,9 +790,9 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
   return (
     <>
     <div className="mt-1 flex flex-wrap items-center gap-1.5 px-1">
-      {/* 🧬 批量落人物（v2.15）：回复含 ≥2 个未落的人物设定块时，一键全部落地（配合人物生成规则的批量产出） */}
+      {/* 🧬 批量落人物（v2.15 · v3 人物库）：回复含 ≥2 个未落的人物设定块时，一键全部落地（配合人物生成规则的批量产出） */}
       {(() => {
-        // 只批量新建画布上没有同名节点的块；同名块已自动识别为「修改」，不能重复创建
+        // 只批量新建**作品人物库**里没有同名人物的块；同名块已自动识别为「修改」，不能重复创建
         const pending = msg.blocks
           .map((b, i) => ({ b, i }))
           .filter((x): x is { b: EditorRoomBlock; i: number } => {
@@ -721,15 +800,15 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
             const rb = resolveBlockBoard(x.b);
             if ('error' in rb) return false; // 卷目标不明确：不批量落地，避免写错画布
             const key = normNodeName(x.b.name);
-            return !key || !rb.board.nodes.some((n) => n.data.kind === 'character' && normNodeName(n.data.name) === key);
+            return !key || !Object.values(useStudioStore.getState().characters).some((c) => normNodeName(c.name) === key);
           });
         return pending.length >= 2 ? (
           <button
             onClick={() => {
               pending.forEach(({ b, i }) => drop(b, i));
-              setDoneMsg(`✓ ${pending.length} 个人物已全部落为画布节点`);
+              setDoneMsg(`✓ ${pending.length} 个人物已全部建入人物库并落到画布`);
             }}
-            title="把本条回复的全部新人物设定块逐个落为画布人物节点（同名人物会识别为修改，不在批量新建内）"
+            title="把本条回复的全部新人物设定块逐个建入人物库并放到画布（同名人物会识别为修改，不在批量新建内）"
             className="flex items-center gap-1 rounded-full bg-brand-600 px-2.5 py-1 text-[12px] font-medium text-white transition hover:bg-brand-700"
           >
             <UserPlus className="h-3.5 w-3.5" />
@@ -737,10 +816,10 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
           </button>
         ) : null;
       })()}
-      {/* ✏️ 批量更新：回复里 ≥2 个块都能唯一匹配到画布已有节点（如「给医院里所有人统一加服装要求」）→ 一键全部更新；
-          同名节点只更新一次（以最后一个块为准），避免重复点击逐个确认 */}
+      {/* ✏️ 批量更新：回复里 ≥2 个块都能唯一匹配到已有目标（人物=作品人物库；环境=目标画布节点）→ 一键全部更新；
+          人物按库 ID 去重（同名多画布只更新一次库记录），环境按画布+节点去重，避免重复点击逐个确认 */}
       {(() => {
-        const seen = new Map<string, { b: EditorRoomBlock; i: number; node: SimNodeType }>();
+        const seen = new Map<string, { b: EditorRoomBlock; i: number; target: SimNodeType | WorkCharacter }>();
         msg.blocks.forEach((b, i) => {
           if (dropped.has(i) || (b.kind !== 'character' && b.kind !== 'environment')) return;
           const block = b as EditorRoomBlock;
@@ -748,18 +827,25 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
           if (!key) return;
           const rb = resolveBlockBoard(block);
           if ('error' in rb) return;
-          const hits = rb.board.nodes.filter((n) => n.data.kind === block.kind && normNodeName(n.data.name) === key);
-          // 不同卷画布可能有同 ID 镜像节点：去重键必须带上画布
-          if (hits.length === 1) seen.set(`${rb.board.id}:${hits[0].id}`, { b: block, i, node: hits[0] });
+          if (block.kind === 'character') {
+            // 人物=库级匹配：命中唯一库记录才更新；同名多人不猜，留给单块选择器
+            const lib = Object.values(useStudioStore.getState().characters);
+            const chits = lib.filter((c) => normNodeName(c.name) === key);
+            if (chits.length === 1) seen.set(chits[0].id, { b: block, i, target: chits[0] });
+            return;
+          }
+          const hits = rb.board.nodes.filter((n) => n.data.kind === 'environment' && normNodeName(n.data.name) === key);
+          // 同名环境可能出现在多张卷画布：去重键必须带上画布
+          if (hits.length === 1) seen.set(`${rb.board.id}:${hits[0].id}`, { b: block, i, target: hits[0] });
         });
         const list = [...seen.values()];
         return list.length >= 2 ? (
           <button
             onClick={() => {
-              list.forEach(({ b, i, node }) => updateExisting(b, i, node));
-              setDoneMsg(`✓ 已按本条回复更新 ${list.length} 个节点`);
+              list.forEach(({ b, i, target }) => updateExisting(b, i, target));
+              setDoneMsg(`✓ 已按本条回复更新 ${list.length} 个目标`);
             }}
-            title="把本条回复里所有能唯一匹配到画布节点的设定块一次性更新（只覆盖块里写出的字段）"
+            title="把本条回复里所有能唯一匹配到已有目标的设定块一次性更新（人物写人物库，环境写画布；只覆盖块里写出的字段）"
             className="flex items-center gap-1 rounded-full bg-emerald-600 px-2.5 py-1 text-[12px] font-medium text-white transition hover:bg-emerald-700"
           >
             <PenLine className="h-3.5 w-3.5" />
@@ -828,15 +914,13 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
             );
           }
           const key = normNodeName(b.character);
-          const hits = key
-            ? rb.board.nodes.filter((n) => n.data.kind === 'character' && normNodeName(n.data.name) === key)
-            : [];
-          const node = hits.length === 1 ? hits[0] : undefined;
-          const d = node?.data.kind === 'character' ? node.data : undefined;
+          // 📇 v3 人物库：状态块按**作品人物库**匹配（找不到/重名禁用，绝不创建人物）
+          const chars = key ? Object.values(characters).filter((c) => normNodeName(c.name) === key) : [];
+          const d = chars.length === 1 ? chars[0] : undefined;
           let issue = b.parseError || '';
           if (!issue && !key) issue = '缺少人物名';
-          if (!issue && hits.length > 1) issue = '目标画布有多个同名人物，请让编辑室用更准确的名字或先改名';
-          if (!issue && !node) issue = '目标画布上未找到该人物（状态块不会创建人物）';
+          if (!issue && chars.length > 1) issue = '作品人物库有多个同名人物，请让编辑室用更准确的名字或先合并';
+          if (!issue && !d) issue = '作品人物库未找到该人物（状态块不会创建人物）';
           if (!issue && d) {
             const target = b.state ? d.states.find((s) => s.label === b.state) : undefined;
             if (b.action === 'create') {
@@ -859,7 +943,7 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
               issue = `人物已有状态「${b.newLabel}」`;
             }
           }
-          const current = d ? activeCharacterState(d) : undefined;
+          const current = d ? characterActiveState(d) : undefined;
           const targetLabel = b.state || current?.label || '当前状态';
           const actLabel =
             b.action === 'create'
@@ -929,8 +1013,9 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
           );
         }
         // ✏️ 人物/环境块：创建与修改自动区分——
-        //   块名与画布上同名节点唯一匹配（或 AI 写了「更新：」）→ 修改已有节点，只覆盖块里写出的字段；
-        //   无同名节点 → 纯创建，不再给创建块挂「更新已有」选择器。
+        //   人物块名与**作品人物库**同名人物唯一匹配（或 AI 写了「更新：」）→ 修改库记录；
+        //   环境块名与目标画布同名节点唯一匹配 → 修改已有节点。只覆盖块里写出的字段；
+        //   无同名 → 纯创建，不再给创建块挂「更新已有」选择器。
         //   只有重名/找不到目标这类无法自动判定的情况才出选择器。
         if (b.kind === 'character' || b.kind === 'environment') {
           const isDropped = dropped.has(i);
@@ -954,17 +1039,34 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
           const blockNodes = rb.board.nodes;
           const crossBoard = rb.board.id !== activeBoardId;
           const boardHint = crossBoard ? `「${rb.label}」画布` : '';
-          const sameKind = blockNodes.filter((n) => n.data.kind === b.kind);
           const lookupName = normNodeName(b.target || b.name);
-          const hits = lookupName ? sameKind.filter((n) => normNodeName(n.data.name) === lookupName) : [];
-          const targetNode = hits.length === 1 ? hits[0] : undefined;
-          const autoMatched = !b.target && !!targetNode; // 块名即目标画布已有节点名 → 识别为修改
+          // 📇 v3 人物库：人物块按**作品人物库**匹配（身份作品级，命中唯一库记录即识别为修改，同名多人不猜）；
+          // 环境块仍按目标画布节点匹配
+          const isCharBlock = b.kind === 'character';
+          const libChars = isCharBlock ? Object.values(characters) : [];
+          const sameKind: Array<SimNodeType | WorkCharacter> = isCharBlock
+            ? libChars
+            : blockNodes.filter((n) => n.data.kind === 'environment');
+          const hits = isCharBlock
+            ? libChars.filter((c) => normNodeName(c.name) === lookupName)
+            : blockNodes.filter((n) => n.data.kind === 'environment' && normNodeName(n.data.name) === lookupName);
+          const targetHit: SimNodeType | WorkCharacter | undefined = hits.length === 1 ? hits[0] : undefined;
+          const targetName = !targetHit
+            ? ''
+            : isCharBlock
+              ? (targetHit as WorkCharacter).name || '未命名'
+              : (targetHit as SimNodeType).data.name || '未命名';
+          const autoMatched = !b.target && !!targetHit; // 块名即已有目标名 → 识别为修改
           const ambiguous = hits.length > 1;
           const missingTarget = !!b.target && hits.length === 0;
           const issue = ambiguous
-            ? `目标画布有多个同名节点，请用右侧选择器指定`
+            ? isCharBlock
+              ? `作品人物库有多个同名人物，请用右侧选择器指定`
+              : `目标画布有多个同名节点，请用右侧选择器指定`
             : missingTarget
-              ? `${boardHint || '画布'}上未找到该节点`
+              ? isCharBlock
+                ? `作品人物库未找到该人物`
+                : `${boardHint || '画布'}上未找到该节点`
               : '';
           // 📍「所在」：目标父环境（名字或 镇＞建筑 路径唯一定位）——只在目标画布内找
           const parentHits = b.parent ? findEnvByRef(blockNodes, b.parent) : [];
@@ -986,23 +1088,25 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
                   🗂{rb.label}
                 </span>
               )}
-              {targetNode ? (
+              {targetHit ? (
                 <button
-                  onClick={() => { if (targetNode) updateExisting(b, i, targetNode); }}
+                  onClick={() => { if (targetHit) updateExisting(b, i, targetHit); }}
                   disabled={isDropped}
                   title={
                     isDropped
                       ? '已更新（要再改可让它重新输出）'
                       : autoMatched
-                        ? `${boardHint || '画布上'}已有同名${kindLabel}，自动识别为修改：只覆盖块里写出的字段，其余保留原值`
-                        : `更新${boardHint || ''}已有${kindLabel}「${targetNode.data.name || '未命名'}」：只覆盖块里写出的字段，其余保留原值`
+                        ? isCharBlock
+                          ? `作品人物库已有同名人物，自动识别为修改：只覆盖块里写出的字段（身份写库，全部画布生效），其余保留原值`
+                          : `${boardHint || '画布上'}已有同名${kindLabel}，自动识别为修改：只覆盖块里写出的字段，其余保留原值`
+                        : `更新${isCharBlock ? '人物库人物' : `${boardHint || ''}已有${kindLabel}`}「${targetName}」：只覆盖块里写出的字段，其余保留原值`
                   }
                   className="flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[12px] text-emerald-700 transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   {isDropped ? <Check className="h-3.5 w-3.5" /> : <PenLine className="h-3.5 w-3.5" />}
                   {isDropped
                     ? `已更新${kindLabel}「${b.name}」`
-                    : `更新${kindLabel}「${targetNode.data.name || '未命名'}」`}
+                    : `更新${kindLabel}「${targetName}」`}
                 </button>
               ) : ambiguous || missingTarget ? (
                 <button
@@ -1065,16 +1169,16 @@ function SimBlockDropRow({ msg }: { msg: EditorRoomMessage }) {
                 <select
                   value=""
                   onChange={(e) => {
-                    const node = sameKind.find((n) => n.id === e.target.value);
-                    if (node) updateExisting(b, i, node);
+                    const picked = sameKind.find((n) => n.id === e.target.value);
+                    if (picked) updateExisting(b, i, picked);
                   }}
                   title={`把设定块更新到已有${kindLabel}：只覆盖块里写出的字段，其余保留原值`}
                   className="max-w-[160px] rounded-full border border-slate-200 bg-white px-2 py-1 text-[12px] text-slate-500 transition hover:bg-slate-50"
                 >
-                  <option value="">{b.target ? '✏️ 换更新目标…' : '✏️ 选择要更新的节点…'}</option>
+                  <option value="">{b.target ? '✏️ 换更新目标…' : '✏️ 选择要更新的目标…'}</option>
                   {sameKind.map((n) => (
                     <option key={n.id} value={n.id}>
-                      {nodeOptionLabel(n, blockNodes)}
+                      {isCharBlock ? charOptionLabel(n as WorkCharacter, boards) : nodeOptionLabel(n as SimNodeType, blockNodes)}
                     </option>
                   ))}
                 </select>

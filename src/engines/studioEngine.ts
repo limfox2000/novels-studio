@@ -1,7 +1,8 @@
 /** 创作台引擎——🎭 编辑室聊天（🏠 私有模型=设计/推演，双引擎分工；流式走 /api/qwen/chat，
  *  private=自建/租用 GPU 动作前 agentGate 预检、public=SaaS 中转常在线，gate/安全上限复用 agentShared 实现）。
  *  回复内嵌【人物设定】/【环境设定】/【区域规划】结构块 → parseSimBlocks 拆块 → 面板「📎 落为…」落到画布；
- *  人物/环境块带「更新：已有节点名」时走「✏️ 更新…」修改已有节点（只覆盖块里写出的字段）。
+ *  块带「更新：已有名字」时走「✏️ 更新…」修改已有对象（只覆盖块里写出的字段）；v3 人物库：人物身份作品级
+ *  （画布节点只是放置，人名/性别/状态读库），画布摘要/检索/名单全部按放置查人物库。
  *  📋 章节大纲生成 genChapterOutline（章节大纲规则+全文目标+本章所属卷介绍+画布舞台+前情大纲；v2.14c 起不带全文规则）；
  *  📝 正文生成 genChapterContent（大纲硬门槛，🏠 私有模型 / 🌐 公共模型 二选一，双引擎分工）。
  *  🎯 全文目标 mainGoal（v2.16）：大纲/正文/随机人物默认注入统一方向；🎭 编辑室 v2.19 起默认不注入任何规则/目标
@@ -24,13 +25,26 @@ import { GenerationAborted } from '../shared/generation';
 import { qwGenerate, qwenUserContent, qwenMessageChars, REASONING_EFFORT_MAX_TOKENS, type QwenChatMessage, type QwenUsage, type ReasoningEffort } from '../shared/qwenClient';
 import { startGeneration, stopGeneration } from '../shared/generation';
 import { agentGate, characterImageBatchHint, characterImageHint, imageInputHint, promptCharBudget, QWEN_SAFE_LIMIT, type CharacterImageBatch, type CharacterVisionRef } from '../shared/agentShared';
-import { CHARACTER_IMAGE_PRESET_DIMS, ENV_TYPE_LABELS, ENV_TYPE_META, GENDER_LABELS, genderOf, type CharacterData, type CharacterGender, type CharacterImagePreset, type CharacterState, type CharacterStateImage, type EnvironmentType, type SimChapter, type SimNodeType, type SimVolume } from '../types/sim';
+import { CHARACTER_IMAGE_PRESET_DIMS, ENV_TYPE_LABELS, ENV_TYPE_META, GENDER_LABELS, genderOf, type CharacterGender, type CharacterImagePreset, type CharacterState, type CharacterStateImage, type EnvironmentType, type SimChapter, type SimNodeType, type SimVolume, type WorkCharacter } from '../types/sim';
 import type { WritingSkill } from '../types/writingSkill';
 import { buildWritingSkillsBlock } from './writingSkills';
-import { activeCharacterState, characterStateOf, STATE_LABEL_CAP } from '../stores/characterStates';
+import { characterActiveState, characterStateOf, STATE_LABEL_CAP } from '../stores/characterStates';
 import { imgSubmit, imgTask, imgConfigCached } from '../services/imgApi';
 
 // ── 画布结构摘要（注入编辑室系统上下文）：地图名 + 环境层级链 + 人物（≤900 字符） ──
+
+/** 悬空放置兜底状态（sanitize 正常会滤除；防摘要/检索崩溃） */
+const FALLBACK_STATE: CharacterState = { id: '', label: '未命名状态', basicInfo: '', identityInfo: '' };
+
+/** 放置 → (人物库记录, 当前状态)：人名/性别/状态全部读库，activeStateId 按放置（每画布独立） */
+function placementState(
+  characters: Record<string, WorkCharacter>,
+  n: SimNodeType,
+): { character: WorkCharacter | undefined; state: CharacterState } {
+  if (n.data.kind !== 'character') return { character: undefined, state: FALLBACK_STATE };
+  const character = characters[n.data.characterId];
+  return { character, state: character ? characterActiveState(character, n.data.activeStateId) : FALLBACK_STATE };
+}
 
 export function simCanvasSummary(opts: { full?: boolean; boardId?: string } = {}): string {
   const cut = (s: string, n: number) => (opts.full ? s : s.slice(0, n));
@@ -68,9 +82,9 @@ export function simCanvasSummary(opts: { full?: boolean; boardId?: string } = {}
       const p = n.parentId ? byId.get(n.parentId) : undefined;
       // 完整祖先链（镇＞建筑＞房间），否则「某建筑里都有谁」只能看到直属房间
       const at = p && p.data.kind === 'environment' ? `，在${envPath(p)}内` : '';
-      // 年龄/关系信息（v2.20）：年龄是基础属性随手带上；关系信息让 AI 知道人物之间的关系
-      // v2.30 多状态：画布摘要只按**当前状态**给出（状态列表在按名检索时展开）
-      const state = activeCharacterState(d);
+      // v3 人物库：人名/性别读库（作品级），状态按放置的 activeStateId（每画布独立）
+      const character = st.characters[d.characterId];
+      const state = character ? characterActiveState(character, d.activeStateId) : FALLBACK_STATE;
       const age = typeof state.age === 'number' && Number.isFinite(state.age) && state.age > 0 ? `/${state.age}岁` : '';
       // v2.27 人物设定两层：基础信息（样子/性情）+ 身份信息（世界位置与故事钩子）
       const basicAll = (state.basicInfo || '').trim();
@@ -80,8 +94,8 @@ export function simCanvasSummary(opts: { full?: boolean; boardId?: string } = {}
         : basicAll.split('\n')[0] || identAll.split('\n')[0] || '';
       const relAll = (state.relations || '').trim();
       const rel = opts.full ? relAll : relAll.split('\n')[0] || '';
-      const stateNote = d.states.length > 1 ? `｜状态：${state.label}` : '';
-      lines.push(`🧑 ${d.name || '未命名'}（${GENDER_LABELS[genderOf(d.gender)]}${age}${at}）：${cut(first, 24) || '（无基础/身份信息）'}${rel ? `｜关系：${cut(rel, 32)}` : ''}${stateNote}`);
+      const stateNote = (character?.states.length ?? 0) > 1 ? `｜状态：${state.label}` : '';
+      lines.push(`🧑 ${character?.name || '未命名'}（${GENDER_LABELS[genderOf(character?.gender)]}${age}${at}）：${cut(first, 24) || '（无基础/身份信息）'}${rel ? `｜关系：${cut(rel, 32)}` : ''}${stateNote}`);
     }
   }
   return lines.join('\n').slice(0, opts.full ? READ_CAP : 900);
@@ -94,6 +108,10 @@ type CanvasIdx = {
   graphName: string;
   nodes: SimNodeType[];
   byId: Map<string, SimNodeType>;
+  /** 人物库（人名/性别/状态的唯一来源；放置节点只是引用） */
+  characters: Record<string, WorkCharacter>;
+  /** characterId → 该画布上的放置（C4 一人一板一个；快照条目按库 ID 反查放置用） */
+  charById: Map<string, SimNodeType>;
   envChildren: Map<string, SimNodeType[]>;
   charChildren: Map<string, SimNodeType[]>;
   rootEnvs: SimNodeType[];
@@ -106,6 +124,10 @@ function canvasIdx(boardId?: string): CanvasIdx {
   const nodes = board?.nodes ?? [];
   const graphName = st.graphName;
   const byId = new Map(nodes.map((n) => [n.id, n]));
+  const charById = new Map<string, SimNodeType>();
+  for (const n of nodes) {
+    if (n.data.kind === 'character' && !charById.has(n.data.characterId)) charById.set(n.data.characterId, n);
+  }
   const envChildren = new Map<string, SimNodeType[]>();
   const charChildren = new Map<string, SimNodeType[]>();
   const rootEnvs: SimNodeType[] = [];
@@ -128,15 +150,15 @@ function canvasIdx(boardId?: string): CanvasIdx {
       } else rootChars.push(n);
     }
   }
-  return { graphName, nodes, byId, envChildren, charChildren, rootEnvs, rootChars };
+  return { graphName, nodes, byId, characters: st.characters, charById, envChildren, charChildren, rootEnvs, rootChars };
 }
 
-const charLabel = (n: SimNodeType): string => {
+const charLabel = (idx: CanvasIdx, n: SimNodeType): string => {
   if (n.data.kind !== 'character') return '';
-  const state = activeCharacterState(n.data);
+  const { character, state } = placementState(idx.characters, n);
   const age = typeof state.age === 'number' && state.age > 0 ? `，${state.age}岁` : '';
-  const st = n.data.states.length > 1 ? `｜${state.label}` : '';
-  return `${n.data.name || '未命名'}（${GENDER_LABELS[genderOf(n.data.gender)]}${age}${st}）`;
+  const st = (character?.states.length ?? 0) > 1 ? `｜${state.label}` : '';
+  return `${character?.name || '未命名'}（${GENDER_LABELS[genderOf(character?.gender)]}${age}${st}）`;
 };
 
 const envLabel = (n: SimNodeType): string => {
@@ -183,7 +205,7 @@ export function simCanvasIndex(boardId?: string): string {
   const top = idx.rootEnvs.slice(0, 12).map(envLabel);
   const more = idx.rootEnvs.length > top.length ? `…等共 ${idx.rootEnvs.length} 个` : '';
   const chars = idx.nodes.filter((n) => n.data.kind === 'character').length;
-  const multi = idx.nodes.filter((n) => n.data.kind === 'character' && n.data.states.length > 1).length;
+  const multi = idx.nodes.filter((n) => n.data.kind === 'character' && (idx.characters[n.data.characterId]?.states.length ?? 0) > 1).length;
   const loose = idx.rootChars.length ? `（其中 ${idx.rootChars.length} 人未归属环境）` : '';
   return `${head}当前画布顶层环境：${top.join('、') || '（无）'}${more}；人物 ${chars} 人${loose}${multi ? `，其中 ${multi} 人多状态（按当前状态工作，改指定状态用【人物状态】）` : ''}。提到某个环境/人物名时，系统会自动检索其成员、归属与当前状态（只检索当前画布，不要臆测其它卷成员）`;
 }
@@ -198,13 +220,13 @@ export function simCanvasTree(cap = 12000, boardId?: string): string {
     if (seen.has(env.id)) return;
     seen.add(env.id);
     const pad = '  '.repeat(depth);
-    const who = (idx.charChildren.get(env.id) ?? []).map(charLabel).filter(Boolean);
+    const who = (idx.charChildren.get(env.id) ?? []).map((n) => charLabel(idx, n)).filter(Boolean);
     lines.push(`${pad}${envLabel(env)}${who.length ? `：${who.join('、')}` : ''}`);
     for (const child of idx.envChildren.get(env.id) ?? []) walk(child, depth + 1);
   };
   for (const e of idx.rootEnvs) walk(e, 0);
   for (const n of idx.nodes) if (n.data.kind === 'environment' && !seen.has(n.id)) walk(n, 0); // 环/悬空兜底
-  if (idx.rootChars.length) lines.push(`🧑 人物（未归属环境）：${idx.rootChars.map(charLabel).join('、')}`);
+  if (idx.rootChars.length) lines.push(`🧑 人物（未归属环境）：${idx.rootChars.map((n) => charLabel(idx, n)).join('、')}`);
   const out = `【画布结构】（环境/人物的完整归属；问「某建筑里都有谁」「某人物在哪」以此为准）\n${lines.join('\n')}`;
   return out.length > cap ? `${out.slice(0, cap)}\n（画布结构较长，已截断）` : out;
 }
@@ -275,7 +297,7 @@ function matchScope(idx: CanvasIdx, text: string): ScopeHit {
   const pick = (kind: 'environment' | 'character') =>
     idx.nodes
       .filter((n) => n.data.kind === kind)
-      .map((n) => ({ n, s: lookupScore(n.data.name || '', msg) }))
+      .map((n) => ({ n, s: lookupScore(nameOf(idx, n), msg) }))
       .filter((x) => x.s > 0)
       .sort((a, b) => b.s - a.s)
       .slice(0, 6)
@@ -283,13 +305,15 @@ function matchScope(idx: CanvasIdx, text: string): ScopeHit {
   return { envHits: pick('environment'), charHits: pick('character') };
 }
 
-const nameOf = (n: SimNodeType): string => (n.data.name || '').trim();
+/** 名字统一走这里：环境读节点 data.name，人物读库（放置只是引用） */
+const nameOf = (idx: CanvasIdx, n: SimNodeType): string =>
+  n.data.kind === 'character' ? (idx.characters[n.data.characterId]?.name || '').trim() : (n.data.name || '').trim();
 /** 「（男，32岁）」——名单里姓名单独标注后，性别/年龄用这个后缀，避免和名字混在一起 */
-const sexAge = (n: SimNodeType): string => {
+const sexAge = (idx: CanvasIdx, n: SimNodeType): string => {
   if (n.data.kind !== 'character') return '';
-  const s = activeCharacterState(n.data);
-  const age = typeof s.age === 'number' && s.age > 0 ? `，${s.age}岁` : '';
-  return `（${GENDER_LABELS[genderOf(n.data.gender)]}${age}）`;
+  const { character, state } = placementState(idx.characters, n);
+  const age = typeof state.age === 'number' && state.age > 0 ? `，${state.age}岁` : '';
+  return `（${GENDER_LABELS[genderOf(character?.gender)]}${age}）`;
 };
 
 /** 按本轮消息检索画布：命中的环境给**确切人物名单**（含下层），命中的人物给完整归属路径。
@@ -338,20 +362,23 @@ export function canvasLookupBlock(
     const lines = [head];
     if (desc) lines.push(`- 当前描述：${desc.slice(0, 500)}${desc.length > 500 ? '…' : ''}`);
     if (chars.length) {
-      const named = chars.filter((c) => !!nameOf(c.n));
+      const named = chars.filter((c) => !!nameOf(idx, c.n));
       const unnamed = chars.length - named.length;
-      const roster = named.slice(0, 80).map((c) => nameOf(c.n)).join('、');
+      const roster = named.slice(0, 80).map((c) => nameOf(idx, c.n)).join('、');
       lines.push(
         named.length
           ? `- 人物名单（【人物设定】的「名字」行逐字使用这些名字；括号里的性别/年龄不属于名字；要统一修改时每人输出一个块）：${roster}${named.length > 80 ? `…等共 ${named.length} 人` : ''}`
           : '- 人物名单：无可按名更新的人物（内部人物都还没有名字）',
       );
       if (unnamed) lines.push(`- 另有 ${unnamed} 个未命名人物（画布上没有名字，无法按名更新；需先在属性面板命名）`);
-      const multi = chars.filter((c) => c.n.data.kind === 'character' && c.n.data.states.length > 1);
+      const multi = chars.filter((c) => c.n.data.kind === 'character' && (idx.characters[c.n.data.characterId]?.states.length ?? 0) > 1);
       if (multi.length) {
         const statesNote = multi
           .slice(0, 20)
-          .map((c) => `${nameOf(c.n) || '未命名'}：${c.n.data.kind === 'character' ? c.n.data.states.map((s) => s.label).join('/') : ''}`)
+          .map((c) => {
+            const st = c.n.data.kind === 'character' ? idx.characters[c.n.data.characterId]?.states : undefined;
+            return `${nameOf(idx, c.n) || '未命名'}：${(st ?? []).map((s) => s.label).join('/')}`;
+          })
           .join('；');
         lines.push(
           `- 多状态人物（【人物设定】只改当前状态；要改指定状态必须用【人物状态】，「状态」行逐字使用下列状态名）：${statesNote}${multi.length > 20 ? `…等 ${multi.length} 人` : ''}`,
@@ -359,11 +386,12 @@ export function canvasLookupBlock(
       }
       for (const c of chars.slice(0, 60)) {
         const sub = c.path.length ? ` — ${c.path.join('＞')}` : '';
-        const nm = nameOf(c.n);
-        const cur = c.n.data.kind === 'character' ? activeCharacterState(c.n.data) : undefined;
-        const st = cur && c.n.data.kind === 'character' && c.n.data.states.length > 1 ? `｜当前状态：${cur.label}` : '';
+        const nm = nameOf(idx, c.n);
+        const { state: cur } = placementState(idx.characters, c.n);
+        const stCount = c.n.data.kind === 'character' ? (idx.characters[c.n.data.characterId]?.states.length ?? 0) : 0;
+        const st = cur && stCount > 1 ? `｜当前状态：${cur.label}` : '';
         lines.push(
-          nm ? `- 名字：${nm}${sexAge(c.n)}${st}${sub}` : `- 未命名人物${sexAge(c.n)}${st}（无名字，无法按名更新）${sub}`,
+          nm ? `- 名字：${nm}${sexAge(idx, c.n)}${st}${sub}` : `- 未命名人物${sexAge(idx, c.n)}${st}（无名字，无法按名更新）${sub}`,
         );
       }
       if (chars.length > 60) lines.push(`- ……其余 ${chars.length - 60} 人见上方名单`);
@@ -378,6 +406,7 @@ export function canvasLookupBlock(
     parts.push(lines.join('\n'));
   }
   for (const ch of charHits) {
+    if (ch.data.kind !== 'character') continue;
     const anc = envAncestorPath(idx, ch);
     const shot = (s: string | undefined) => {
       const t = (s || '').trim();
@@ -389,27 +418,29 @@ export function canvasLookupBlock(
       shot(st.identityInfo) ? `身份信息：${shot(st.identityInfo)}` : '',
       shot(st.relations) ? `关系信息：${shot(st.relations)}` : '',
     ].filter(Boolean);
-    const d = ch.data.kind === 'character' ? ch.data : undefined;
-    const cur = d ? activeCharacterState(d) : undefined;
+    const character = idx.characters[ch.data.characterId];
+    const states = character?.states ?? [];
+    const cur = character ? characterActiveState(character, ch.data.activeStateId) : undefined;
     // 「李刚重伤后是什么样」：先命中人物，再在消息里匹配状态标签（长标签优先，避免 状态1 命中 状态10）
-    const wanted = d
-      ? [...d.states].sort((a, b) => normLookup(b.label).length - normLookup(a.label).length).find((s) => {
-          const label = normLookup(s.label);
-          return label.length >= 2 && normLookup(raw).includes(label);
-        })
-      : undefined;
+    const wanted = states
+      .slice()
+      .sort((a, b) => normLookup(b.label).length - normLookup(a.label).length)
+      .find((s) => {
+        const label = normLookup(s.label);
+        return label.length >= 2 && normLookup(raw).includes(label);
+      });
     const wantedAttrs = wanted && wanted.id !== cur?.id ? attrsOf(wanted) : [];
-    const stateInfo = d && cur
-      ? d.states.length > 1
-        ? `｜当前状态：${cur.label}（固定人名/性别；全部状态：${d.states.map((s) => s.label).join('、')}）`
+    const stateInfo = character && cur
+      ? states.length > 1
+        ? `｜当前状态：${cur.label}（固定人名/性别；全部状态：${states.map((s) => s.label).join('、')}）`
         : ''
       : '';
-    const nm = nameOf(ch);
+    const nm = nameOf(idx, ch);
     const currentAttrs = cur ? attrsOf(cur) : [];
     parts.push(
       nm
-        ? `名字：${nm}${sexAge(ch)} — 位于 ${anc ? `${anc}内` : '画布根层（未归属环境）'}${stateInfo}${currentAttrs.length ? `\n  当前状态属性：${currentAttrs.join('；')}` : ''}${wantedAttrs.length ? `\n  状态「${wanted!.label}」：${wantedAttrs.join('；')}` : ''}`
-        : `未命名人物${sexAge(ch)}（无名字，无法按名更新） — 位于 ${anc ? `${anc}内` : '画布根层（未归属环境）'}${stateInfo}`,
+        ? `名字：${nm}${sexAge(idx, ch)} — 位于 ${anc ? `${anc}内` : '画布根层（未归属环境）'}${stateInfo}${currentAttrs.length ? `\n  当前状态属性：${currentAttrs.join('；')}` : ''}${wantedAttrs.length ? `\n  状态「${wanted!.label}」：${wantedAttrs.join('；')}` : ''}`
+        : `未命名人物${sexAge(idx, ch)}（无名字，无法按名更新） — 位于 ${anc ? `${anc}内` : '画布根层（未归属环境）'}${stateInfo}`,
     );
     // 「李刚那个房间都有谁」这类：顺带列出其所在环境（非根层）的成员
     if (askWho && ch.parentId) {
@@ -417,7 +448,7 @@ export function canvasLookupBlock(
       if (env && env.data.kind === 'environment' && !hitIds.has(env.id)) {
         hitIds.add(env.id);
         const chars = collectEnvChars(idx, env);
-        const roster = chars.slice(0, 40).map((c) => nameOf(c.n) || '（未命名）').join('、');
+        const roster = chars.slice(0, 40).map((c) => nameOf(idx, c.n) || '（未命名）').join('、');
         parts.push(`${envLabel(env)}内部共 ${chars.length} 人：${roster}${chars.length > 40 ? '…' : ''}`);
       }
     }
@@ -430,7 +461,8 @@ export function canvasLookupBlock(
  *  ⚠ 只有用户**明确要求读取形象图**时才检索画布；普通提到人物/长相/穿搭不会自动附图。
  *  agent 没有工具调用，因此按消息里点到的状态名优先，否则当前状态，再退到第一个有图的状态。 */
 export interface CharacterImageCandidate {
-  nodeId: string;
+  /** 人物库 ID（形象属库：同一人物的所有画布放置共享，改一处全局生效） */
+  characterId: string;
   name: string;
   stateId: string;
   stateLabel: string;
@@ -471,7 +503,7 @@ const IMAGE_ENV_GROUP_RE = /其中|里面|内部|里(?:的)?(?:人|人物|角色
 type ImageTargetRef = { n: SimNodeType; stateId?: string };
 
 const allNamedChars = (idx: CanvasIdx): SimNodeType[] =>
-  idx.nodes.filter((n) => n.data.kind === 'character' && !!nameOf(n));
+  idx.nodes.filter((n) => n.data.kind === 'character' && !!nameOf(idx, n));
 
 /** 在一段文本里找出所有被点到的画布人物（不限于 matchScope 的前 6 个），按出现位置排序。
  *  群组场景下用户可能一次列出 5~10 个名字，不能只取相似度前 6。 */
@@ -480,9 +512,10 @@ function matchAllChars(idx: CanvasIdx, text: string, limit: number): SimNodeType
   if (!msg) return [];
   const hits: Array<{ n: SimNodeType; score: number; at: number }> = [];
   for (const n of allNamedChars(idx)) {
-    const score = lookupScore(n.data.name || '', msg);
+    const name = nameOf(idx, n);
+    const score = lookupScore(name, msg);
     if (!score) continue;
-    const full = normLookup(n.data.name || '');
+    const full = normLookup(name);
     hits.push({ n, score, at: full ? msg.indexOf(full) : -1 });
   }
   hits.sort((a, b) => {
@@ -494,15 +527,17 @@ function matchAllChars(idx: CanvasIdx, text: string, limit: number): SimNodeType
   return hits.slice(0, limit).map((h) => h.n);
 }
 
-/** 命中环境 → 其内部（含下层）的有名人物；用于「医院里这些人」这种群组请求。 */
+/** 命中环境 → 其内部（含下层）的有名人物；用于「医院里这些人」这种群组请求。
+ *  去重按 characterId（人物库 ID）——同一人物不同画布放置只读一张图。 */
 function envOccupantTargets(idx: CanvasIdx, envs: SimNodeType[], limit: number): ImageTargetRef[] {
   const out: ImageTargetRef[] = [];
   const seen = new Set<string>();
   for (const env of envs) {
     if (env.data.kind !== 'environment') continue;
     for (const c of collectEnvChars(idx, env)) {
-      if (!nameOf(c.n) || seen.has(c.n.id)) continue;
-      seen.add(c.n.id);
+      const key = c.n.data.kind === 'character' ? c.n.data.characterId : c.n.id;
+      if (!nameOf(idx, c.n) || seen.has(key)) continue;
+      seen.add(key);
       out.push({ n: c.n });
       if (out.length >= limit) return out;
     }
@@ -546,8 +581,9 @@ function defaultGroupTargets(
   if (snap && snap.boardId === st.activeBoardId && snap.entries.length) {
     const refs: ImageTargetRef[] = [];
     for (const e of snap.entries) {
-      const n = idx.byId.get(e.characterId);
-      if (n?.data.kind === 'character' && nameOf(n)) refs.push({ n, stateId: e.stateId });
+      // 快照条目 characterId 已是人物库 ID：在本画布按 data.characterId 反查放置（未放置人物跳过）
+      const n = idx.charById.get(e.characterId);
+      if (n?.data.kind === 'character' && nameOf(idx, n)) refs.push({ n, stateId: e.stateId });
     }
     if (refs.length) return { refs, source: 'chapter' };
   }
@@ -608,11 +644,12 @@ export function characterImageCandidates(
   }
   if (!refs.length) return { ...empty, group };
 
-  // 去重（同一人物只读一张）并按顺序解析最终状态
+  // 去重（同一人物只读一张；镜像放置同 characterId）并按顺序解析最终状态
   const seen = new Set<string>();
   const uniq = refs.filter((r) => {
-    if (seen.has(r.n.id)) return false;
-    seen.add(r.n.id);
+    const key = r.n.data.kind === 'character' ? r.n.data.characterId : r.n.id;
+    if (seen.has(key)) return false;
+    seen.add(key);
     return true;
   });
   const normRaw = normLookup(raw);
@@ -620,12 +657,13 @@ export function characterImageCandidates(
   const all: CharacterImageCandidate[] = [];
   for (const r of uniq) {
     if (r.n.data.kind !== 'character') continue;
-    const d = r.n.data;
-    const name = nameOf(r.n);
-    if (!name) continue; // 未命名人物无法在提示里对应图片
+    const character = idx.characters[r.n.data.characterId];
+    const states = character?.states ?? [];
+    const name = nameOf(idx, r.n);
+    if (!name || !character) continue; // 未命名人物无法在提示里对应图片
     // 长标签优先，避免「状态1」命中「状态10」
     const findWanted = (normText: string) =>
-      [...d.states]
+      [...states]
         .sort((a, b) => normLookup(b.label).length - normLookup(a.label).length)
         .find((s) => {
           const label = normLookup(s.label);
@@ -633,15 +671,15 @@ export function characterImageCandidates(
         });
     const wantedNow = findWanted(normRaw);
     const wantedCarried = scopeText !== raw ? findWanted(normScope) : undefined;
-    const preferred = r.stateId ? d.states.find((s) => s.id === r.stateId) : undefined;
-    const cur = activeCharacterState(d);
+    const preferred = r.stateId ? states.find((s) => s.id === r.stateId) : undefined;
+    const cur = characterActiveState(character, r.n.data.activeStateId);
     const state =
       (wantedNow?.image ? wantedNow : undefined) ??
       (preferred?.image ? preferred : undefined) ??
       (wantedCarried?.image ? wantedCarried : undefined) ??
-      (cur.image ? cur : d.states.find((s) => !!s.image));
+      (cur.image ? cur : states.find((s) => !!s.image));
     if (!state?.image) continue;
-    all.push({ nodeId: r.n.id, name, stateId: state.id, stateLabel: state.label, image: state.image });
+    all.push({ characterId: r.n.data.characterId, name, stateId: state.id, stateLabel: state.label, image: state.image });
   }
   return {
     candidates: all.slice(0, CHARACTER_VISION_GROUP_MAX),
@@ -1316,7 +1354,7 @@ export function chapterAgentBlockIfRelevant(userMsg: string): string {
   if (!chapter) return '';
   const preferred = chapterBoardOf(chapter.volumeId, st.volumes, st.boards);
   const hit = findChapterRegion(st.boards, chapter.id, preferred);
-  return `\n${buildChapterAgentBrief(chapter, st.boards, st.volumes, hit?.region)}\n`;
+  return `\n${buildChapterAgentBrief(chapter, st.boards, st.volumes, st.characters, hit?.region)}\n`;
 }
 
 function buildSimSystem(summary: string, readBlock: string, userMsg: string, history: ReadonlyArray<SimChatMsg> = []): string {
@@ -1325,7 +1363,7 @@ function buildSimSystem(summary: string, readBlock: string, userMsg: string, his
   const refBlock = /状态|引用|快照|名单|章节|本章|历史/.test(userMsg)
     ? (() => {
         const st = useStudioStore.getState();
-        return `\n${stateReferenceAgentContext(st.chapters, st.boards, st.volumes, { boardId: st.activeBoardId })}\n`;
+        return `\n${stateReferenceAgentContext(st.chapters, st.characters)}\n`;
       })()
     : '';
   const chapterBlock = chapterAgentBlockIfRelevant(userMsg);
@@ -1345,7 +1383,8 @@ ${readBlock}${projectDataBlock()}${chapterBlock}${refBlock}
 - 章节需求：要写几章就每章输出一个【写入】块，同一回复全部输出；需求必须简短扼要，一两句话（80 字内）说清本章要发生什么，不写大纲、不写分段事件链；章节标题取自【章节】列表
 - 本章大纲：一次写一章、每章一个【写入】块；写该章大纲的完整正文（结构遵循章节大纲规则如有）；章节标题取自【章节】列表
 - 章节的正文、归卷不支持写入，只能读取；卷的新建用【卷设定】
-- 修改画布上已有的人物/环境用【人物设定】/【环境设定】块：「名字」写节点当前名字即自动识别为修改，用户点「✏️ 更新…」确认后生效；不要为修改另建重复节点。只有要改名时才加「更新：（旧名）」行
+- 修改画布上已有的人物/环境用【人物设定】/【环境设定】块：「名字」写当前名字（与【画布索引】/【画布检索】一字不差）即自动识别为修改，用户点「✏️ 更新…」确认后生效；不要为修改另建重复节点。只有要改名时才加「更新：（旧名）」行
+- 人物身份属于整部作品（人物库）：同名同人是同一个人，修改其属性/状态会在该人物出现的所有画布同步生效；【人物设定】的「卷：」行只决定把人物**放置**到哪张画布，不会复制出另一个人
 - 人物有多个状态时，【人物设定】的年龄/基础信息/身份信息/关系信息只作用于**当前状态**；要新建、切换、重命名、删除状态或修改**非当前状态**，必须用【人物状态】块，不能拿【人物设定】代替
 
 【工作方式】
@@ -1364,18 +1403,19 @@ ${readBlock}${projectDataBlock()}${chapterBlock}${refBlock}
 
 【人物产出协议】（段名一字不差）
 【人物设定】
-更新：（仅改画布上已有名称时填写：目标人物的当前名字，一字不差；同名直接修改、新建人物都省略本行）
-所在：（可选：新建人物所在的环境名或层级路径，从【画布索引】/【画布检索】一字不差抄写；用户要求在某建筑/房间/城镇里创建人物时填写；省略=不归属环境；修改已有节点的普通更新不要写本行，只有用户明确要求移动归属时才写）
-卷：（可选：目标卷画布名，从【画布索引】的「全部画布」一字不差抄写；省略=当前画布；用户要求写到其它卷时必填；找不到/重名时不要猜，先请用户确认）
-名字：（人名，12 字以内；修改已有节点时写该节点当前名字；要改名则本行写新名字并加「更新：」行）
-性别：（男/女 二选一；修改已有节点时可省略，省略则保留原值）
-年龄：（新建必填，数字年龄，如 32；修改已有节点时可省略，省略则保留原值）
+更新：（仅修改人物库已有的人物时填写：目标人物当前名字，一字不差；同名多人时不要静默挑选，先向用户确认是哪一位；新建人物都省略本行）
+所在：（可选：新建人物所在的环境名或层级路径，从【画布索引】/【画布检索】一字不差抄写；用户要求在某建筑/房间/城镇里创建人物时填写；省略=不归属环境；修改已有人物的普通更新不要写本行，只有用户明确要求移动归属时才写）
+卷：（可选：放置目标卷画布名，从【画布索引】的「全部画布」一字不差抄写；省略=当前画布；用户要求把人物放到其它卷时必填；找不到/重名时不要猜，先请用户确认。人物身份全局唯一，「卷：」只是放置位置，不会产生第二个人）
+名字：（人名，12 字以内；修改已有人物时写该人物当前名字；要改名则本行写新名字并加「更新：」行）
+性别：（男/女 二选一；修改已有人物时可省略，省略则保留原值）
+年龄：（新建必填，数字年龄，如 32；修改已有人物时可省略，省略则保留原值）
 基础信息：（长相/身材/习惯穿搭/性格，一段话——人物本身的样子与性情；修改时写改动后的完整段落，省略则保留原值）
 身份信息：（职业/身份/与故事相关的特殊设计，一段话——人物在世界中的位置与故事钩子；修改时写改动后的完整段落，省略则保留原值）
 关系信息：（此人物与其他人物之间的关系，如「李刚之父；与王明有旧怨」，一段话；用户没提到人物关系、或当前没有其他人物可关联时，省略整段）
-- 新建人物自动带默认状态「状态0」；更新已有人的年龄/基础信息/身份信息/关系信息只改当前状态。人名、性别跨状态稳定，任何状态切换都不改变
+- 新建人物自动带默认状态「状态0」；更新已有人物的年龄/基础信息/身份信息/关系信息只改其当前状态（按放置逐画布独立）。人名、性别跨状态稳定，任何状态切换都不改变
+- 画布上的同名人物是同一个人的多个放置：不要为新放置重复建人；跨画布同名不同人（人物库里的两个人）时，更新前必须让用户确认目标
 
-【人物状态产出协议】（段名一字不差；只操作画布上**已有**人物的状态，不创建人物，也不改人名/性别/所在环境/形象/头像）
+【人物状态产出协议】（段名一字不差；只操作**人物库已有**人物的状态，不创建人物，也不改人名/性别/所在环境/形象/头像）
 【人物状态】
 人物：（已有人的当前名字，必须从【画布索引】/【画布检索】一字不差抄写，不得编造）
 卷：（可选：目标卷画布名，从【画布索引】的「全部画布」一字不差抄写；省略=当前画布；找不到/重名时不要猜，先请用户确认）
@@ -1642,16 +1682,17 @@ ${simCanvasSummary()}
  *  提示词阶段占文本生成互斥（ui.generating，结束即释放）；出图阶段与编辑室【生图】块共用 genImage（不占文本互斥）。
  *  ⚠ 返回的 url 是服务器临时文件（media GC 10 分钟后回收）——调用方必须立即 prepareCharacterImageUrl 转存浏览器本地。 */
 export async function genCharacterImage(opts: {
-  id: string;
-  /** 形象针对的状态；缺省=当前状态（每个状态独立形象） */
+  /** 人物库 ID：形象属库，生成结果写入人物状态后，该人物所有画布放置同步生效 */
+  characterId: string;
+  /** 形象针对的状态；缺省=首项状态（每个状态独立形象） */
   stateId?: string;
   engine: 'private' | 'public';
   preset: CharacterImagePreset;
   onStage?: (stage: 'prompt' | 'image') => void;
 }): Promise<{ ok: boolean; url?: string; prompt?: string; error?: string }> {
   const st0 = useStudioStore.getState();
-  const n = (st0.boards[st0.activeBoardId]?.nodes ?? []).find((x) => x.id === opts.id);
-  if (!n || n.data.kind !== 'character') return { ok: false, error: '人物节点不存在' };
+  const character = st0.characters[opts.characterId];
+  if (!character) return { ok: false, error: '人物库中不存在该人物' };
   const ui = useUiStore.getState();
   if (ui.generating) return { ok: false, error: '已有生成任务进行中' };
   const gate = await agentGate(opts.engine);
@@ -1662,14 +1703,13 @@ export async function genCharacterImage(opts: {
   let prompt = '';
   try {
     opts.onStage?.('prompt');
-    const d = n.data;
-    const state = characterStateOf(d, opts.stateId);
+    const state = characterStateOf(character, opts.stateId);
     const age = typeof state.age === 'number' && Number.isFinite(state.age) && state.age > 0 ? `${state.age}岁` : '年龄未设定';
     const brief = [
-      `人物名：${d.name || '未命名'}`,
-      `性别：${GENDER_LABELS[genderOf(d.gender)]}`,
+      `人物名：${character.name || '未命名'}`,
+      `性别：${GENDER_LABELS[genderOf(character.gender)]}`,
       `年龄：${age}`,
-      `状态：${state.label}${d.states.length > 1 ? '（同一人物的当前状态；只按这个状态的外貌与身份作画，不要混用其它状态）' : ''}`,
+      `状态：${state.label}${character.states.length > 1 ? '（同一人物的当前状态；只按这个状态的外貌与身份作画，不要混用其它状态）' : ''}`,
       state.basicInfo.trim() ? `基础信息：${state.basicInfo.trim()}` : '',
       state.identityInfo.trim() ? `身份信息：${state.identityInfo.trim()}` : '',
       state.relations?.trim() ? `关系：${state.relations.trim()}` : '',
@@ -1765,7 +1805,7 @@ function chapterStageFor(opts: {
   if (snapshot) {
     const boards = useStudioStore.getState().boards;
     const sourceBoard = boards[snapshot.boardId];
-    const stage = buildChapterStageBlock(snapshot, boards, {
+    const stage = buildChapterStageBlock(snapshot, boards, st.characters, {
       ...(sourceBoard ? { sourceLabel: boardLabel(sourceBoard, st.volumes) } : {}),
     });
     return { stage, capturedNow, ...(chapter ? { chapter } : {}) };

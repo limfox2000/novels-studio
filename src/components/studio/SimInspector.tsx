@@ -1,5 +1,6 @@
 /** 创作台属性面板（左侧停靠，可关闭）：选中单个节点时在此编辑其属性——
- *  🧑 人物 = 人名 + 性别（基础属性：男/女，决定节点配色）+ 状态（年龄/基础信息/身份信息/关系信息/人物形象）
+ *  🧑 人物 = 人名 + 性别（v3 人物库：身份写库，全部画布放置同步生效）+ 状态（年龄/基础信息/身份信息/关系信息/人物形象，
+ *  写入当前画布放置正在显示的状态；未放置的人物不能在这里改状态属性）
  *  + 人物形象（v2.31：每状态一张大图，从大图手动裁出圆形头像）；🏗 环境 = 名称 + 类型 + 描述。
  *  节点面上只展示不输入（v2.3 用户拍板）。
  *  v2.4：面板放左侧、✕ 可关闭、点击节点**不自动弹出**——由顶栏「⚙ 属性」开关；已打开时点节点即切换显示。
@@ -14,15 +15,16 @@ import {
   CHARACTER_IMAGE_PRESETS,
   genderOf,
   ENV_TYPE_LABELS,
-  type CharacterData,
   type CharacterGender,
   type CharacterImagePreset,
+  type CharacterPlacementData,
   type CharacterState,
   type CharacterStateImage,
   type EnvironmentType,
   type SimNodeType,
+  type WorkCharacter,
 } from '../../types/sim';
-import { activeCharacterState, characterStateIndex, nextStateLabel } from '../../stores/characterStates';
+import { characterActiveState, characterStateIndex, nextStateLabel } from '../../stores/characterStates';
 import { GENDER_STYLE } from './SimNodes';
 import { CharacterAvatar } from './CharacterAvatar';
 import { CharacterCropDialog } from './CharacterCropDialog';
@@ -43,7 +45,7 @@ import { Field, Input, Select, Textarea } from '../ui/Field';
 
 export function SimInspector({ open, onClose }: { open: boolean; onClose: () => void }) {
   const nodes = useActiveNodes();
-  const activeBoardId = useStudioStore((s) => s.activeBoardId);
+  const characters = useStudioStore((s) => s.characters);
   const selectedNodes = useMemo(() => nodes.filter((n) => n.selected), [nodes]);
   // 单选才显示节点属性；未选中=本书属性；多选只提示
   const selected: SimNodeType | null = selectedNodes.length === 1 ? selectedNodes[0] : null;
@@ -66,89 +68,99 @@ export function SimInspector({ open, onClose }: { open: boolean; onClose: () => 
     body = <BookProperties />;
   } else if (selected?.data.kind === 'character') {
     const d = selected.data;
-    const state = activeCharacterState(d);
+    const character = characters[d.characterId];
     title = '人物属性';
     icon = <UserRound />;
-    const id = selected.id;
-    body = (
-      <>
-        <Field label="人名">
-          <Input
-            autoFocus
-            value={d.name}
-            maxLength={12}
-            onChange={(e) => st.updateCharacter(id, { name: e.target.value })}
-            placeholder="人名"
-          />
-        </Field>
-        <div className="mt-2 flex items-center gap-2">
-          <span className="shrink-0 text-[12px] font-medium text-slate-500">性别</span>
-          <div className="flex gap-1">
-            {(['male', 'female'] as CharacterGender[]).map((g) => {
-              const gs = GENDER_STYLE[g];
-              const active = genderOf(d.gender) === g;
-              return (
-                <button
-                  key={g}
-                  onClick={() => st.updateCharacter(id, { gender: g })}
-                  title={`性别：${gs.label}（跨状态稳定，决定节点配色）`}
-                  className={`flex items-center gap-1 rounded-[8px] border px-3 py-1.5 text-[12px] transition ${
-                    active
-                      ? `${gs.capsule} border-transparent font-medium text-white`
-                      : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-                  }`}
-                >
-                  {g === 'male' ? <Mars className="h-3.5 w-3.5" /> : <Venus className="h-3.5 w-3.5" />}
-                  {gs.label}
-                </button>
-              );
-            })}
+    if (!character) {
+      // 库记录缺失（sanitize 会清掉悬空放置，此处仅兜底渲染）
+      body = (
+        <p className="text-[13px] leading-relaxed text-slate-400">
+          该放置的人物已不在人物库中，可从画布移除此节点。
+        </p>
+      );
+    } else {
+      const state = characterActiveState(character, d.activeStateId);
+      const id = d.characterId;
+      body = (
+        <>
+          <Field label="人名">
+            <Input
+              autoFocus
+              value={character.name}
+              maxLength={12}
+              onChange={(e) => st.updateCharacter(id, { name: e.target.value })}
+              placeholder="人名"
+            />
+          </Field>
+          <div className="mt-2 flex items-center gap-2">
+            <span className="shrink-0 text-[12px] font-medium text-slate-500">性别</span>
+            <div className="flex gap-1">
+              {(['male', 'female'] as CharacterGender[]).map((g) => {
+                const gs = GENDER_STYLE[g];
+                const active = genderOf(character.gender) === g;
+                return (
+                  <button
+                    key={g}
+                    onClick={() => st.updateCharacter(id, { gender: g })}
+                    title={`性别：${gs.label}（写库，全部画布放置同步生效；决定节点配色）`}
+                    className={`flex items-center gap-1 rounded-[8px] border px-3 py-1.5 text-[12px] transition ${
+                      active
+                        ? `${gs.capsule} border-transparent font-medium text-white`
+                        : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    {g === 'male' ? <Mars className="h-3.5 w-3.5" /> : <Venus className="h-3.5 w-3.5" />}
+                    {gs.label}
+                  </button>
+                );
+              })}
+            </div>
           </div>
-        </div>
-        <CharacterStateBar nodeId={id} data={d} boardId={activeBoardId} />
-        <Field label="年龄">
-          <Input
-            type="number"
-            min={0}
-            max={999}
-            value={typeof state.age === 'number' && Number.isFinite(state.age) ? state.age : ''}
-            onChange={(e) => {
-              const v = e.target.value.trim();
-              const n = Math.round(Number(v));
-              st.updateActiveCharacterState(id, {
-                age: v === '' || !Number.isFinite(n) ? undefined : Math.max(0, Math.min(999, n)),
-              });
-            }}
-            placeholder="岁"
+          <CharacterStateBar characterId={id} character={character} activeStateId={d.activeStateId} />
+          <Field label="年龄">
+            <Input
+              type="number"
+              min={0}
+              max={999}
+              value={typeof state.age === 'number' && Number.isFinite(state.age) ? state.age : ''}
+              onChange={(e) => {
+                const v = e.target.value.trim();
+                const n = Math.round(Number(v));
+                st.updateActiveCharacterState(id, {
+                  age: v === '' || !Number.isFinite(n) ? undefined : Math.max(0, Math.min(999, n)),
+                });
+              }}
+              placeholder="岁"
+            />
+          </Field>
+          <CharacterImageSection characterId={id} state={state} gender={genderOf(character.gender)} />
+          <Label>基础信息</Label>
+          <Textarea
+            value={state.basicInfo}
+            onChange={(e) => st.updateActiveCharacterState(id, { basicInfo: e.target.value })}
+            placeholder="长相、身材、习惯穿搭与性格，如：身形清瘦高挑，常穿洗旧的靛蓝长衫；寡言，遇事先观察再开口…"
+            rows={4}
+            className="resize-none"
           />
-        </Field>
-        <CharacterImageSection nodeId={id} state={state} gender={genderOf(d.gender)} />
-        <Label>基础信息</Label>
-        <Textarea
-          value={state.basicInfo}
-          onChange={(e) => st.updateActiveCharacterState(id, { basicInfo: e.target.value })}
-          placeholder="长相、身材、习惯穿搭与性格，如：身形清瘦高挑，常穿洗旧的靛蓝长衫；寡言，遇事先观察再开口…"
-          rows={4}
-          className="resize-none"
-        />
-        <Label>身份信息</Label>
-        <Textarea
-          value={state.identityInfo}
-          onChange={(e) => st.updateActiveCharacterState(id, { identityInfo: e.target.value })}
-          placeholder="职业、身份、与故事相关的特殊设计，如：药铺学徒，实为前朝医官后人；随身药箱里藏着半张城防图…"
-          rows={4}
-          className="resize-none"
-        />
-        <Label>关系信息</Label>
-        <Textarea
-          value={state.relations ?? ''}
-          onChange={(e) => st.updateActiveCharacterState(id, { relations: e.target.value })}
-          placeholder="与其他人物的关系，如：李刚之父；与王明有旧怨（可留空，编辑室可填充）"
-          rows={3}
-          className="resize-none"
-        />
-      </>
-    );
+          <Label>身份信息</Label>
+          <Textarea
+            value={state.identityInfo}
+            onChange={(e) => st.updateActiveCharacterState(id, { identityInfo: e.target.value })}
+            placeholder="职业、身份、与故事相关的特殊设计，如：药铺学徒，实为前朝医官后人；随身药箱里藏着半张城防图…"
+            rows={4}
+            className="resize-none"
+          />
+          <Label>关系信息</Label>
+          <Textarea
+            value={state.relations ?? ''}
+            onChange={(e) => st.updateActiveCharacterState(id, { relations: e.target.value })}
+            placeholder="与其他人物的关系，如：李刚之父；与王明有旧怨（可留空，编辑室可填充）"
+            rows={3}
+            className="resize-none"
+          />
+        </>
+      );
+    }
   } else if (selected) {
     const d = selected.data;
     title = '环境属性';
@@ -290,33 +302,44 @@ const STATE_ERR_TEXT: Record<CharacterStateError, string> = {
   'duplicate-label': '同一人物内已有同名状态',
   protected: '默认状态（首项）不可删除，可重命名',
   'last-state': '人物至少保留一个状态',
+  unplaced: '该人物未放置在当前画布，放置后才能修改其当前状态',
 };
 
-/** 🧬 状态条（v2.30）：切换/新建（复制当前）/重命名/删除。状态属性由下方表单写当前状态。 */
-function CharacterStateBar({ nodeId, data, boardId }: { nodeId: string; data: CharacterData; boardId: string }) {
-  const state = activeCharacterState(data);
-  const index = characterStateIndex(data, state.id);
+/** 🧬 状态条（v2.30 · v3 人物库）：状态属人物库记录——切换=当前画布放置级（写放置不写库）；
+ *  新建/重命名/删除=库级，影响该人物全部画布放置。状态属性由下方表单写当前状态。
+ *  （人物库面板复用：activeStateId 缺省=首项状态，切换仍作用于当前画布放置，未放置时提示 unplaced。） */
+export function CharacterStateBar({
+  characterId,
+  character,
+  activeStateId,
+}: {
+  characterId: string;
+  character: WorkCharacter;
+  activeStateId?: string;
+}) {
+  const state = characterActiveState(character, activeStateId);
+  const index = characterStateIndex(character, state.id);
   const chapters = useStudioStore((s) => s.chapters);
   const st = useStudioStore.getState();
   const refs: StateReferenceSummary = useMemo(
-    () => stateReferenceSummary(chapters, boardId, nodeId, state.id),
-    [chapters, boardId, nodeId, state.id],
+    () => stateReferenceSummary(chapters, characterId, state.id),
+    [chapters, characterId, state.id],
   );
 
   const add = () => {
     const label = window.prompt(
-      `新状态名称（将复制「${state.label}」的属性与形象，创建后切到新状态）`,
-      nextStateLabel(data.states),
+      `新状态名称（将复制「${state.label}」的属性与形象，创建后切到新状态；全部画布放置可用）`,
+      nextStateLabel(character.states),
     );
     if (label === null) return;
-    const r = st.addCharacterState(nodeId, { label, baseStateId: state.id, activate: true });
+    const r = st.addCharacterState(characterId, { label, baseStateId: state.id, activate: true });
     if (!r.ok) window.alert(`⚠ ${STATE_ERR_TEXT[r.error]}`);
   };
 
   const rename = () => {
     const label = window.prompt('状态名称（同一人物内唯一，如「重伤后」）', state.label);
     if (label === null) return;
-    const r = st.renameCharacterState(nodeId, state.id, label);
+    const r = st.renameCharacterState(characterId, state.id, label);
     if (!r.ok) window.alert(`⚠ ${STATE_ERR_TEXT[r.error]}`);
   };
 
@@ -326,23 +349,23 @@ function CharacterStateBar({ nodeId, data, boardId }: { nodeId: string; data: Ch
       ? `\n\n该状态被 ${refs.count} 章引用：${referenceChapterText(refs, 6)}。删除后这些章节在切回同步前会显示「资料缺失」；章节场景会随画布自动同步。`
       : '';
     if (!window.confirm(`删除状态「${state.label}」？该状态的人物设定与形象引用会一并移除（其它状态仍在用的图片不会被删）。${impact}`)) return;
-    const r = st.deleteCharacterState(nodeId, state.id);
+    const r = st.deleteCharacterState(characterId, state.id);
     if (!r.ok) window.alert(`⚠ ${STATE_ERR_TEXT[r.error]}`);
   };
 
   const defaultLabel = `状态${index}`;
   return (
-    <div className="mt-2" title="点击数字切换状态；画布、属性表单、人物形象与章节生成都使用当前状态">
+    <div className="mt-2" title="点击数字切换当前画布显示的状态；状态属性属人物库，修改一处全局生效">
       <div className="flex items-center gap-1.5">
         <Layers className="h-3.5 w-3.5 shrink-0 text-slate-400" />
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
-          {data.states.map((s, i) => {
+          {character.states.map((s, i) => {
             const active = s.id === state.id;
             return (
               <button
                 key={s.id}
                 type="button"
-                onClick={() => st.switchCharacterState(nodeId, s.id)}
+                onClick={() => st.switchCharacterState(characterId, s.id)}
                 title={`切换到状态 ${i}：${s.label}${i === 0 ? '（默认）' : ''}`}
                 aria-label={`切换到状态 ${i}：${s.label}`}
                 aria-pressed={active}
@@ -358,7 +381,7 @@ function CharacterStateBar({ nodeId, data, boardId }: { nodeId: string; data: Ch
           })}
           <IconButton
             icon={<Plus />}
-            title="新建状态：复制当前状态的全部属性与形象引用，并切换到新状态"
+            title="新建状态：复制当前状态的全部属性与形象引用（库级，全部画布可用），并切到新状态"
             onClick={add}
           />
         </div>
@@ -399,17 +422,18 @@ type CropTarget = {
   fullUrl: string;
 };
 
-/** 🖼 人物形象区（v2.31，按状态）：
+/** 🖼 人物形象区（v2.31，按状态 · v3 人物库）：形象属人物库状态——写入后该人物全部画布放置同步生效。
  *  - 上传：保留原图尺寸（最长边 >4096 等比缩小）；
  *  - AI：按所选预设构图生成，再在客户端裁切/缩放到精确像素；
  *  - 头像：从大图手动框选头部，生成 256×256 圆形头像；未裁切时画布显示性别剪影；
- *  - 大图/头像本体只进 IndexedDB，状态里只存元数据。 */
-function CharacterImageSection({
-  nodeId,
+ *  - 大图/头像本体只进 IndexedDB，状态里只存元数据。
+ *  （人物库面板复用：纯库级操作，不依赖画布上下文。） */
+export function CharacterImageSection({
+  characterId,
   state,
   gender,
 }: {
-  nodeId: string;
+  characterId: string;
   state: CharacterState;
   gender: CharacterGender;
 }) {
@@ -443,7 +467,7 @@ function CharacterImageSection({
     return () => {
       alive = false;
     };
-  }, [nodeId, state.id, image?.key]);
+  }, [characterId, state.id, image?.key]);
 
   const openCrop = async (img: CharacterStateImage, sid: string, label: string, url?: string) => {
     let src = url ?? fullUrl;
@@ -470,8 +494,8 @@ function CharacterImageSection({
     try {
       // 上传始终保留原图尺寸（超 4096 长边等比缩小）；预设只用于 AI 生成
       const prepared = await prepareCharacterImageFile(file, 'original');
-      const saved = await saveFullImage(nodeId, sid, prepared, 'original');
-      useStudioStore.getState().updateCharacterState(nodeId, { image: saved.image }, sid);
+      const saved = await saveFullImage(characterId, sid, prepared, 'original');
+      useStudioStore.getState().updateCharacterState(characterId, { image: saved.image }, sid);
       if (stateIdRef.current === sid) {
         setFullUrl(saved.dataUrl);
         setCropTarget({ image: saved.image, fullUrl: saved.dataUrl, stateId: sid, stateLabel: label });
@@ -494,11 +518,11 @@ function CharacterImageSection({
     setStage('prompt');
     try {
       const engine = useEditorRoomStore.getState().settings.engine;
-      const r = await genCharacterImage({ id: nodeId, stateId: sid, engine, preset, onStage: setStage });
+      const r = await genCharacterImage({ characterId, stateId: sid, engine, preset, onStage: setStage });
       if (!r.ok || !r.url) throw new Error(r.error || '生成失败');
       const prepared = await prepareCharacterImageUrl(r.url, preset);
-      const saved = await saveFullImage(nodeId, sid, prepared, preset);
-      useStudioStore.getState().updateCharacterState(nodeId, { image: saved.image }, sid);
+      const saved = await saveFullImage(characterId, sid, prepared, preset);
+      useStudioStore.getState().updateCharacterState(characterId, { image: saved.image }, sid);
       if (stateIdRef.current === sid) {
         setFullUrl(saved.dataUrl);
         setCropTarget({ image: saved.image, fullUrl: saved.dataUrl, stateId: sid, stateLabel: label });
@@ -514,7 +538,7 @@ function CharacterImageSection({
   const remove = () => {
     if (!image || busy) return;
     if (!window.confirm(`移除「${state.label}」的人物形象与头像？（其它状态仍在使用的图片不会被删）`)) return;
-    useStudioStore.getState().updateCharacterState(nodeId, { image: undefined }, state.id);
+    useStudioStore.getState().updateCharacterState(characterId, { image: undefined }, state.id);
     setFullUrl(undefined);
     setZoom(false);
     setCropTarget(null);
@@ -654,12 +678,12 @@ function CharacterImageSection({
 
       {err && <p className="mt-1.5 text-[12px] leading-relaxed text-rose-500">{err}</p>}
       <p className="mt-1.5 text-[10px] leading-relaxed text-slate-400">
-        大图与头像只保存在本机浏览器，随画布元数据引用；导出到其它浏览器后需重新设置图片。
+        大图与头像只保存在本机浏览器，随人物状态元数据引用；导出到其它浏览器后需重新设置图片。
       </p>
 
       {cropTarget && (
         <CharacterCropDialog
-          nodeId={nodeId}
+          characterId={characterId}
           stateId={cropTarget.stateId}
           stateLabel={cropTarget.stateLabel}
           image={cropTarget.image}

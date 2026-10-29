@@ -13,17 +13,17 @@ import type {
   ChapterRegion,
   ChapterSnapshot,
   ChapterSnapshotEntry,
-  CharacterData,
   CharacterState,
   EnvironmentType,
   SimBoard,
   SimNodeType,
   SnapshotEnvRef,
   SnapshotSource,
+  WorkCharacter,
 } from '../types/sim';
 import { ENV_TYPES } from '../types/sim';
 import { absPositionOf, sortParentsFirst } from './graphGeom';
-import { activeCharacterState } from './characterStates';
+import { characterHasState, characterStateOf } from './characterStates';
 import { sanitizeRegionRect, sanitizeRegions } from './chapterRegions';
 
 export const SNAPSHOT_MAX_REGIONS = 8;
@@ -163,22 +163,27 @@ export function envPathForCharacter(n: SimNodeType, byId: Map<string, SimNodeTyp
 function entryFromNode(
   n: SimNodeType,
   byId: Map<string, SimNodeType>,
+  characters: Record<string, WorkCharacter>,
   role: CastRole,
   stateId?: string,
-): ChapterSnapshotEntry {
-  const d = n.data as CharacterData;
+): ChapterSnapshotEntry | null {
+  // 人物节点只是放置：身份/属性一律查人物库（characterId 不在库中 = 悬空放置，跳过）
+  if (n.data.kind !== 'character') return null;
+  const d = n.data;
+  const character = characters[d.characterId];
+  if (!character) return null;
   const abs = absPositionOf(n, byId);
   const parent = parentEnvOf(n, byId);
-  const state = (stateId ? d.states.find((s) => s.id === stateId) : undefined) ?? activeCharacterState(d);
+  const state = characterStateOf(character, stateId, d.activeStateId);
   return {
-    characterId: n.id,
+    characterId: character.id,
     stateId: state.id,
     role,
     x: abs.x,
     y: abs.y,
     ...(parent ? { parentEnvId: parent.id } : {}),
     envPathAtCapture: envPathForCharacter(n, byId),
-    nameAtCapture: (d.name || '未命名').trim().slice(0, SNAPSHOT_NAME_CAP),
+    nameAtCapture: (character.name || '未命名').trim().slice(0, SNAPSHOT_NAME_CAP),
     stateLabelAtCapture: state.label.slice(0, SNAPSHOT_LABEL_CAP),
     stateFingerprintAtCapture: stateFingerprint(state),
     origin: 'region',
@@ -187,14 +192,19 @@ function entryFromNode(
 
 /** 采集区域名单：中心点在区域内的人物；边缘带默认 mentioned，内侧 present。
  *  按名称、状态、id 排序，保证同一画布多次采集结果稳定。 */
-export function collectRegionRoster(board: SimBoard, region: Rect): ChapterSnapshotEntry[] {
+export function collectRegionRoster(
+  board: SimBoard,
+  region: Rect,
+  characters: Record<string, WorkCharacter>,
+): ChapterSnapshotEntry[] {
   const byId = new Map(board.nodes.map((n) => [n.id, n]));
   const out: ChapterSnapshotEntry[] = [];
   for (const n of board.nodes) {
     if (n.data.kind !== 'character') continue;
     const center = absCenterOf(n, byId);
     if (!rectContainsPoint(region, center)) continue;
-    out.push(entryFromNode(n, byId, pointInRegionEdge(region, center) ? 'mentioned' : 'present'));
+    const entry = entryFromNode(n, byId, characters, pointInRegionEdge(region, center) ? 'mentioned' : 'present');
+    if (entry) out.push(entry);
   }
   out.sort((a, b) =>
     a.role !== b.role
@@ -258,10 +268,11 @@ export function captureChapterSnapshot(
   board: SimBoard,
   region: ChapterRegion,
   opts: CaptureSnapshotOptions = {},
+  characters: Record<string, WorkCharacter> = {},
 ): ChapterSnapshot {
   const now = opts.now ?? Date.now();
   const rect = { ...region, ...sanitizeRegionRect(region) };
-  const entries = collectRegionRoster(board, rect);
+  const entries = collectRegionRoster(board, rect, characters);
   return {
     version: 1,
     boardId: board.id,
@@ -277,32 +288,43 @@ export function captureChapterSnapshot(
 /** 刷新：重采自动名单 + 更新几何/环境引用。
  *  - 手动词条始终保留；区域自动条目的角色/状态若被人工改过（roleLocked/stateLocked）也保留；
  *  - 自动条目已不在区域 → 移除（人工加过的除外）；
- *  - 人物/状态已从画布缺失 → 保留采集值，等待 UI 标“资料缺失”；
+ *  - 人物/状态已缺失 → 保留采集值，等待 UI 标“资料缺失”；
  *  - 区域不再存在时保留旧几何，由调用方决定是否允许刷新。 */
 export function refreshChapterSnapshot(
   snapshot: ChapterSnapshot,
   board: SimBoard,
   region: ChapterRegion,
+  characters: Record<string, WorkCharacter>,
   opts: { now?: number } = {},
 ): ChapterSnapshot {
   const now = opts.now ?? Date.now();
   const byId = new Map(board.nodes.map((n) => [n.id, n]));
   const rect = { ...region, ...sanitizeRegionRect(region) };
-  const auto = new Map(collectRegionRoster(board, rect).map((e) => [e.characterId, e]));
+  const auto = new Map(collectRegionRoster(board, rect, characters).map((e) => [e.characterId, e]));
   const existing = new Map(snapshot.entries.map((e) => [e.characterId, e]));
   const merged: ChapterSnapshotEntry[] = [];
 
-  const applyCurrentState = (e: ChapterSnapshotEntry, node: SimNodeType & { data: CharacterData }): ChapterSnapshotEntry => {
+  // 放置按 characterId 索引（node.id 与人物身份解耦）
+  const placementByChar = new Map<string, SimNodeType>();
+  for (const n of board.nodes) {
+    if (n.data.kind === 'character' && !placementByChar.has(n.data.characterId)) {
+      placementByChar.set(n.data.characterId, n);
+    }
+  }
+
+  const applyCurrentState = (e: ChapterSnapshotEntry, node: SimNodeType): ChapterSnapshotEntry => {
+    if (node.data.kind !== 'character') return e;
+    const character = characters[node.data.characterId];
     const abs = absPositionOf(node, byId);
     const parent = parentEnvOf(node, byId);
-    const current = node.data.states.find((s) => s.id === e.stateId);
+    const current = character?.states.find((s) => s.id === e.stateId);
     return {
       ...e,
       x: abs.x,
       y: abs.y,
       ...(parent ? { parentEnvId: parent.id } : { parentEnvId: undefined }),
       envPathAtCapture: envPathForCharacter(node, byId),
-      nameAtCapture: (node.data.name || '未命名').trim().slice(0, SNAPSHOT_NAME_CAP),
+      nameAtCapture: ((character?.name || '未命名') as string).trim().slice(0, SNAPSHOT_NAME_CAP),
       ...(current
         ? {
             stateLabelAtCapture: current.label.slice(0, SNAPSHOT_LABEL_CAP),
@@ -318,7 +340,7 @@ export function refreshChapterSnapshot(
       merged.push(a);
       continue;
     }
-    const node = byId.get(a.characterId) as (SimNodeType & { data: CharacterData }) | undefined;
+    const node = placementByChar.get(a.characterId);
     const preserveRole = old.origin === 'manual' || old.roleLocked;
     const preserveState = old.origin === 'manual' || old.stateLocked;
     let e: ChapterSnapshotEntry = {
@@ -337,7 +359,7 @@ export function refreshChapterSnapshot(
   for (const old of snapshot.entries) {
     if (auto.has(old.characterId)) continue;
     if (old.origin !== 'manual') continue;
-    const node = byId.get(old.characterId) as (SimNodeType & { data: CharacterData }) | undefined;
+    const node = placementByChar.get(old.characterId);
     merged.push(node ? applyCurrentState(old, node) : old);
   }
 
@@ -372,11 +394,16 @@ export interface ApplyChapterSceneResult {
 }
 
 /** 🎬 把章节场景应用到画布：只移动快照内人物，恢复父环境、绝对位置与当前状态 id。
+ *  - 放置按 characterId 在快照画布上找（人物身份=库 ID，node.id 与身份解耦）；
  *  - 绝对坐标 × 当前父环境绝对坐标 → 相对坐标（环境布局不进入快照，按当前布局换算）；
  *  - 父环境缺失 → 退回根层并记录，不猜测替代容器；
- *  - 状态 id 缺失 → 保留人物当前状态并记录，不猜测；
+ *  - 状态 id 对人物库校验：缺失 → 保留放置当前状态（回落首项由解析兜底）并记录，不猜测；
  *  - 快照外人物一律不动。 */
-export function applyChapterScene(board: SimBoard, snapshot: ChapterSnapshot): ApplyChapterSceneResult {
+export function applyChapterScene(
+  board: SimBoard,
+  snapshot: ChapterSnapshot,
+  characters: Record<string, WorkCharacter>,
+): ApplyChapterSceneResult {
   const byId = new Map(board.nodes.map((n) => [n.id, n]));
   const replaced = new Map<string, SimNodeType>();
   const missingCharacters: string[] = [];
@@ -387,8 +414,9 @@ export function applyChapterScene(board: SimBoard, snapshot: ChapterSnapshot): A
   let stateRestored = 0;
 
   for (const entry of snapshot.entries) {
-    const node = byId.get(entry.characterId);
-    if (!node || node.data.kind !== 'character') {
+    const node = board.nodes.find((n) => n.data.kind === 'character' && n.data.characterId === entry.characterId);
+    const character = characters[entry.characterId];
+    if (!node || node.data.kind !== 'character' || !character) {
       missingCharacters.push(entry.characterId);
       continue;
     }
@@ -400,7 +428,7 @@ export function applyChapterScene(board: SimBoard, snapshot: ChapterSnapshot): A
     const position = { x: Math.round(entry.x - parentAbs.x), y: Math.round(entry.y - parentAbs.y) };
 
     let activeStateId = node.data.activeStateId;
-    const hasState = node.data.states.some((s) => s.id === entry.stateId);
+    const hasState = characterHasState(character, entry.stateId);
     if (!hasState) missingStates.push(entry.characterId);
     else activeStateId = entry.stateId;
 
@@ -412,7 +440,7 @@ export function applyChapterScene(board: SimBoard, snapshot: ChapterSnapshot): A
     if (positionChanged) moved++;
     if (parentChanged) reparented++;
     if (stateChanged) stateRestored++;
-    replaced.set(entry.characterId, {
+    replaced.set(node.id, {
       ...node,
       ...(parentChanged ? { parentId } : {}),
       position,
@@ -491,16 +519,23 @@ export function sameSnapshotScene(a: ChapterSnapshot, b: ChapterSnapshot): boole
   return true;
 }
 
-/** 手动添加条目：默认仅提及 + 当前状态；已存在则原样返回 */
+/** 手动添加条目：默认仅提及 + 当前状态；人物未放置在板上或不在库中 → null */
 export function manualSnapshotEntry(
   board: SimBoard,
+  characters: Record<string, WorkCharacter>,
   characterId: string,
   opts: { role?: CastRole; stateId?: string } = {},
 ): ChapterSnapshotEntry | null {
-  const byId = new Map(board.nodes.map((n) => [n.id, n]));
-  const node = byId.get(characterId);
-  if (!node || node.data.kind !== 'character') return null;
-  const entry = entryFromNode(node, byId, opts.role ?? 'mentioned', opts.stateId);
+  const placement = board.nodes.find((n) => n.data.kind === 'character' && n.data.characterId === characterId);
+  if (!placement) return null;
+  const entry = entryFromNode(
+    placement,
+    new Map(board.nodes.map((n) => [n.id, n])),
+    characters,
+    opts.role ?? 'mentioned',
+    opts.stateId,
+  );
+  if (!entry) return null;
   return {
     ...entry,
     origin: 'manual',
@@ -530,12 +565,13 @@ export interface SnapshotStaleness {
   rosterDelta: number;
 }
 
-/** 快照与源画布/当前区域的差异：用于名单面板“有变化”提示与生成前警告。
+/** 快照与源画布/当前区域/人物库的差异：用于名单面板“有变化”提示与生成前警告。
  *  源画布缺失时仍检查条目（无法解析），返回 source-board-missing。 */
 export function snapshotStaleness(
   snapshot: ChapterSnapshot,
   board: SimBoard | undefined,
   currentRegion: ChapterRegion | undefined,
+  characters: Record<string, WorkCharacter> = {},
 ): SnapshotStaleness {
   const codes = new Set<SnapshotIssueCode>();
   let missingCount = 0;
@@ -545,7 +581,7 @@ export function snapshotStaleness(
 
   if (!board) {
     codes.add('source-board-missing');
-    const missing = snapshot.entries.filter((e) => !byId.has(e.characterId)).length;
+    const missing = snapshot.entries.filter((e) => !characters[e.characterId]).length;
     return { codes: [...codes], missingCount: missing, changedCount: 0, rosterDelta: 0 };
   }
 
@@ -556,28 +592,36 @@ export function snapshotStaleness(
     codes.add('region-moved');
   }
 
-  const autoNow = currentRegion ? collectRegionRoster(board, currentRegion) : [];
+  const autoNow = currentRegion ? collectRegionRoster(board, currentRegion, characters) : [];
   const autoIds = new Set(snapshot.entries.filter((e) => e.origin === 'region').map((e) => e.characterId));
   const nowIds = new Set(autoNow.map((e) => e.characterId));
   for (const id of nowIds) if (!autoIds.has(id)) rosterDelta++;
   for (const id of autoIds) if (!nowIds.has(id)) rosterDelta++;
   if (rosterDelta) codes.add('roster-changed');
 
+  const placementByChar = new Map<string, SimNodeType>();
+  for (const n of board.nodes) {
+    if (n.data.kind === 'character' && !placementByChar.has(n.data.characterId)) {
+      placementByChar.set(n.data.characterId, n);
+    }
+  }
+
   for (const e of snapshot.entries) {
-    const n = byId.get(e.characterId);
-    if (!n || n.data.kind !== 'character') {
+    const n = placementByChar.get(e.characterId);
+    const c = characters[e.characterId];
+    if (!n || !c) {
       missingCount++;
       codes.add('missing-character');
       continue;
     }
-    const state = n.data.states.find((s) => s.id === e.stateId);
+    const state = c.states.find((s) => s.id === e.stateId);
     if (!state) {
       missingCount++;
       codes.add('missing-state');
       continue;
     }
     let changed = false;
-    if ((n.data.name || '未命名').trim() !== e.nameAtCapture || state.label !== e.stateLabelAtCapture) {
+    if ((c.name || '未命名').trim() !== e.nameAtCapture || state.label !== e.stateLabelAtCapture) {
       changed = true;
       codes.add('name-changed');
     }
@@ -616,8 +660,9 @@ export function snapshotIssueText(
   snapshot: ChapterSnapshot,
   board: SimBoard | undefined,
   currentRegion: ChapterRegion | undefined,
+  characters: Record<string, WorkCharacter> = {},
 ): string {
-  const s = snapshotStaleness(snapshot, board, currentRegion);
+  const s = snapshotStaleness(snapshot, board, currentRegion, characters);
   if (!s.codes.length) return '';
   return s.codes.map((c) => SNAPSHOT_ISSUE_LABELS[c]).join('；');
 }

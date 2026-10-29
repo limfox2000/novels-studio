@@ -400,7 +400,7 @@ function editorChatSystem(e: Editor, userMsg: string, history: SimChatMsg[] = []
   const refBlock = /状态|引用|快照|名单|章节|本章|历史/.test(userMsg)
     ? (() => {
         const st = useStudioStore.getState();
-        return `\n\n【状态引用】（只读）\n${stateReferenceAgentContext(st.chapters, st.boards, st.volumes, { boardId: st.activeBoardId })}`;
+        return `\n\n【状态引用】（只读）\n${stateReferenceAgentContext(st.chapters, st.characters)}`;
       })()
     : '';
   const chapterBlock = chapterAgentBlockIfRelevant(userMsg);

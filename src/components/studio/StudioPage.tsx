@@ -33,7 +33,7 @@ import { useEditorialStore } from '../../stores/editorialStore';
 import { useUiStore } from '../../stores/uiStore';
 import { chapterBoardOf } from '../../stores/chapterRegions';
 import { characterReferenceSummary, referenceChapterText } from '../../stores/snapshotRefs';
-import type { SimData, SimNodeType } from '../../types/sim';
+import type { CharacterPlacementData, SimData, SimNodeType } from '../../types/sim';
 import { ENV_TYPE_META, genderOf } from '../../types/sim';
 import { DEFAULT_STATE_ID } from '../../stores/characterStates';
 import { genRandomCharacter } from '../../engines/studioEngine';
@@ -45,6 +45,7 @@ import { ContentManager } from './ContentManager';
 import { Bookshelf } from './Bookshelf';
 import { CopyToVolumeDialog } from './CopyToVolumeDialog';
 import { CharacterSearchDialog } from './CharacterSearchDialog';
+import { CharacterLibraryPanel } from './CharacterLibraryPanel';
 import { ChapterRegionsOverlay } from './ChapterRegionsOverlay';
 import { useActiveChapterId } from './useActiveChapter';
 import { beginChapterRegion } from './chapterRegionActions';
@@ -60,6 +61,7 @@ import { Field, Textarea } from '../ui/Field';
 import { Badge, StatusDot } from '../ui/Badge';
 import {
   ArrowLeft,
+  BookUser,
   Copy,
   Cpu,
   Dna,
@@ -121,28 +123,35 @@ function StudioCanvas() {
     useUiStore.getState().setSelectedRegionId(null);
     // ✎ Ctrl/Cmd+点人物节点：把人名插进「本章需求」光标处（OutlineManager 挂载时才监听，未开面板静默）
     if ((e.ctrlKey || e.metaKey) && node.data.kind === 'character') {
-      const name = (node.data as { name?: string }).name?.trim();
+      // 人名读人物库（放置只是引用）
+      const name = (useStudioStore.getState().characters[node.data.characterId]?.name || '').trim();
       if (name) window.dispatchEvent(new CustomEvent('sim-insert-char-name', { detail: name }));
     }
   }, []);
 
-  // Del/Backspace 删除：自行 confirm + deleteNode，返回 false 阻止 RF 默认变更流
+  // Del/Backspace 删除：环境删除自行 confirm；人物删除=仅移除放置（C5 非破坏，免确认），返回 false 阻止 RF 默认变更流
   const onBeforeDelete = useCallback(async ({ nodes: doomed }: { nodes: SimNodeType[]; edges: Edge[] }) => {
     if (!doomed.length) return true; // 仅选中边：走 RF 默认（直接删边）
     const st = useStudioStore.getState();
-    const refLines = doomed
-      .filter((n) => n.data.kind === 'character')
-      .map((n) => {
-        const ref = characterReferenceSummary(st.chapters, st.activeBoardId, n.id);
-        if (!ref.count) return '';
-        const name = ((n.data as { name?: string }).name || '未命名').trim();
-        return `${name}：被 ${ref.count} 章引用（${referenceChapterText(ref, 4)}）`;
-      })
-      .filter(Boolean);
-    const impact = refLines.length
-      ? `\n\n章节名单引用：\n${refLines.join('\n')}\n删除后相关章节在切回同步前会显示「资料缺失」；章节场景会随画布自动同步。`
-      : '';
-    if (!window.confirm(`删除选中的 ${doomed.length} 个节点？（父环境的内部节点将提升回根层）${impact}`)) return false;
+    const envs = doomed.filter((n) => n.data.kind === 'environment');
+    if (envs.length) {
+      const refLines = doomed
+        .filter((n): n is SimNodeType & { data: CharacterPlacementData } => n.data.kind === 'character')
+        .map((n) => {
+          const ref = characterReferenceSummary(st.chapters, n.data.characterId);
+          if (!ref.count) return '';
+          const name = (st.characters[n.data.characterId]?.name || '未命名').trim();
+          return `${name}：被 ${ref.count} 章引用（${referenceChapterText(ref, 4)}）`;
+        })
+        .filter(Boolean);
+      const impact = refLines.length
+        ? `\n\n章节名单引用：\n${refLines.join('\n')}\n被移除画布对应章节的场景会随之自动同步（历史章节保留采集记录）。`
+        : '';
+      const tip = `删除选中的 ${envs.length} 个环境（内部节点将提升回根层）${
+        doomed.length > envs.length ? `，并把 ${doomed.length - envs.length} 个人物从本画布移除（人物与形象保留在人物库）` : ''
+      }？${impact}`;
+      if (!window.confirm(tip)) return false;
+    }
     doomed.forEach((n) => st.deleteNode(n.id));
     return false; // 已自行删除，阻止 RF 默认变更
   }, []);
@@ -228,8 +237,12 @@ function StudioCanvas() {
           className="!bg-white/80 !rounded-lg !shadow-lg"
           nodeColor={(node) => {
             const d = node.data as SimData;
-            // 人物按性别细分点色（男蓝=默认/女玫红），环境按类型点色（v2.18 ENV_TYPE_META 清淡配色）
-            return d.kind === 'character' ? GENDER_STYLE[genderOf(d.gender)].dot : (ENV_TYPE_META[d.etype]?.dot ?? '#64748b');
+            // 人物性别读人物库（放置无性别字段；小地图点色随库同步：男蓝=默认/女玫红），环境按类型点色（v2.18）
+            if (d.kind === 'character') {
+              const character = useStudioStore.getState().characters[d.characterId];
+              return GENDER_STYLE[genderOf(character?.gender)].dot;
+            }
+            return ENV_TYPE_META[d.etype]?.dot ?? '#64748b';
           }}
         />
       </ReactFlow>
@@ -387,6 +400,8 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
   const [volumesOpen, setVolumesOpen] = useState(false);
   const [copyOpen, setCopyOpen] = useState(false);
   const [charSearchOpen, setCharSearchOpen] = useState(false);
+  const [libOpen, setLibOpen] = useState(false);
+  const characterCount = useStudioStore((s) => Object.keys(s.characters).length);
   // 🗂 多卷画布：标签 = 默认主画布 + 各卷画布（异常数据里的未关联画布也保留显示）
   const boards = useStudioStore((s) => s.boards);
   const volumes = useStudioStore((s) => s.volumes);
@@ -488,20 +503,31 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
     const st = useStudioStore.getState();
     const size = kind === 'environment' ? { w: ENV_DEFAULT_W, h: ENV_DEFAULT_H } : CHAR_NOMINAL_SIZE;
     const pos = dropPos(size);
-    const id = kind === 'character' ? st.createCharacter(pos) : st.createEnvironment(pos);
-    // ⚠ excludeId=新节点自身：判定点取新节点中心，不排除会「创建即挂到自己」
-    // （self-parent + 相对坐标 {0,0}，RF12 定位坏掉 → 节点凭空消失，v2.1 踩坑）
-    const container = findContainerAt(selectActiveNodes(useStudioStore.getState()), pos.x + size.w / 2, pos.y + size.h / 2, id);
-    if (container) st.reparentNode(id, container.id);
-    // 🧬 人物生成规则存在 → ＋人物自动按规则随机生成（v2.15）：先落空节点（位置/嵌套照旧），生成完填属性
-    if (kind === 'character') void autoFillCharacter(id);
+    if (kind === 'environment') {
+      const id = st.createEnvironment(pos);
+      // ⚠ excludeId=新节点自身：判定点取新节点中心，不排除会「创建即挂到自己」
+      // （self-parent + 相对坐标 {0,0}，RF12 定位坏掉 → 节点凭空消失，v2.1 踩坑）
+      const container = findContainerAt(selectActiveNodes(useStudioStore.getState()), pos.x + size.w / 2, pos.y + size.h / 2, id);
+      if (container) st.reparentNode(id, container.id);
+      return;
+    }
+    // 📇 v3 人物库：创建=建库记录+放置到当前画布（createCharacter 返回库 ID，放置节点随建即选中）
+    const characterId = st.createCharacter({ placeOnBoardId: st.activeBoardId, pos, select: true });
+    const nodes = selectActiveNodes(useStudioStore.getState());
+    const nodeId = nodes.find((n) => n.data.kind === 'character' && n.data.characterId === characterId)?.id;
+    if (nodeId) {
+      const container = findContainerAt(nodes, pos.x + size.w / 2, pos.y + size.h / 2, nodeId);
+      if (container) st.reparentNode(nodeId, container.id);
+    }
+    // 🧬 人物生成规则存在 → ＋人物自动按规则随机生成（v2.15）：先落空放置（位置/嵌套照旧），生成完填库
+    void autoFillCharacter(characterId);
   };
 
-  // 🧬 人物自动生成填充：占位「生成中…」→ 成功填名字/性别/基础信息/身份信息；失败/互斥回空节点可手填（不吞掉节点）
-  const autoFillCharacter = async (id: string) => {
+  // 🧬 人物自动生成填充：占位「生成中…」→ 成功填名字/性别/基础信息/身份信息；失败/互斥回空人物可手填（不吞掉放置）
+  const autoFillCharacter = async (characterId: string) => {
     const st = useStudioStore.getState();
     if (!st.charGenRules.trim()) return;
-    st.updateCharacter(id, { name: '生成中…' });
+    st.updateCharacter(characterId, { name: '生成中…' });
     const engine = useEditorRoomStore.getState().settings.engine;
     // 🏛 作品责任编辑：注入其职责与该模块技能记忆（v2.21）
     const responsible = useEditorialStore.getState().getWorkResponsibleData('人物生成');
@@ -509,11 +535,11 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
     const s2 = useStudioStore.getState();
     if (r.ok && r.block) {
       const gender = genderOf(r.block.gender);
-      s2.updateCharacter(id, { name: r.block.name, gender });
+      s2.updateCharacter(characterId, { name: r.block.name, gender });
       // 显式写状态0：生成期间用户若新建/切换了状态，也不会把随机属性写进别的状态。
       // 新人物默认没有形象，画布先显示性别剪影，由用户上传/生成后再裁头像。
       s2.updateCharacterState(
-        id,
+        characterId,
         {
           age: r.block.age,
           basicInfo: r.block.basicInfo ?? '',
@@ -523,8 +549,8 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
         DEFAULT_STATE_ID,
       );
     } else {
-      s2.updateCharacter(id, { name: '' });
-      if (r.error && r.error !== '已有生成任务进行中') window.alert(`⚠ 人物自动生成失败：${r.error}（已保留空白人物节点，可手动填写）`);
+      s2.updateCharacter(characterId, { name: '' });
+      if (r.error && r.error !== '已有生成任务进行中') window.alert(`⚠ 人物自动生成失败：${r.error}（已保留空白人物，可手动填写）`);
     }
   };
 
@@ -767,6 +793,16 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
               查人
             </button>
             <button
+              data-character-library-open
+              onClick={() => setLibOpen(true)}
+              title="人物库：作品级人物唯一管理（身份写一处全局生效；状态按画布放置显示）"
+              className="flex h-6 shrink-0 items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 text-[12px] text-slate-500 transition hover:border-brand-300 hover:bg-brand-50/50 hover:text-brand-700"
+            >
+              <BookUser className="h-3 w-3" strokeWidth={1.75} />
+              人物库
+              {characterCount > 0 && <span className="text-[10px] tabular-nums opacity-70">{characterCount}</span>}
+            </button>
+            <button
               onClick={() => switchToBoard(DEFAULT_BOARD_ID)}
               title="默认主画布：未分卷章节与旧单画布内容（所有画布节点合计会显示在属性面板）"
               className={`flex h-6 shrink-0 items-center gap-1 rounded-full border px-2.5 text-[12px] transition ${
@@ -836,6 +872,7 @@ function SimBar({ inspectorOpen, onToggleInspector, onOpenShelf }: { inspectorOp
       {volumesOpen && <VolumesDialog onClose={() => setVolumesOpen(false)} />}
       {copyOpen && <CopyToVolumeDialog onClose={() => setCopyOpen(false)} />}
       {charSearchOpen && <CharacterSearchDialog onClose={() => setCharSearchOpen(false)} />}
+      {libOpen && <CharacterLibraryPanel onClose={() => setLibOpen(false)} />}
       {agentOpen && <EditorRoomPanel onClose={() => setAgentOpen(false)} />}
       {modelCenterOpen && (
         <ModelCenterPanel
